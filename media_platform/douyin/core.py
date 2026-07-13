@@ -129,7 +129,7 @@ class DouYinCrawler(AbstractCrawler):
 
     async def search(self) -> None:
         utils.logger.info("[DouYinCrawler.search] Begin search douyin keywords")
-        dy_limit_count = 10  # douyin limit page fixed value
+        dy_limit_count = 15  # Must match the search API count parameter.
         if config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
         start_page = config.START_PAGE  # start page number
@@ -140,32 +140,59 @@ class DouYinCrawler(AbstractCrawler):
             aweme_list: List[str] = []
             page = 0
             dy_search_id = ""
-            while (page - start_page + 1) * dy_limit_count <= config.CRAWLER_MAX_NOTES_COUNT and not accumulator.stop_reason:
+            while accumulator.candidate_count < accumulator.hard_limit and not accumulator.stop_reason:
                 if page < start_page:
                     utils.logger.info(f"[DouYinCrawler.search] Skip {page}")
                     page += 1
                     continue
                 try:
                     utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page}")
+                    requested_offset = page * dy_limit_count - dy_limit_count
+                    requested_search_id = dy_search_id
                     posts_res = await self.dy_client.search_info_by_keyword(
                         keyword=keyword,
-                        offset=page * dy_limit_count - dy_limit_count,
+                        offset=requested_offset,
                         publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
                         search_id=dy_search_id,
                     )
-                    if posts_res.get("data") is None or posts_res.get("data") == []:
+                    if "data" not in posts_res or posts_res.get("data") is None:
+                        utils.logger.error(
+                            f"[DouYinCrawler.search] response missing data, keyword: {keyword}, page: {page}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            "missing_data_field",
+                            source_page=page,
+                            source_offset=requested_offset,
+                            source_cursor=requested_search_id,
+                        )
+                        break
+                    if posts_res.get("data") == []:
                         utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,{posts_res.get('data')}`")
-                        accumulator.mark_source_exhausted()
+                        accumulator.mark_source_exhausted(
+                            "empty_page",
+                            source_page=page,
+                            source_offset=requested_offset,
+                            source_cursor=requested_search_id,
+                            source_has_more=(
+                                posts_res.get("has_more") if "has_more" in posts_res else None
+                            ),
+                            raw_batch_count=0,
+                        )
                         break
                 except DataFetchError:
                     utils.logger.error(f"[DouYinCrawler.search] search douyin keyword: {keyword} failed")
+                    accumulator.mark_runtime_failed(
+                        "search_request_failed",
+                        source_page=page,
+                        source_offset=page * dy_limit_count - dy_limit_count,
+                        source_cursor=dy_search_id,
+                    )
                     break
 
                 page += 1
-                if "data" not in posts_res:
-                    utils.logger.error(f"[DouYinCrawler.search] search douyin keyword: {keyword} failed，账号也许被风控了。")
-                    break
                 dy_search_id = posts_res.get("extra", {}).get("logid", "")
+                source_has_more = posts_res.get("has_more") if "has_more" in posts_res else None
+                raw_batch_count = len(posts_res.get("data") or [])
                 page_aweme_list = []
                 accumulator.begin_batch()
                 for post_item in posts_res.get("data"):
@@ -201,7 +228,25 @@ class DouYinCrawler(AbstractCrawler):
                 
                 # Batch get note comments for the current page
                 await self.batch_get_note_comments(page_aweme_list)
-                if accumulator.finish_batch():
+                if accumulator.finish_batch(
+                    source_page=page - 1,
+                    source_offset=requested_offset,
+                    source_cursor=requested_search_id,
+                    next_cursor=dy_search_id,
+                    source_has_more=source_has_more,
+                    raw_batch_count=raw_batch_count,
+                ):
+                    break
+                if source_has_more in (False, 0):
+                    accumulator.mark_source_exhausted(
+                        "has_more_false",
+                        source_page=page - 1,
+                        source_offset=requested_offset,
+                        source_cursor=requested_search_id,
+                        next_cursor=dy_search_id,
+                        source_has_more=source_has_more,
+                        raw_batch_count=raw_batch_count,
+                    )
                     break
 
                 # Sleep after each page navigation

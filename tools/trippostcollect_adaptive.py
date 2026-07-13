@@ -48,6 +48,13 @@ class AdaptiveAccumulator:
     stagnant_batches: int = 0
     batch_no: int = 0
     stop_reason: str = ""
+    last_source_page: int | str | None = None
+    last_source_offset: int | None = None
+    last_source_cursor: int | str | None = None
+    last_next_cursor: int | str | None = None
+    last_source_has_more: bool | int | None = None
+    last_raw_batch_count: int | None = None
+    stop_detail: str = ""
     _batch_valid_before: int = 0
 
     @classmethod
@@ -78,7 +85,41 @@ class AdaptiveAccumulator:
             return True
         return False
 
-    def finish_batch(self) -> bool:
+    def _record_source(
+        self,
+        *,
+        source_page: int | str | None = None,
+        source_offset: int | None = None,
+        source_cursor: int | str | None = None,
+        next_cursor: int | str | None = None,
+        source_has_more: bool | int | None = None,
+        raw_batch_count: int | None = None,
+    ) -> None:
+        self.last_source_page = source_page
+        self.last_source_offset = source_offset
+        self.last_source_cursor = source_cursor
+        self.last_next_cursor = next_cursor
+        self.last_source_has_more = source_has_more
+        self.last_raw_batch_count = raw_batch_count
+
+    def finish_batch(
+        self,
+        *,
+        source_page: int | str | None = None,
+        source_offset: int | None = None,
+        source_cursor: int | str | None = None,
+        next_cursor: int | str | None = None,
+        source_has_more: bool | int | None = None,
+        raw_batch_count: int | None = None,
+    ) -> bool:
+        self._record_source(
+            source_page=source_page,
+            source_offset=source_offset,
+            source_cursor=source_cursor,
+            next_cursor=next_cursor,
+            source_has_more=source_has_more,
+            raw_batch_count=raw_batch_count,
+        )
         added = len(self.valid_identities) - self._batch_valid_before
         self.stagnant_batches = self.stagnant_batches + 1 if added == 0 else 0
         if self.stagnant_batches >= self.max_stagnant_batches:
@@ -93,6 +134,12 @@ class AdaptiveAccumulator:
             "target": self.target,
             "hard_limit": self.hard_limit,
             "stop_reason": self.stop_reason or "continue",
+            "source_page": source_page,
+            "source_offset": source_offset,
+            "source_cursor": source_cursor,
+            "next_cursor": next_cursor,
+            "source_has_more": source_has_more,
+            "raw_batch_count": raw_batch_count,
         }
         append_execution_event("adaptive_batch_completed", details)
         if self.stop_reason:
@@ -100,9 +147,46 @@ class AdaptiveAccumulator:
             return True
         return False
 
-    def mark_source_exhausted(self) -> None:
+    def mark_source_exhausted(
+        self,
+        detail: str,
+        *,
+        source_page: int | str | None = None,
+        source_offset: int | None = None,
+        source_cursor: int | str | None = None,
+        next_cursor: int | str | None = None,
+        source_has_more: bool | int | None = None,
+        raw_batch_count: int | None = None,
+    ) -> None:
+        self._record_source(
+            source_page=source_page,
+            source_offset=source_offset,
+            source_cursor=source_cursor,
+            next_cursor=next_cursor,
+            source_has_more=source_has_more,
+            raw_batch_count=raw_batch_count,
+        )
         if not self.stop_reason:
             self.stop_reason = "source_exhausted"
+        self.stop_detail = detail
+        append_execution_event("adaptive_search_stopped", self.summary())
+
+    def mark_runtime_failed(
+        self,
+        detail: str,
+        *,
+        source_page: int | str | None = None,
+        source_offset: int | None = None,
+        source_cursor: int | str | None = None,
+    ) -> None:
+        self._record_source(
+            source_page=source_page,
+            source_offset=source_offset,
+            source_cursor=source_cursor,
+        )
+        if not self.stop_reason:
+            self.stop_reason = "runtime_failed"
+        self.stop_detail = detail
         append_execution_event("adaptive_search_stopped", self.summary())
 
     def summary(self) -> dict[str, Any]:
@@ -114,4 +198,12 @@ class AdaptiveAccumulator:
             "hard_limit": self.hard_limit,
             "stagnant_batches": self.stagnant_batches,
             "stop_reason": self.stop_reason or "running",
+            "pages_fetched": self.batch_no,
+            "source_page": self.last_source_page,
+            "source_offset": self.last_source_offset,
+            "source_cursor": self.last_source_cursor,
+            "next_cursor": self.last_next_cursor,
+            "source_has_more": self.last_source_has_more,
+            "raw_batch_count": self.last_raw_batch_count,
+            "stop_detail": self.stop_detail,
         }

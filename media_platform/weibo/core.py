@@ -141,9 +141,6 @@ class WeiboCrawler(AbstractCrawler):
         :return:
         """
         utils.logger.info("[WeiboCrawler.search] Begin search weibo keywords")
-        weibo_limit_count = 10  # weibo limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < weibo_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = weibo_limit_count
         start_page = config.START_PAGE
         accumulator = AdaptiveAccumulator.from_environment("weibo", config.CRAWLER_MAX_NOTES_COUNT)
 
@@ -164,17 +161,30 @@ class WeiboCrawler(AbstractCrawler):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[WeiboCrawler.search] Current search keyword: {keyword}")
             page = 1
-            while (page - start_page + 1) * weibo_limit_count <= config.CRAWLER_MAX_NOTES_COUNT and not accumulator.stop_reason:
+            while accumulator.candidate_count < accumulator.hard_limit and not accumulator.stop_reason:
                 if page < start_page:
                     utils.logger.info(f"[WeiboCrawler.search] Skip page: {page}")
                     page += 1
                     continue
                 utils.logger.info(f"[WeiboCrawler.search] search weibo keyword: {keyword}, page: {page}")
-                search_res = await self.wb_client.get_note_by_keyword(keyword=keyword, page=page, search_type=search_type)
+                requested_page = page
+                try:
+                    search_res = await self.wb_client.get_note_by_keyword(
+                        keyword=keyword,
+                        page=requested_page,
+                        search_type=search_type,
+                    )
+                except DataFetchError:
+                    accumulator.mark_runtime_failed("search_request_failed", source_page=requested_page)
+                    raise
                 note_id_list: List[str] = []
                 note_list = filter_search_result_card(search_res.get("cards"))
                 if not note_list:
-                    accumulator.mark_source_exhausted()
+                    accumulator.mark_source_exhausted(
+                        "empty_page",
+                        source_page=requested_page,
+                        raw_batch_count=0,
+                    )
                     break
                 # If full text fetching is enabled, batch get full text of posts
                 note_list = await self.batch_get_notes_full_text(note_list)
@@ -213,7 +223,10 @@ class WeiboCrawler(AbstractCrawler):
                 utils.logger.info(f"[WeiboCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
 
                 await self.batch_get_notes_comments(note_id_list)
-                if accumulator.finish_batch():
+                if accumulator.finish_batch(
+                    source_page=requested_page,
+                    raw_batch_count=len(note_list),
+                ):
                     break
 
     async def get_specified_notes(self):

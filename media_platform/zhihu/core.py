@@ -243,9 +243,6 @@ class ZhihuCrawler(AbstractCrawler):
     async def search(self) -> None:
         """Search for notes and retrieve their comment information."""
         utils.logger.info("[ZhihuCrawler.search] Begin search zhihu keywords")
-        zhihu_limit_count = 20  # zhihu limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < zhihu_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = zhihu_limit_count
         start_page = config.START_PAGE
         accumulator = AdaptiveAccumulator.from_environment("zhihu", config.CRAWLER_MAX_NOTES_COUNT)
         for keyword in config.KEYWORDS.split(","):
@@ -254,9 +251,7 @@ class ZhihuCrawler(AbstractCrawler):
                 f"[ZhihuCrawler.search] Current search keyword: {keyword}"
             )
             page = 1
-            while not accumulator.stop_reason and (
-                page - start_page + 1
-            ) * zhihu_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+            while accumulator.candidate_count < accumulator.hard_limit and not accumulator.stop_reason:
                 if page < start_page:
                     utils.logger.info(f"[ZhihuCrawler.search] Skip page {page}")
                     page += 1
@@ -277,13 +272,18 @@ class ZhihuCrawler(AbstractCrawler):
                     )
                     if not content_list:
                         utils.logger.info("No more content!")
-                        accumulator.mark_source_exhausted()
+                        accumulator.mark_source_exhausted(
+                            "empty_page",
+                            source_page=page,
+                            raw_batch_count=0,
+                        )
                         break
 
                     # Sleep after page navigation
                     await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                     utils.logger.info(f"[ZhihuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
 
+                    requested_page = page
                     page += 1
                     accumulator.begin_batch()
                     for content in content_list:
@@ -302,10 +302,14 @@ class ZhihuCrawler(AbstractCrawler):
                             break
 
                     await self.batch_get_content_comments(content_list)
-                    if accumulator.finish_batch():
+                    if accumulator.finish_batch(
+                        source_page=requested_page,
+                        raw_batch_count=len(content_list),
+                    ):
                         break
                 except DataFetchError:
                     utils.logger.error("[ZhihuCrawler.search] Search content error")
+                    accumulator.mark_runtime_failed("search_request_failed", source_page=page)
                     return
 
     async def batch_get_content_comments(self, content_list: List[ZhihuContent]):

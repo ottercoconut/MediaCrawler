@@ -403,18 +403,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def search(self) -> None:
         """Search for notes and retrieve their comment information."""
         utils.logger.info("[XiaoHongShuCrawler.search] Begin search Xiaohongshu keywords")
-        xhs_limit_count = 20  # Xiaohongshu limit page fixed value
         candidate_hard_limit = max(1, int(config.CRAWLER_MAX_NOTES_COUNT or 1))
         accumulator = AdaptiveAccumulator.from_environment("xhs", candidate_hard_limit)
-        oversample_pages = max(1, self._env_int("TRIPPOSTCOLLECT_XHS_SEARCH_MAX_PAGES_PER_BATCH", 5))
-        page_fetch_limit = max(xhs_limit_count, candidate_hard_limit, xhs_limit_count * oversample_pages)
         start_page = config.START_PAGE
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[XiaoHongShuCrawler.search] Current search keyword: {keyword}")
             page = 1
             search_id = get_search_id()
-            while (page - start_page + 1) * xhs_limit_count <= page_fetch_limit and not accumulator.stop_reason:
+            while accumulator.candidate_count < accumulator.hard_limit and not accumulator.stop_reason:
                 if page < start_page:
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Skip page {page}")
                     page += 1
@@ -422,6 +419,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
                 try:
                     utils.logger.info(f"[XiaoHongShuCrawler.search] search Xiaohongshu keyword: {keyword}, page: {page}")
+                    requested_page = page
                     note_ids: List[str] = []
                     xsec_tokens: List[str] = []
                     notes_res = await self.xhs_client.get_note_by_keyword(
@@ -433,18 +431,43 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Search notes response: {notes_res}")
                     if not notes_res:
                         utils.logger.info("[XiaoHongShuCrawler.search] No more content!")
-                        accumulator.mark_source_exhausted()
+                        accumulator.mark_source_exhausted(
+                            "empty_response",
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            raw_batch_count=0,
+                        )
                         break
                     semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
                     remaining = max(0, accumulator.hard_limit - accumulator.candidate_count)
+                    raw_items = list(notes_res.get("items") or [])
+                    source_has_more = notes_res.get("has_more") if "has_more" in notes_res else None
                     post_items = [
                         post_item
-                        for post_item in notes_res.get("items", {})
+                        for post_item in raw_items
                         if post_item.get("model_type") not in ("rec_query", "hot_query")
                     ][:remaining]
                     if not post_items:
-                        accumulator.mark_source_exhausted()
-                        break
+                        accumulator.begin_batch()
+                        if accumulator.finish_batch(
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            source_has_more=source_has_more,
+                            raw_batch_count=len(raw_items),
+                        ):
+                            break
+                        if source_has_more in (False, 0):
+                            accumulator.mark_source_exhausted(
+                                "has_more_false",
+                                source_page=requested_page,
+                                source_cursor=search_id,
+                                source_has_more=source_has_more,
+                                raw_batch_count=len(raw_items),
+                            )
+                            break
+                        page += 1
+                        await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                        continue
                     task_list = [
                         self.get_note_detail_async_task(
                             note_id=post_item.get("id"),
@@ -495,20 +518,36 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                 break
                         elif accumulator.consider(identity, valid=False):
                             break
-                    page += 1
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Note detail summaries: {self.note_detail_summaries(note_details)}")
                     await self.batch_get_note_comments(note_ids, xsec_tokens)
-                    if accumulator.finish_batch():
+                    if accumulator.finish_batch(
+                        source_page=requested_page,
+                        source_cursor=search_id,
+                        source_has_more=source_has_more,
+                        raw_batch_count=len(raw_items),
+                    ):
                         break
-                    if not notes_res.get("has_more", False):
-                        accumulator.mark_source_exhausted()
+                    if source_has_more in (False, 0):
+                        accumulator.mark_source_exhausted(
+                            "has_more_false",
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            source_has_more=source_has_more,
+                            raw_batch_count=len(raw_items),
+                        )
                         break
+                    page += 1
 
                     # Sleep after each page navigation
                     await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
                 except DataFetchError:
                     utils.logger.error("[XiaoHongShuCrawler.search] Get note detail error")
+                    accumulator.mark_runtime_failed(
+                        "search_or_detail_request_failed",
+                        source_page=page,
+                        source_cursor=search_id,
+                    )
                     break
 
     async def get_creators_and_notes(self) -> None:
