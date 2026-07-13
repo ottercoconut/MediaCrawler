@@ -236,7 +236,11 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         uri = "/api/sns/web/v1/user/selfinfo"
         headers = await self._pre_headers(uri, params={})
         async with make_async_client(proxy=self.proxy) as client:
-            response = await client.get(f"{self._host}{uri}", headers=headers)
+            response = await client.get(
+                f"{self._host}{uri}",
+                headers=headers,
+                timeout=min(self.timeout, 15),
+            )
             if response.status_code == 200:
                 return response.json()
         return None
