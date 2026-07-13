@@ -75,3 +75,19 @@ def test_existing_database_identity_does_not_advance_new_target(monkeypatch, tmp
     assert len(accumulator.existing_valid_identities) == 1
     assert accumulator.consider("new-note", valid=True) is True
     assert accumulator.stop_reason == "target_new_met"
+
+
+def test_resume_identity_does_not_advance_continuation_target(monkeypatch, tmp_path) -> None:
+    resume_path = tmp_path / "resume.json"
+    resume_path.write_text(json.dumps(["prior-note"]), encoding="utf-8")
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_RESUME_IDENTITIES_PATH", str(resume_path))
+    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
+
+    accumulator = AdaptiveAccumulator.from_environment("xhs", hard_limit=10)
+    accumulator.begin_batch()
+
+    assert accumulator.consider("prior-note", valid=True) is False
+    assert accumulator.consider("new-note", valid=True) is True
+    assert len(accumulator.existing_valid_identities) == 1
+    assert len(accumulator.new_valid_identities) == 1

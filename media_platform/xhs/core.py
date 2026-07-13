@@ -507,7 +507,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                 and (note_detail.get("user") or {}).get("nickname")
                                 and note_detail.get("image_list")
                                 and followers_observed
-                                and all(key in interact_info for key in ("liked_count", "collected_count", "comment_count", "share_count"))
+                                and all(
+                                    interact_info.get(key) not in (None, "")
+                                    for key in ("liked_count", "collected_count", "comment_count", "share_count")
+                                )
                             )
                             should_stop = accumulator.consider(identity, valid=valid)
                             await xhs_store.update_xhs_note(note_detail)

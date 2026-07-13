@@ -207,7 +207,10 @@ class WeiboCrawler(AbstractCrawler):
                                 and user.get("screen_name")
                                 and followers_observed
                                 and weibo_store._weibo_pic_urls(mblog)
-                                and all(key in mblog for key in ("attitudes_count", "comments_count", "reposts_count"))
+                                and all(
+                                    mblog.get(key) not in (None, "")
+                                    for key in ("attitudes_count", "comments_count", "reposts_count")
+                                )
                             )
                             should_stop = accumulator.consider(note_id, valid=valid)
                             note_id_list.append(note_id)

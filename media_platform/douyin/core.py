@@ -216,7 +216,10 @@ class DouYinCrawler(AbstractCrawler):
                         and author.get("nickname")
                         and douyin_store._extract_note_image_list(aweme_info)
                         and author_stats.get("followers_observed")
-                        and all(key in statistics for key in ("digg_count", "collect_count", "comment_count", "share_count"))
+                        and all(
+                            statistics.get(key) not in (None, "")
+                            for key in ("digg_count", "collect_count", "comment_count", "share_count")
+                        )
                     )
                     should_stop = accumulator.consider(aweme_id, valid=valid)
                     aweme_list.append(aweme_id)

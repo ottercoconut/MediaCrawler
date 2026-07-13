@@ -25,20 +25,20 @@ def _utc_iso() -> str:
 
 def existing_platform_identities(platform: str) -> set[str]:
     db_value = os.environ.get("TRIPPOSTCOLLECT_DB_PATH", "").strip()
-    if not db_value:
-        return set()
-    try:
-        with sqlite3.connect(Path(db_value).expanduser()) as conn:
-            rows = conn.execute(
-                """
-                SELECT platform_post_id, canonical_url
-                FROM web_posts
-                WHERE platform_key=?
-                """,
-                (platform,),
-            ).fetchall()
-    except (OSError, sqlite3.Error):
-        return set()
+    rows = []
+    if db_value:
+        try:
+            with sqlite3.connect(Path(db_value).expanduser()) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT platform_post_id, canonical_url
+                    FROM web_posts
+                    WHERE platform_key=?
+                    """,
+                    (platform,),
+                ).fetchall()
+        except (OSError, sqlite3.Error):
+            rows = []
     identities: set[str] = set()
     for platform_post_id, canonical_url in rows:
         if platform_post_id:
@@ -47,6 +47,13 @@ def existing_platform_identities(platform: str) -> set[str]:
             path_parts = [part for part in urlparse(str(canonical_url)).path.split("/") if part]
             if path_parts:
                 identities.add(path_parts[-1])
+    resume_value = os.environ.get("TRIPPOSTCOLLECT_RESUME_IDENTITIES_PATH", "").strip()
+    if resume_value:
+        try:
+            resume_identities = json.loads(Path(resume_value).expanduser().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            resume_identities = []
+        identities.update(str(value) for value in resume_identities if value not in (None, ""))
     return identities
 
 
