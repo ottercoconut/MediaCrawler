@@ -18,8 +18,10 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 import asyncio
+import json
 import os
 import random
+import time
 from asyncio import Task
 from typing import Dict, List, Optional
 
@@ -38,6 +40,7 @@ from model.m_xiaohongshu import NoteUrlInfo, CreatorUrlInfo
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
+from tools.trippostcollect_adaptive import AdaptiveAccumulator
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -62,6 +65,262 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
 
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return max(0.0, float(os.environ.get(name, str(default))))
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return max(0, int(os.environ.get(name, str(default))))
+        except ValueError:
+            return default
+
+    def _storage_state_path(self) -> str:
+        explicit_path = os.environ.get("TRIPPOSTCOLLECT_XHS_STORAGE_STATE_PATH", "").strip()
+        if explicit_path:
+            return explicit_path
+        profile_name = config.USER_DATA_DIR % config.PLATFORM
+        return os.path.join(os.getcwd(), "browser_data", profile_name, "trippostcollect_storage_state.json")
+
+    @staticmethod
+    def _cookie_for_restore(cookie: Dict) -> Dict:
+        allowed_keys = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+        restored = {key: value for key, value in cookie.items() if key in allowed_keys and value is not None}
+        if restored.get("expires") == -1:
+            restored.pop("expires", None)
+        return restored
+
+    async def _restore_storage_state(self) -> bool:
+        snapshot_path = self._storage_state_path()
+        if not snapshot_path or not os.path.isfile(snapshot_path):
+            return False
+        try:
+            with open(snapshot_path, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            utils.logger.warning(f"[XiaoHongShuCrawler] Failed to load storage state {snapshot_path}: {exc}")
+            return False
+
+        cookies = [
+            self._cookie_for_restore(cookie)
+            for cookie in state.get("cookies", [])
+            if isinstance(cookie, dict) and cookie.get("name") and cookie.get("value")
+        ]
+        if cookies:
+            try:
+                await self.browser_context.add_cookies(cookies)
+                utils.logger.info(
+                    f"[XiaoHongShuCrawler] Restored {len(cookies)} cookies from storage state: {snapshot_path}"
+                )
+            except Exception as exc:
+                utils.logger.warning(f"[XiaoHongShuCrawler] Restore cookies failed: {exc}")
+
+        storage_by_origin: Dict[str, Dict[str, Dict[str, str]]] = {}
+        for origin_item in state.get("origins", []):
+            if not isinstance(origin_item, dict):
+                continue
+            origin = origin_item.get("origin")
+            if not origin:
+                continue
+            bucket = storage_by_origin.setdefault(origin, {"localStorage": {}, "sessionStorage": {}})
+            for item in origin_item.get("localStorage", []):
+                if isinstance(item, dict) and item.get("name") is not None and item.get("value") is not None:
+                    bucket["localStorage"][str(item["name"])] = str(item["value"])
+
+        for item in state.get("trippostcollect", {}).get("runtime_storage", []):
+            if not isinstance(item, dict):
+                continue
+            origin = item.get("origin")
+            if not origin:
+                continue
+            bucket = storage_by_origin.setdefault(origin, {"localStorage": {}, "sessionStorage": {}})
+            for storage_key in ("localStorage", "sessionStorage"):
+                values = item.get(storage_key)
+                if not isinstance(values, dict):
+                    continue
+                for key, value in values.items():
+                    if value is not None:
+                        bucket[storage_key][str(key)] = str(value)
+
+        if storage_by_origin:
+            script_payload = json.dumps(storage_by_origin, ensure_ascii=False)
+            await self.browser_context.add_init_script(
+                script=f"""
+                (() => {{
+                  const storageByOrigin = {script_payload};
+                  const state = storageByOrigin[location.origin];
+                  if (!state) return;
+                  for (const [key, value] of Object.entries(state.localStorage || {{}})) {{
+                    try {{ window.localStorage.setItem(key, value); }} catch (_) {{}}
+                  }}
+                  for (const [key, value] of Object.entries(state.sessionStorage || {{}})) {{
+                    try {{ window.sessionStorage.setItem(key, value); }} catch (_) {{}}
+                  }}
+                }})();
+                """
+            )
+            utils.logger.info(
+                f"[XiaoHongShuCrawler] Installed storage restore init script for {len(storage_by_origin)} origins"
+            )
+        return bool(cookies or storage_by_origin)
+
+    async def _write_storage_state(self) -> None:
+        snapshot_path = self._storage_state_path()
+        if not snapshot_path:
+            return
+        try:
+            state = await self.browser_context.storage_state()
+            runtime_storage: List[Dict] = []
+            for page in [page for page in self.browser_context.pages if not page.is_closed()]:
+                url = page.url or ""
+                if "xiaohongshu.com" not in url and "rednote.com" not in url:
+                    continue
+                try:
+                    storage = await page.evaluate(
+                        """
+                        () => ({
+                          origin: location.origin,
+                          url: location.href,
+                          localStorage: Object.fromEntries(Object.entries(window.localStorage || {})),
+                          sessionStorage: Object.fromEntries(Object.entries(window.sessionStorage || {}))
+                        })
+                        """
+                    )
+                except Exception as exc:
+                    storage = {"url": url, "error": f"{type(exc).__name__}: {exc}"}
+                runtime_storage.append(storage)
+            state["trippostcollect"] = {
+                "platform": "xhs",
+                "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "runtime_storage": runtime_storage,
+            }
+            os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+            with open(snapshot_path, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(snapshot_path, 0o600)
+            except OSError:
+                pass
+            utils.logger.info(f"[XiaoHongShuCrawler] Wrote storage state snapshot: {snapshot_path}")
+        except Exception as exc:
+            utils.logger.warning(f"[XiaoHongShuCrawler] Write storage state failed: {exc}")
+
+    async def _activate_latest_xhs_page(self) -> None:
+        """Use the newest Xiaohongshu/Rednote page when login opens an extra tab/window."""
+        try:
+            pages = [page for page in self.browser_context.pages if not page.is_closed()]
+        except Exception:
+            return
+        for page in reversed(pages):
+            url = page.url or ""
+            if "xiaohongshu.com" in url or "rednote.com" in url:
+                self.context_page = page
+                return
+
+    async def _profile_ui_visible(self) -> bool:
+        try:
+            await self._activate_latest_xhs_page()
+            selector = "xpath=//a[contains(@href, '/user/profile/')]//span[text()='我']"
+            return await self.context_page.locator(selector).count() > 0
+        except Exception:
+            return False
+
+    async def _cookie_markers(self) -> Dict[str, bool]:
+        try:
+            current_cookie = await self.browser_context.cookies(self.cookie_urls)
+            _, cookie_dict = utils.convert_cookies(current_cookie)
+        except Exception:
+            cookie_dict = {}
+        return {
+            "web_session": bool(cookie_dict.get("web_session")),
+            "a1": bool(cookie_dict.get("a1")),
+            "webId": bool(cookie_dict.get("webId")),
+            "gid": bool(cookie_dict.get("gid")),
+        }
+
+    async def _visible_checkpoint_markers(self) -> Dict[str, object]:
+        markers = {
+            "security": [],
+            "login_or_qr": [],
+            "pages": [],
+        }
+        security_texts = ("请通过验证", "安全验证", "验证码", "身份验证", "操作频繁", "环境异常", "风险")
+        login_texts = ("扫码登录", "二维码", "打开小红书扫一扫", "确认登录", "登录确认", "手机号登录")
+        try:
+            pages = [page for page in self.browser_context.pages if not page.is_closed()]
+        except Exception:
+            pages = [self.context_page]
+        for page in pages:
+            page_info: Dict[str, object] = {"url": page.url}
+            try:
+                content = await page.content()
+            except Exception:
+                content = ""
+            security = sorted({text for text in security_texts if text in content})
+            login_or_qr = sorted({text for text in login_texts if text in content})
+            if security:
+                markers["security"] = sorted(set(markers["security"]) | set(security))  # type: ignore[arg-type]
+            if login_or_qr:
+                markers["login_or_qr"] = sorted(set(markers["login_or_qr"]) | set(login_or_qr))  # type: ignore[arg-type]
+            page_info["security"] = security
+            page_info["login_or_qr"] = login_or_qr
+            markers["pages"].append(page_info)  # type: ignore[union-attr]
+        return markers
+
+    async def _wait_for_initial_page_settle(self) -> None:
+        settle_seconds = self._env_float("TRIPPOSTCOLLECT_XHS_INITIAL_SETTLE_SECONDS", 12.0)
+        try:
+            await self.context_page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        except Exception:
+            pass
+        try:
+            await self.context_page.wait_for_load_state("networkidle", timeout=30_000)
+        except Exception:
+            pass
+        if settle_seconds > 0:
+            utils.logger.info(
+                f"[XiaoHongShuCrawler] Waiting {settle_seconds:.1f}s for Xiaohongshu web startup settle ..."
+            )
+            await asyncio.sleep(settle_seconds)
+        await self._activate_latest_xhs_page()
+
+    async def _wait_for_manual_checkpoint_if_needed(self) -> bool:
+        wait_seconds = self._env_int("TRIPPOSTCOLLECT_XHS_LOGIN_WAIT_SECONDS", 0)
+        if wait_seconds <= 0:
+            return False
+
+        utils.logger.info(
+            f"[XiaoHongShuCrawler] Login state is not ready; waiting up to {wait_seconds}s "
+            "for visible security/login confirmation ..."
+        )
+        started = time.monotonic()
+        last_print = 0.0
+        while time.monotonic() - started < wait_seconds:
+            await self._activate_latest_xhs_page()
+            cookie_markers = await self._cookie_markers()
+            profile_ui = await self._profile_ui_visible()
+            if profile_ui:
+                utils.logger.info(
+                    "[XiaoHongShuCrawler] Login/session markers became ready after manual checkpoint wait: "
+                    f"profile_ui={profile_ui}, cookies={cookie_markers}"
+                )
+                return True
+
+            now = time.monotonic()
+            if now - last_print >= 10:
+                checkpoint_markers = await self._visible_checkpoint_markers()
+                utils.logger.info(
+                    "[XiaoHongShuCrawler] Waiting for Xiaohongshu checkpoint: "
+                    f"profile_ui={profile_ui}, cookies={cookie_markers}, visible={checkpoint_markers}"
+                )
+                last_print = now
+            await asyncio.sleep(2)
+        return False
+
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
         if config.ENABLE_IP_PROXY:
@@ -79,6 +338,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     self.user_agent,
                     headless=config.CDP_HEADLESS,
                 )
+                if self.cdp_manager:
+                    await self.cdp_manager.add_stealth_script()
             else:
                 utils.logger.info("[XiaoHongShuCrawler] Launching browser using standard mode")
                 # Launch a browser context.
@@ -92,25 +353,38 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
+            await self._restore_storage_state()
             self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(self.index_url)
+            await self.context_page.goto(self.index_url, wait_until="domcontentloaded", timeout=60_000)
+            await self._wait_for_initial_page_settle()
 
             # Create a client to interact with the Xiaohongshu website.
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
             if not await self.xhs_client.pong():
-                login_obj = XiaoHongShuLogin(
-                    login_type=config.LOGIN_TYPE,
-                    login_phone="",  # input your phone number
-                    browser_context=self.browser_context,
-                    context_page=self.context_page,
-                    cookie_str=config.COOKIES,
-                )
-                await login_obj.begin()
-                await self.xhs_client.update_cookies(
-                    browser_context=self.browser_context,
-                    urls=self.cookie_urls,
-                )
+                checkpoint_ready = False
+                if await self._wait_for_manual_checkpoint_if_needed():
+                    await self.xhs_client.update_cookies(
+                        browser_context=self.browser_context,
+                        urls=self.cookie_urls,
+                    )
+                    checkpoint_ready = await self.xhs_client.pong()
+                if not checkpoint_ready:
+                    login_obj = XiaoHongShuLogin(
+                        login_type=config.LOGIN_TYPE,
+                        login_phone="",  # input your phone number
+                        browser_context=self.browser_context,
+                        context_page=self.context_page,
+                        cookie_str=config.COOKIES,
+                    )
+                    await login_obj.begin()
+                    await self.xhs_client.update_cookies(
+                        browser_context=self.browser_context,
+                        urls=self.cookie_urls,
+                    )
+                    if not await self.xhs_client.pong():
+                        raise RuntimeError("[XiaoHongShuCrawler] Xiaohongshu login state not confirmed after login flow")
 
+            await self._write_storage_state()
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
@@ -130,15 +404,17 @@ class XiaoHongShuCrawler(AbstractCrawler):
         """Search for notes and retrieve their comment information."""
         utils.logger.info("[XiaoHongShuCrawler.search] Begin search Xiaohongshu keywords")
         xhs_limit_count = 20  # Xiaohongshu limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < xhs_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = xhs_limit_count
+        candidate_hard_limit = max(1, int(config.CRAWLER_MAX_NOTES_COUNT or 1))
+        accumulator = AdaptiveAccumulator.from_environment("xhs", candidate_hard_limit)
+        oversample_pages = max(1, self._env_int("TRIPPOSTCOLLECT_XHS_SEARCH_MAX_PAGES_PER_BATCH", 5))
+        page_fetch_limit = max(xhs_limit_count, candidate_hard_limit, xhs_limit_count * oversample_pages)
         start_page = config.START_PAGE
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[XiaoHongShuCrawler.search] Current search keyword: {keyword}")
             page = 1
             search_id = get_search_id()
-            while (page - start_page + 1) * xhs_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+            while (page - start_page + 1) * xhs_limit_count <= page_fetch_limit and not accumulator.stop_reason:
                 if page < start_page:
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Skip page {page}")
                     page += 1
@@ -155,28 +431,78 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         sort=(SearchSortType(config.SORT_TYPE) if config.SORT_TYPE != "" else SearchSortType.GENERAL),
                     )
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Search notes response: {notes_res}")
-                    if not notes_res or not notes_res.get("has_more", False):
+                    if not notes_res:
                         utils.logger.info("[XiaoHongShuCrawler.search] No more content!")
+                        accumulator.mark_source_exhausted()
                         break
                     semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+                    remaining = max(0, accumulator.hard_limit - accumulator.candidate_count)
+                    post_items = [
+                        post_item
+                        for post_item in notes_res.get("items", {})
+                        if post_item.get("model_type") not in ("rec_query", "hot_query")
+                    ][:remaining]
+                    if not post_items:
+                        accumulator.mark_source_exhausted()
+                        break
                     task_list = [
                         self.get_note_detail_async_task(
                             note_id=post_item.get("id"),
                             xsec_source=post_item.get("xsec_source"),
                             xsec_token=post_item.get("xsec_token"),
                             semaphore=semaphore,
-                        ) for post_item in notes_res.get("items", {}) if post_item.get("model_type") not in ("rec_query", "hot_query")
+                        ) for post_item in post_items
                     ]
                     note_details = await asyncio.gather(*task_list)
-                    for note_detail in note_details:
+                    accumulator.begin_batch()
+                    for post_item, note_detail in zip(post_items, note_details):
+                        identity = str((note_detail or {}).get("note_id") or post_item.get("id") or "")
                         if note_detail:
+                            if self.is_video_note(note_detail):
+                                utils.logger.info(
+                                    f"[XiaoHongShuCrawler.search] Skip video note, note_id: {note_detail.get('note_id')}"
+                                )
+                                if accumulator.consider(identity, valid=False):
+                                    break
+                                continue
+                            await self.enrich_note_creator(note_detail)
+                            creator_profile = note_detail.get("creator_profile") or {}
+                            creator_item = xhs_store._normalized_creator_item(
+                                (note_detail.get("user") or {}).get("user_id", ""),
+                                creator_profile,
+                            ) if creator_profile else {}
+                            followers_observed = any(
+                                creator_item.get(key) not in (None, "")
+                                for key in ("fans_count", "fans")
+                            )
+                            interact_info = note_detail.get("interact_info") or {}
+                            valid = bool(
+                                identity
+                                and (note_detail.get("title") or note_detail.get("desc"))
+                                and note_detail.get("time")
+                                and (note_detail.get("user") or {}).get("user_id")
+                                and (note_detail.get("user") or {}).get("nickname")
+                                and note_detail.get("image_list")
+                                and followers_observed
+                                and all(key in interact_info for key in ("liked_count", "collected_count", "comment_count", "share_count"))
+                            )
+                            should_stop = accumulator.consider(identity, valid=valid)
                             await xhs_store.update_xhs_note(note_detail)
                             await self.get_notice_media(note_detail)
                             note_ids.append(note_detail.get("note_id"))
                             xsec_tokens.append(note_detail.get("xsec_token"))
+                            if should_stop:
+                                break
+                        elif accumulator.consider(identity, valid=False):
+                            break
                     page += 1
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Note details: {note_details}")
+                    utils.logger.info(f"[XiaoHongShuCrawler.search] Note detail summaries: {self.note_detail_summaries(note_details)}")
                     await self.batch_get_note_comments(note_ids, xsec_tokens)
+                    if accumulator.finish_batch():
+                        break
+                    if not notes_res.get("has_more", False):
+                        accumulator.mark_source_exhausted()
+                        break
 
                     # Sleep after each page navigation
                     await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
@@ -240,6 +566,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
         note_details = await asyncio.gather(*task_list)
         for note_detail in note_details:
             if note_detail:
+                if self.is_video_note(note_detail):
+                    utils.logger.info(
+                        f"[XiaoHongShuCrawler.fetch_creator_notes_detail] Skip video note, note_id: {note_detail.get('note_id')}"
+                    )
+                    continue
+                await self.enrich_note_creator(note_detail)
                 await xhs_store.update_xhs_note(note_detail)
                 await self.get_notice_media(note_detail)
 
@@ -265,11 +597,72 @@ class XiaoHongShuCrawler(AbstractCrawler):
         note_details = await asyncio.gather(*get_note_detail_task_list)
         for note_detail in note_details:
             if note_detail:
+                if self.is_video_note(note_detail):
+                    utils.logger.info(
+                        f"[XiaoHongShuCrawler.get_specified_notes] Skip video note, note_id: {note_detail.get('note_id')}"
+                    )
+                    continue
                 need_get_comment_note_ids.append(note_detail.get("note_id", ""))
                 xsec_tokens.append(note_detail.get("xsec_token", ""))
+                await self.enrich_note_creator(note_detail)
                 await xhs_store.update_xhs_note(note_detail)
                 await self.get_notice_media(note_detail)
         await self.batch_get_note_comments(need_get_comment_note_ids, xsec_tokens)
+
+    async def enrich_note_creator(self, note_detail: Dict) -> None:
+        """Attach creator homepage metrics when TripPostCollect requests author enrichment."""
+        if os.environ.get("TRIPPOSTCOLLECT_XHS_ENRICH_CREATORS") != "1":
+            return
+        user_info = note_detail.get("user") or {}
+        user_id = user_info.get("user_id")
+        if not user_id:
+            return
+        try:
+            creator_info = await self.xhs_client.get_creator_info(
+                user_id=user_id,
+                xsec_token=note_detail.get("xsec_token", ""),
+                xsec_source=note_detail.get("xsec_source", "pc_search"),
+            )
+        except Exception as exc:
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler.enrich_note_creator] creator profile fetch failed: {user_id}, {exc}"
+            )
+            return
+        if creator_info:
+            note_detail["creator_profile"] = creator_info
+            await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+
+    @staticmethod
+    def is_video_note(note_detail: Dict) -> bool:
+        note_type = str(note_detail.get("type") or "").strip().lower()
+        return note_type in {"video", "视频"} or "video" in note_type
+
+    @staticmethod
+    def note_detail_summaries(note_details: List[Optional[Dict]]) -> List[Dict]:
+        summaries: List[Dict] = []
+        for note_detail in note_details:
+            if not note_detail:
+                continue
+            user_info = note_detail.get("user") or {}
+            interact_info = note_detail.get("interact_info") or {}
+            creator_profile = note_detail.get("creator_profile") or {}
+            summaries.append(
+                {
+                    "note_id": note_detail.get("note_id"),
+                    "type": note_detail.get("type"),
+                    "title": note_detail.get("title"),
+                    "desc_preview": str(note_detail.get("desc") or "")[:80],
+                    "image_count": len(note_detail.get("image_list") or []),
+                    "user_id": user_info.get("user_id"),
+                    "nickname": user_info.get("nickname"),
+                    "liked_count": interact_info.get("liked_count"),
+                    "collected_count": interact_info.get("collected_count"),
+                    "comment_count": interact_info.get("comment_count"),
+                    "share_count": interact_info.get("share_count"),
+                    "creator_profile": bool(creator_profile),
+                }
+            )
+        return summaries
 
     async def get_note_detail_async_task(
         self,
@@ -376,13 +769,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 "pragma": "no-cache",
                 "priority": "u=1, i",
                 "referer": f"{self.index_url}/",
-                "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+                "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126", "Not.A/Brand";v="99"',
                 "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
+                "sec-ch-ua-platform": '"macOS"',
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-site",
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                "user-agent": self.user_agent,
                 "Cookie": cookie_str,
             },
             playwright_page=self.context_page,
@@ -465,7 +858,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             utils.logger.info(f"[XiaoHongShuCrawler.get_notice_media] Crawling image mode is not enabled")
             return
         await self.get_note_images(note_detail)
-        await self.get_notice_video(note_detail)
+        utils.logger.info("[XiaoHongShuCrawler.get_notice_media] Video media crawling is disabled by TripPostCollect policy")
 
     async def get_note_images(self, note_item: Dict):
         """Get note images. Please use get_notice_media
@@ -503,20 +896,5 @@ class XiaoHongShuCrawler(AbstractCrawler):
         Args:
             note_item: Note item dictionary
         """
-        if not config.ENABLE_GET_MEIDAS:
-            return
-        note_id = note_item.get("note_id")
-
-        videos = xhs_store.get_video_url_arr(note_item)
-
-        if not videos:
-            return
-        videoNum = 0
-        for url in videos:
-            content = await self.xhs_client.get_note_media(url)
-            await asyncio.sleep(random.random())
-            if content is None:
-                continue
-            extension_file_name = f"{videoNum}.mp4"
-            videoNum += 1
-            await xhs_store.update_xhs_note_video(note_id, content, extension_file_name)
+        utils.logger.info("[XiaoHongShuCrawler.get_notice_video] Video media crawling is disabled by TripPostCollect policy")
+        return

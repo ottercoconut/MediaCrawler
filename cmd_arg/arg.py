@@ -216,6 +216,15 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 show_default=True,
             ),
         ] = str(config.ENABLE_GET_SUB_COMMENTS),
+        get_media: Annotated[
+            str,
+            typer.Option(
+                "--get_media",
+                help="Whether to crawl media resources, supports yes/true/t/y/1 or no/false/f/n/0",
+                rich_help_panel="Media Configuration",
+                show_default=True,
+            ),
+        ] = str(config.ENABLE_GET_MEIDAS),
         headless: Annotated[
             str,
             typer.Option(
@@ -225,6 +234,15 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 show_default=True,
             ),
         ] = str(config.HEADLESS),
+        enable_cdp_mode: Annotated[
+            str,
+            typer.Option(
+                "--enable_cdp_mode",
+                help="Whether to launch through Chrome DevTools Protocol when supported",
+                rich_help_panel="Runtime Configuration",
+                show_default=True,
+            ),
+        ] = str(config.ENABLE_CDP_MODE),
         save_data_option: Annotated[
             SaveDataOptionEnum,
             typer.Option(
@@ -337,7 +355,9 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
 
         enable_comment = _to_bool(get_comment)
         enable_sub_comment = _to_bool(get_sub_comment)
+        enable_media = _to_bool(get_media)
         enable_headless = _to_bool(headless)
+        enable_cdp_mode_value = _to_bool(enable_cdp_mode)
         enable_ip_proxy_value = _to_bool(enable_ip_proxy)
         init_db_value = init_db.value if init_db else None
 
@@ -353,8 +373,10 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.KEYWORDS = keywords
         config.ENABLE_GET_COMMENTS = enable_comment
         config.ENABLE_GET_SUB_COMMENTS = enable_sub_comment
+        config.ENABLE_GET_MEIDAS = enable_media
         config.HEADLESS = enable_headless
         config.CDP_HEADLESS = enable_headless
+        config.ENABLE_CDP_MODE = enable_cdp_mode_value
         config.SAVE_DATA_OPTION = save_data_option.value
         config.COOKIES = cookies
         config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = max_comments_count_singlenotes
@@ -409,7 +431,9 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
             keywords=config.KEYWORDS,
             get_comment=config.ENABLE_GET_COMMENTS,
             get_sub_comment=config.ENABLE_GET_SUB_COMMENTS,
+            get_media=config.ENABLE_GET_MEIDAS,
             headless=config.HEADLESS,
+            enable_cdp_mode=config.ENABLE_CDP_MODE,
             save_data_option=config.SAVE_DATA_OPTION,
             init_db=init_db_value,
             cookies=config.COOKIES,

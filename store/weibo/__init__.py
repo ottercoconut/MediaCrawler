@@ -32,6 +32,44 @@ from .weibo_store_media import *
 from ._store_impl import *
 
 
+def _first_present(*values):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _weibo_pic_url(pic):
+    if isinstance(pic, str):
+        return pic
+    if not isinstance(pic, dict):
+        return None
+    for key in ("url", "large", "bmiddle", "middleplus", "thumbnail"):
+        value = pic.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            nested_url = value.get("url")
+            if nested_url:
+                return nested_url
+    return None
+
+
+def _weibo_pic_urls(mblog: Dict) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+    pics = mblog.get("pics") or []
+    if not isinstance(pics, list):
+        return urls
+    for pic in pics:
+        url = _weibo_pic_url(pic)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
 class WeibostoreFactory:
     STORES = {
         "csv": WeiboCsvStoreImplement,
@@ -84,6 +122,17 @@ async def update_weibo_note(note_item: Dict):
     note_id = mblog.get("id")
     content_text = mblog.get("text")
     clean_text = re.sub(r"<.*?>", "", content_text)
+    image_list = _weibo_pic_urls(mblog)
+    followers_count = _first_present(
+        user_info.get("followers_count"),
+        user_info.get("followers_count_str"),
+        user_info.get("fans_count"),
+        user_info.get("fans_count_str"),
+    )
+    followers_observed = any(
+        key in user_info and user_info.get(key) not in (None, "")
+        for key in ("followers_count", "followers_count_str", "fans_count", "fans_count_str")
+    )
     # 教学版：原始 user_id 匿名化为 creator_hash，昵称脱敏；
     # 不采集头像/主页链接/性别/IP 归属地等可定位真人的信息。
     save_content_item = {
@@ -97,10 +146,16 @@ async def update_weibo_note(note_item: Dict):
         "shared_count": str(mblog.get("reposts_count", 0)),
         "last_modify_ts": utils.get_current_timestamp(),
         "note_url": f"https://m.weibo.cn/detail/{note_id}",
+        "image_list": image_list,
+        "image_count": len(image_list),
 
         # 创作者信息（匿名化/脱敏，不含原始 user_id/avatar/gender/profile_url/ip_location）
         "creator_hash": anonymize_user_id(user_info.get("id")),
         "nickname": mask_nickname(user_info.get("screen_name", "")),
+        "followers_count": followers_count,
+        "fans_count": followers_count,
+        "followers_observed": followers_observed,
+        "author_followers_source": "search_author" if followers_observed else "missing",
         "source_keyword": source_keyword_var.get(),
     }
     utils.logger.info(f"[store.weibo.update_weibo_note] weibo note id:{note_id}, title:{save_content_item.get('content')[:24]} ...")

@@ -21,7 +21,7 @@
 # @Author  : relakkes@gmail.com
 # @Time    : 2024/1/14 18:46
 # @Desc    :
-from typing import List
+from typing import Any, List
 
 import config
 from var import source_keyword_var
@@ -29,6 +29,106 @@ from tools.user_hash import anonymize_user_id, mask_nickname
 
 from ._store_impl import *
 from .douyin_store_media import *
+
+
+def _first_nonempty(*values):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _nested_value(data: Dict, *paths):
+    for path in paths:
+        current = data
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if current not in (None, ""):
+            return current
+    return None
+
+
+def _creator_user_profile(creator_profile: Dict) -> Dict:
+    user = (
+        creator_profile.get("user")
+        or creator_profile.get("user_info")
+        or creator_profile.get("author")
+        or creator_profile.get("profile")
+        or creator_profile
+        or {}
+    )
+    return user if isinstance(user, dict) else {}
+
+
+def _author_metric(author: Dict, creator_profile: Dict, *keys: str):
+    profile_user = _creator_user_profile(creator_profile)
+    candidates = []
+    for key in keys:
+        value = _first_nonempty(author.get(key), profile_user.get(key), creator_profile.get(key))
+        if value not in (None, "") and not isinstance(value, (dict, list)):
+            candidates.append(value)
+    expected = {key.lower() for key in keys}
+
+    def walk(data):
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if str(key).lower() in expected and value not in (None, "") and not isinstance(value, (dict, list)):
+                    candidates.append(value)
+                elif isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(data, list):
+            for item in data:
+                walk(item)
+
+    walk(creator_profile)
+    for value in candidates:
+        if str(value) != "0":
+            return value
+    return candidates[0] if candidates else None
+
+
+def _normalized_author_stats(author: Dict, creator_profile: Dict) -> Dict:
+    follower_keys = (
+        "follower_count",
+        "followers_count",
+        "mplatform_followers_count",
+        "fans_count",
+        "fans",
+    )
+    followers_count = _author_metric(
+        author,
+        creator_profile,
+        *follower_keys,
+    )
+    expected = {key.lower() for key in follower_keys}
+
+    def observed(data: Any) -> bool:
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if str(key).lower() in expected and value not in (None, "") and not isinstance(value, (dict, list)):
+                    return True
+                if isinstance(value, (dict, list)) and observed(value):
+                    return True
+        elif isinstance(data, list):
+            return any(observed(item) for item in data)
+        return False
+
+    profile_observed = observed(creator_profile)
+    search_observed = observed(author)
+    followers_observed = profile_observed or search_observed
+    return {
+        "followers_count": followers_count,
+        "fans_count": followers_count,
+        "following_count": _author_metric(author, creator_profile, "following_count", "follow_count", "follows"),
+        "aweme_count": _author_metric(author, creator_profile, "aweme_count", "post_count", "posts_count", "video_count"),
+        "author_liked_count": _author_metric(author, creator_profile, "total_favorited", "favorited_count", "liked_count"),
+        "followers_observed": followers_observed,
+        "author_followers_source": "creator_profile" if profile_observed else ("search_author" if search_observed else "missing"),
+        "author_followers_zero_suspicious": str(followers_count) == "0" and not profile_observed,
+    }
 
 
 class DouyinStoreFactory:
@@ -158,6 +258,8 @@ def _extract_music_download_url(aweme_detail: Dict) -> str:
 async def update_douyin_aweme(aweme_item: Dict):
     aweme_id = aweme_item.get("aweme_id")
     user_info = aweme_item.get("author", {})
+    creator_profile = aweme_item.get("creator_profile") or {}
+    author_stats = _normalized_author_stats(user_info, creator_profile)
     interact_info = aweme_item.get("statistics", {})
     save_content_item = {
         "aweme_id": aweme_id,
@@ -167,6 +269,14 @@ async def update_douyin_aweme(aweme_item: Dict):
         "create_time": aweme_item.get("create_time"),
         "creator_hash": anonymize_user_id(user_info.get("uid")),  # 创作者匿名哈希(不存原始 uid)
         "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称(已脱敏)
+        "followers_count": author_stats.get("followers_count"),
+        "fans_count": author_stats.get("fans_count"),
+        "followers_observed": author_stats.get("followers_observed"),
+        "following_count": author_stats.get("following_count"),
+        "aweme_count": author_stats.get("aweme_count"),
+        "author_liked_count": author_stats.get("author_liked_count"),
+        "author_followers_source": author_stats.get("author_followers_source"),
+        "author_followers_zero_suspicious": author_stats.get("author_followers_zero_suspicious"),
         "liked_count": str(interact_info.get("digg_count")),
         "collected_count": str(interact_info.get("collect_count")),
         "comment_count": str(interact_info.get("comment_count")),

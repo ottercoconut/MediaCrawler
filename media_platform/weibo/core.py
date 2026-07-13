@@ -41,6 +41,7 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import weibo as weibo_store
 from tools import utils
+from tools.trippostcollect_adaptive import AdaptiveAccumulator
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -144,6 +145,7 @@ class WeiboCrawler(AbstractCrawler):
         if config.CRAWLER_MAX_NOTES_COUNT < weibo_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = weibo_limit_count
         start_page = config.START_PAGE
+        accumulator = AdaptiveAccumulator.from_environment("weibo", config.CRAWLER_MAX_NOTES_COUNT)
 
         # Set the search type based on the configuration for weibo
         if config.WEIBO_SEARCH_TYPE == "default":
@@ -162,7 +164,7 @@ class WeiboCrawler(AbstractCrawler):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[WeiboCrawler.search] Current search keyword: {keyword}")
             page = 1
-            while (page - start_page + 1) * weibo_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+            while (page - start_page + 1) * weibo_limit_count <= config.CRAWLER_MAX_NOTES_COUNT and not accumulator.stop_reason:
                 if page < start_page:
                     utils.logger.info(f"[WeiboCrawler.search] Skip page: {page}")
                     page += 1
@@ -171,15 +173,38 @@ class WeiboCrawler(AbstractCrawler):
                 search_res = await self.wb_client.get_note_by_keyword(keyword=keyword, page=page, search_type=search_type)
                 note_id_list: List[str] = []
                 note_list = filter_search_result_card(search_res.get("cards"))
+                if not note_list:
+                    accumulator.mark_source_exhausted()
+                    break
                 # If full text fetching is enabled, batch get full text of posts
                 note_list = await self.batch_get_notes_full_text(note_list)
+                accumulator.begin_batch()
                 for note_item in note_list:
                     if note_item:
                         mblog: Dict = note_item.get("mblog")
                         if mblog:
-                            note_id_list.append(mblog.get("id"))
+                            note_id = str(mblog.get("id") or "")
+                            user = mblog.get("user") or {}
+                            followers_observed = any(
+                                key in user and user.get(key) not in (None, "")
+                                for key in ("followers_count", "followers_count_str", "fans_count", "fans_count_str")
+                            )
+                            valid = bool(
+                                note_id
+                                and mblog.get("text")
+                                and mblog.get("created_at")
+                                and user.get("id")
+                                and user.get("screen_name")
+                                and followers_observed
+                                and weibo_store._weibo_pic_urls(mblog)
+                                and all(key in mblog for key in ("attitudes_count", "comments_count", "reposts_count"))
+                            )
+                            should_stop = accumulator.consider(note_id, valid=valid)
+                            note_id_list.append(note_id)
                             await weibo_store.update_weibo_note(note_item)
                             await self.get_note_images(mblog)
+                            if should_stop:
+                                break
 
                 page += 1
 
@@ -188,6 +213,8 @@ class WeiboCrawler(AbstractCrawler):
                 utils.logger.info(f"[WeiboCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
 
                 await self.batch_get_notes_comments(note_id_list)
+                if accumulator.finish_batch():
+                    break
 
     async def get_specified_notes(self):
         """
@@ -379,11 +406,10 @@ class WeiboCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
-                channel="chrome",  # Use system's Chrome stable version
             )
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel="chrome")  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore
             browser_context = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
             return browser_context
 

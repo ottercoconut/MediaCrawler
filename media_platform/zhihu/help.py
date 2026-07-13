@@ -35,6 +35,49 @@ from tools.user_hash import anonymize_user_id, mask_nickname
 ZHIHU_SGIN_JS = None
 
 
+def _first_non_empty(*values):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def _normalize_image_url(url: str) -> str:
+    url = (url or "").strip()
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.startswith(("http://", "https://")):
+        return url
+    return ""
+
+
+def extract_image_urls_from_html(html_content: str) -> List[str]:
+    """
+    Extract content image URLs before the HTML is converted to plain text.
+    Zhihu lazy-loads images, so prefer original/actual image attributes over
+    placeholder data:image values.
+    """
+    if not html_content:
+        return []
+    selector = Selector(text=html_content)
+    image_urls: List[str] = []
+    seen = set()
+    for image in selector.css("img"):
+        candidates = [
+            image.attrib.get("data-original", ""),
+            image.attrib.get("data-actualsrc", ""),
+            image.attrib.get("src", ""),
+        ]
+        for candidate in candidates:
+            url = _normalize_image_url(candidate)
+            if not url or "/equation?" in url or url in seen:
+                continue
+            seen.add(url)
+            image_urls.append(url)
+            break
+    return image_urls
+
+
 def sign(url: str, cookies: str) -> Dict:
     """
     zhihu sign algorithm
@@ -56,6 +99,20 @@ def sign(url: str, cookies: str) -> Dict:
 class ZhihuExtractor:
     def __init__(self):
         pass
+
+    @staticmethod
+    def _apply_author_info(content: ZhihuContent, author_info: ZhihuCreator) -> None:
+        content.creator_hash = author_info.creator_hash
+        content.creator_url_token = author_info.url_token
+        content.user_nickname = author_info.user_nickname
+        content.author_profile_url = author_info.profile_url
+        content.avatar_url = author_info.avatar_url
+        content.followers_count = author_info.fans
+        content.followers_observed = author_info.followers_observed
+        content.author_followers_source = author_info.author_followers_source
+        content.following_count = author_info.follows
+        content.author_desc = author_info.headline
+        content.verified_text = author_info.verified_text
 
     def extract_contents_from_search(self, json_data: Dict) -> List[ZhihuContent]:
         """
@@ -109,7 +166,10 @@ class ZhihuExtractor:
         res = ZhihuContent()
         res.content_id = str(answer.get("id") or "")
         res.content_type = answer.get("type")
-        res.content_text = extract_text_from_html(answer.get("content", ""))
+        content_html = answer.get("content", "") or ""
+        res.content_text = extract_text_from_html(content_html)
+        res.image_list = extract_image_urls_from_html(content_html)
+        res.image_count = len(res.image_list)
         res.question_id = str(answer.get("question", {}).get("id") or "")
         res.content_url = f"{zhihu_constant.ZHIHU_URL}/question/{res.question_id}/answer/{res.content_id}"
         res.title = extract_text_from_html(answer.get("title", ""))
@@ -121,8 +181,7 @@ class ZhihuExtractor:
 
         # extract author info
         author_info = self._extract_content_or_comment_author(answer.get("author"))
-        res.creator_hash = author_info.creator_hash
-        res.user_nickname = author_info.user_nickname
+        self._apply_author_info(res, author_info)
         return res
 
     def _extract_article_content(self, article: Dict) -> ZhihuContent:
@@ -137,7 +196,10 @@ class ZhihuExtractor:
         res = ZhihuContent()
         res.content_id = str(article.get("id") or "")
         res.content_type = article.get("type")
-        res.content_text = extract_text_from_html(article.get("content"))
+        content_html = article.get("content", "") or ""
+        res.content_text = extract_text_from_html(content_html)
+        res.image_list = extract_image_urls_from_html(content_html)
+        res.image_count = len(res.image_list)
         res.content_url = f"{zhihu_constant.ZHIHU_ZHUANLAN_URL}/p/{res.content_id}"
         res.title = extract_text_from_html(article.get("title"))
         res.desc = extract_text_from_html(article.get("excerpt"))
@@ -148,8 +210,7 @@ class ZhihuExtractor:
 
         # extract author info
         author_info = self._extract_content_or_comment_author(article.get("author"))
-        res.creator_hash = author_info.creator_hash
-        res.user_nickname = author_info.user_nickname
+        self._apply_author_info(res, author_info)
         return res
 
     def _extract_zvideo_content(self, zvideo: Dict) -> ZhihuContent:
@@ -179,8 +240,7 @@ class ZhihuExtractor:
 
         # extract author info
         author_info = self._extract_content_or_comment_author(zvideo.get("author"))
-        res.creator_hash = author_info.creator_hash
-        res.user_nickname = author_info.user_nickname
+        self._apply_author_info(res, author_info)
         return res
 
     @staticmethod
@@ -199,8 +259,24 @@ class ZhihuExtractor:
                 return res
             if not author.get("id"):
                 author = author.get("member")
+            if not author:
+                return res
             res.creator_hash = anonymize_user_id(author.get("id"))
+            res.url_token = author.get("url_token") or ""
             res.user_nickname = mask_nickname(author.get("name"))
+            if res.url_token:
+                res.profile_url = f"{zhihu_constant.ZHIHU_URL}/people/{res.url_token}"
+            res.avatar_url = author.get("avatar_url") or ""
+            res.followers_observed = any(
+                key in author and author.get(key) not in (None, "")
+                for key in ("follower_count", "followerCount")
+            )
+            res.fans = _first_non_empty(author.get("follower_count"), author.get("followerCount"), 0)
+            res.author_followers_source = "search_author" if res.followers_observed else "missing"
+            res.follows = _first_non_empty(author.get("following_count"), author.get("followingCount"), 0)
+            res.headline = author.get("headline") or ""
+            badge_v2 = author.get("badge_v2") or {}
+            res.verified_text = author.get("verify_bayes") or badge_v2.get("title") or ""
 
         except Exception as e :
             utils.logger.warning(
@@ -338,10 +414,16 @@ class ZhihuExtractor:
             return None
 
         res = ZhihuCreator()
+        res.url_token = user_url_token
         res.creator_hash = anonymize_user_id(creator_info.get("id"))
         res.user_nickname = mask_nickname(creator_info.get("name"))
+        res.profile_url = f"{zhihu_constant.ZHIHU_URL}/people/{user_url_token}"
+        res.avatar_url = creator_info.get("avatarUrl") or creator_info.get("avatar_url") or ""
         res.follows = creator_info.get("followingCount")
         res.fans = creator_info.get("followerCount")
+        res.headline = creator_info.get("headline") or creator_info.get("description") or ""
+        badge_v2 = creator_info.get("badgeV2") or creator_info.get("badge_v2") or {}
+        res.verified_text = badge_v2.get("title") or ""
         res.anwser_count = creator_info.get("answerCount")
         res.video_count = creator_info.get("zvideoCount")
         res.question_count = creator_info.get("questionCount")

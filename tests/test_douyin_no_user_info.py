@@ -70,6 +70,10 @@ def _build_aweme_item() -> dict:
             "avatar_thumb": {"url_list": ["http://x/avatar_thumb.jpg"]},
             "avatar_medium": {"url_list": ["http://x/avatar_medium.jpg"]},
             "signature": "这是创作者个人签名内容",
+            "follower_count": 12345,
+            "following_count": 321,
+            "aweme_count": 88,
+            "total_favorited": 7654321,
         },
         "statistics": {
             "digg_count": 100,
@@ -202,6 +206,12 @@ def test_douyin_aweme_masks_user_info():
     assert captured.get("nickname")
     assert captured["nickname"] != raw_nick
     assert captured["nickname"] == mask_nickname(raw_nick)
+    # 4.1 作者统计字段保留；这些不是可定位真人的原始 ID/头像/签名。
+    assert captured.get("followers_count") == 12345
+    assert captured.get("fans_count") == 12345
+    assert captured.get("following_count") == 321
+    assert captured.get("aweme_count") == 88
+    assert captured.get("author_liked_count") == 7654321
     # 5. 内容字段保留(desc/title 是作品描述,不禁用)
     assert captured.get("desc") == aweme["desc"]
     assert captured.get("title") == aweme["desc"]
@@ -287,6 +297,11 @@ def test_douyin_store_end_to_end_sqlite(monkeypatch):
     assert obj.creator_hash != raw_uid
     assert obj.nickname == mask_nickname(raw_nick)
     assert obj.nickname != raw_nick
+    assert obj.followers_count == 12345
+    assert obj.fans_count == 12345
+    assert obj.following_count == 321
+    assert obj.aweme_count == 88
+    assert obj.author_liked_count == 7654321
     assert obj.title == aweme["desc"]
     assert obj.desc == aweme["desc"]
     _assert_no_forbidden(captured, "douyin_aweme_orm_construct")
@@ -325,6 +340,11 @@ def test_douyin_store_end_to_end_sqlite(monkeypatch):
     assert row.creator_hash != raw_uid
     assert row.nickname == mask_nickname(raw_nick)
     assert row.nickname != raw_nick
+    assert row.followers_count == "12345"
+    assert row.fans_count == "12345"
+    assert row.following_count == "321"
+    assert row.aweme_count == "88"
+    assert row.author_liked_count == "7654321"
     assert row.desc == aweme["desc"]
     assert row.title == aweme["desc"]
     assert row.cover_url == "http://x/cover.jpg"

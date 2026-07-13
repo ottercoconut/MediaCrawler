@@ -24,6 +24,7 @@ import socket
 import httpx
 import signal
 import atexit
+from pathlib import Path
 from typing import Optional, Dict, Any
 from playwright.async_api import Browser, BrowserContext, Playwright
 
@@ -247,6 +248,42 @@ class CDPBrowserManager:
             utils.logger.warning(f"[CDPBrowserManager] CDP connection test failed: {e}")
             return False
 
+    def _clean_session_restore_tabs(self, user_data_dir: str) -> None:
+        """
+        Remove Chromium session restore files without touching login cookies/storage.
+        """
+        if not os.environ.get("TRIPPOSTCOLLECT_CLEAN_BROWSER_TABS"):
+            return
+
+        profile_root = Path(user_data_dir)
+        default_profile = profile_root / "Default"
+        candidates = [
+            default_profile / "Current Session",
+            default_profile / "Current Tabs",
+            default_profile / "Last Session",
+            default_profile / "Last Tabs",
+        ]
+        sessions_dir = default_profile / "Sessions"
+        if sessions_dir.exists():
+            candidates.extend(sessions_dir.glob("Session_*"))
+            candidates.extend(sessions_dir.glob("Tabs_*"))
+
+        removed = 0
+        for path in candidates:
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed += 1
+            except OSError as exc:
+                utils.logger.warning(
+                    f"[CDPBrowserManager] Failed to remove stale session tab file {path}: {exc}"
+                )
+
+        if removed:
+            utils.logger.info(
+                f"[CDPBrowserManager] Removed {removed} stale session tab files from {user_data_dir}"
+            )
+
     async def _launch_browser(self, browser_path: str, headless: bool):
         """
         Launch browser process
@@ -254,13 +291,17 @@ class CDPBrowserManager:
         # Set user data directory (if save login state is enabled)
         user_data_dir = None
         if config.SAVE_LOGIN_STATE:
+            profile_name = config.USER_DATA_DIR % config.PLATFORM
+            if not os.environ.get("TRIPPOSTCOLLECT_SHARE_CDP_PROFILE"):
+                profile_name = f"cdp_{profile_name}"
             user_data_dir = os.path.join(
                 os.getcwd(),
                 "browser_data",
-                f"cdp_{config.USER_DATA_DIR % config.PLATFORM}",
+                profile_name,
             )
             os.makedirs(user_data_dir, exist_ok=True)
             utils.logger.info(f"[CDPBrowserManager] User data directory: {user_data_dir}")
+            self._clean_session_restore_tabs(user_data_dir)
 
         # Launch browser
         self.launcher.browser_process = self.launcher.launch_browser(

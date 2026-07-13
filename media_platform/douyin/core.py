@@ -36,6 +36,7 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
+from tools.trippostcollect_adaptive import AdaptiveAccumulator
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -63,6 +64,8 @@ class DouYinCrawler(AbstractCrawler):
         ]
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
+        self.creator_profile_cache: Dict[str, Dict] = {}
+        self.creator_profile_enriched_count = 0
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -95,7 +98,7 @@ class DouYinCrawler(AbstractCrawler):
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
             self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(self.index_url)
+            await self.context_page.goto(self.index_url, wait_until="domcontentloaded")
 
             self.dy_client = await self.create_douyin_client(httpx_proxy_format)
             if not await self.dy_client.pong(browser_context=self.browser_context):
@@ -130,13 +133,14 @@ class DouYinCrawler(AbstractCrawler):
         if config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
         start_page = config.START_PAGE  # start page number
+        accumulator = AdaptiveAccumulator.from_environment("douyin", config.CRAWLER_MAX_NOTES_COUNT)
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[DouYinCrawler.search] Current keyword: {keyword}")
             aweme_list: List[str] = []
             page = 0
             dy_search_id = ""
-            while (page - start_page + 1) * dy_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+            while (page - start_page + 1) * dy_limit_count <= config.CRAWLER_MAX_NOTES_COUNT and not accumulator.stop_reason:
                 if page < start_page:
                     utils.logger.info(f"[DouYinCrawler.search] Skip {page}")
                     page += 1
@@ -151,6 +155,7 @@ class DouYinCrawler(AbstractCrawler):
                     )
                     if posts_res.get("data") is None or posts_res.get("data") == []:
                         utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,{posts_res.get('data')}`")
+                        accumulator.mark_source_exhausted()
                         break
                 except DataFetchError:
                     utils.logger.error(f"[DouYinCrawler.search] search douyin keyword: {keyword} failed")
@@ -162,23 +167,79 @@ class DouYinCrawler(AbstractCrawler):
                     break
                 dy_search_id = posts_res.get("extra", {}).get("logid", "")
                 page_aweme_list = []
+                accumulator.begin_batch()
                 for post_item in posts_res.get("data"):
                     try:
                         aweme_info: Dict = (post_item.get("aweme_info") or post_item.get("aweme_mix_info", {}).get("mix_items")[0])
                     except TypeError:
+                        if accumulator.consider("", valid=False):
+                            break
                         continue
-                    aweme_list.append(aweme_info.get("aweme_id", ""))
-                    page_aweme_list.append(aweme_info.get("aweme_id", ""))
+                    aweme_info = await self.enrich_aweme_creator(aweme_info)
+                    aweme_id = str(aweme_info.get("aweme_id") or "")
+                    author = aweme_info.get("author") or {}
+                    creator_profile = aweme_info.get("creator_profile") or {}
+                    author_stats = douyin_store._normalized_author_stats(author, creator_profile)
+                    statistics = aweme_info.get("statistics") or {}
+                    valid = bool(
+                        aweme_id
+                        and aweme_info.get("desc")
+                        and aweme_info.get("create_time")
+                        and author.get("uid")
+                        and author.get("nickname")
+                        and douyin_store._extract_note_image_list(aweme_info)
+                        and author_stats.get("followers_observed")
+                        and all(key in statistics for key in ("digg_count", "collect_count", "comment_count", "share_count"))
+                    )
+                    should_stop = accumulator.consider(aweme_id, valid=valid)
+                    aweme_list.append(aweme_id)
+                    page_aweme_list.append(aweme_id)
                     await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                     await self.get_aweme_media(aweme_item=aweme_info)
+                    if should_stop:
+                        break
                 
                 # Batch get note comments for the current page
                 await self.batch_get_note_comments(page_aweme_list)
+                if accumulator.finish_batch():
+                    break
 
                 # Sleep after each page navigation
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                 utils.logger.info(f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
             utils.logger.info(f"[DouYinCrawler.search] keyword:{keyword}, aweme_list:{aweme_list}")
+
+    async def enrich_aweme_creator(self, aweme_info: Dict) -> Dict:
+        if os.environ.get("TRIPPOSTCOLLECT_DOUYIN_ENRICH_CREATORS") != "1":
+            return aweme_info
+        author = aweme_info.get("author") or {}
+        if os.environ.get("TRIPPOSTCOLLECT_DOUYIN_ENRICH_ONLY_IMAGES", "1") == "1":
+            if not douyin_store._extract_note_image_list(aweme_info) and str(aweme_info.get("aweme_type")) not in {"68"}:
+                return aweme_info
+        sec_uid = author.get("sec_uid") or author.get("sec_user_id")
+        if not sec_uid:
+            return aweme_info
+        if sec_uid in self.creator_profile_cache:
+            creator_profile = self.creator_profile_cache[sec_uid]
+            if creator_profile:
+                aweme_info["creator_profile"] = creator_profile
+            return aweme_info
+        max_enrich = int(os.environ.get("TRIPPOSTCOLLECT_DOUYIN_MAX_CREATOR_ENRICH", "30"))
+        if max_enrich >= 0 and self.creator_profile_enriched_count >= max_enrich:
+            return aweme_info
+        try:
+            creator_profile = await self.dy_client.get_user_info(sec_uid)
+            self.creator_profile_cache[sec_uid] = creator_profile or {}
+            self.creator_profile_enriched_count += 1
+            if creator_profile:
+                aweme_info["creator_profile"] = creator_profile
+            sleep_seconds = float(os.environ.get("TRIPPOSTCOLLECT_DOUYIN_CREATOR_SLEEP_SECONDS", "0.25"))
+            if sleep_seconds > 0:
+                await asyncio.sleep(sleep_seconds)
+        except DataFetchError as exc:
+            self.creator_profile_cache[sec_uid] = {}
+            utils.logger.warning(f"[DouYinCrawler.enrich_aweme_creator] get creator profile failed: {exc}")
+        return aweme_info
 
     async def get_specified_awemes(self):
         """Get the information and comments of the specified post from URLs or IDs"""
@@ -211,6 +272,7 @@ class DouYinCrawler(AbstractCrawler):
         aweme_details = await asyncio.gather(*task_list)
         for aweme_detail in aweme_details:
             if aweme_detail is not None:
+                aweme_detail = await self.enrich_aweme_creator(aweme_detail)
                 await douyin_store.update_douyin_aweme(aweme_item=aweme_detail)
                 await self.get_aweme_media(aweme_item=aweme_detail)
         await self.batch_get_note_comments(aweme_id_list)
@@ -229,6 +291,9 @@ class DouYinCrawler(AbstractCrawler):
                 return None
             except KeyError as ex:
                 utils.logger.error(f"[DouYinCrawler.get_aweme_detail] have not fund note detail aweme_id:{aweme_id}, err: {ex}")
+                return None
+            except Exception as ex:
+                utils.logger.warning(f"[DouYinCrawler.get_aweme_detail] Skip aweme after request error aweme_id:{aweme_id}, err: {ex}")
                 return None
 
     async def batch_get_note_comments(self, aweme_list: List[str]) -> None:

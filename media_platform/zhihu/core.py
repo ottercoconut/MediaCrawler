@@ -40,6 +40,7 @@ from model.m_zhihu import ZhihuContent, ZhihuCreator
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import zhihu as zhihu_store
 from tools import utils
+from tools.trippostcollect_adaptive import AdaptiveAccumulator
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -63,6 +64,65 @@ class ZhihuCrawler(AbstractCrawler):
         self._extractor = ZhihuExtractor()
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            return default
+
+    async def _activate_latest_zhihu_page(self) -> None:
+        try:
+            pages = [page for page in self.browser_context.pages if not page.is_closed()]
+        except Exception:
+            return
+        for page in reversed(pages):
+            if "zhihu.com" in (page.url or ""):
+                self.context_page = page
+                return
+
+    async def _close_stale_pages(self, keep_page: Page) -> None:
+        try:
+            pages = [page for page in self.browser_context.pages if not page.is_closed()]
+        except Exception:
+            return
+
+        closed_count = 0
+        for page in pages:
+            if page is keep_page:
+                continue
+            try:
+                await page.close(run_before_unload=False)
+                closed_count += 1
+            except Exception as exc:
+                utils.logger.warning(
+                    f"[ZhihuCrawler] Failed to close stale browser tab {page.url}: {exc}"
+                )
+
+        if closed_count:
+            utils.logger.info(f"[ZhihuCrawler] Closed {closed_count} stale browser tabs")
+
+    async def _wait_for_initial_login_settle(self) -> None:
+        settle_seconds = self._env_float("TRIPPOSTCOLLECT_ZHIHU_INITIAL_SETTLE_SECONDS", 0.0)
+        await self._activate_latest_zhihu_page()
+        try:
+            await self.context_page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        except Exception:
+            pass
+        try:
+            await self.context_page.wait_for_load_state("networkidle", timeout=30_000)
+        except Exception:
+            pass
+        if settle_seconds > 0:
+            utils.logger.info(
+                f"[ZhihuCrawler] Waiting {settle_seconds:.1f}s for Zhihu login state settle ..."
+            )
+            await asyncio.sleep(settle_seconds)
+        await self._activate_latest_zhihu_page()
 
     async def start(self) -> None:
         """
@@ -101,7 +161,33 @@ class ZhihuCrawler(AbstractCrawler):
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
             self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(self.index_url, wait_until="domcontentloaded")
+            await self._close_stale_pages(self.context_page)
+            try:
+                await self.context_page.goto(
+                    self.index_url,
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+            except Exception as exc:
+                utils.logger.warning(
+                    f"[ZhihuCrawler.start] Initial homepage navigation did not settle: {exc}"
+                )
+            if config.LOGIN_TYPE == "cookie" and config.COOKIES:
+                for key, value in utils.convert_str_cookie_to_dict(config.COOKIES).items():
+                    await self.browser_context.add_cookies(
+                        [{"name": key, "value": value, "domain": ".zhihu.com", "path": "/"}]
+                    )
+                try:
+                    await self.context_page.reload(
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                except Exception as exc:
+                    utils.logger.warning(
+                        f"[ZhihuCrawler.start] Cookie reload did not settle: {exc}"
+                    )
+            await self._wait_for_initial_login_settle()
+            await self._close_stale_pages(self.context_page)
 
             # Create a client to interact with the zhihu website.
             self.zhihu_client = await self.create_zhihu_client(httpx_proxy_format)
@@ -123,9 +209,16 @@ class ZhihuCrawler(AbstractCrawler):
             utils.logger.info(
                 "[ZhihuCrawler.start] Zhihu navigating to search page to get search page cookies, this process takes about 5 seconds"
             )
-            await self.context_page.goto(
-                f"{self.index_url}/search?q=python&search_source=Guess&utm_content=search_hot&type=content"
-            )
+            try:
+                await self.context_page.goto(
+                    f"{self.index_url}/search?q=python&search_source=Guess&utm_content=search_hot&type=content",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+            except Exception as exc:
+                utils.logger.warning(
+                    f"[ZhihuCrawler.start] Search-page navigation did not settle: {exc}"
+                )
             await asyncio.sleep(5)
             await self.zhihu_client.update_cookies(
                 browser_context=self.browser_context,
@@ -154,13 +247,14 @@ class ZhihuCrawler(AbstractCrawler):
         if config.CRAWLER_MAX_NOTES_COUNT < zhihu_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = zhihu_limit_count
         start_page = config.START_PAGE
+        accumulator = AdaptiveAccumulator.from_environment("zhihu", config.CRAWLER_MAX_NOTES_COUNT)
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(
                 f"[ZhihuCrawler.search] Current search keyword: {keyword}"
             )
             page = 1
-            while (
+            while not accumulator.stop_reason and (
                 page - start_page + 1
             ) * zhihu_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
                 if page < start_page:
@@ -183,6 +277,7 @@ class ZhihuCrawler(AbstractCrawler):
                     )
                     if not content_list:
                         utils.logger.info("No more content!")
+                        accumulator.mark_source_exhausted()
                         break
 
                     # Sleep after page navigation
@@ -190,10 +285,25 @@ class ZhihuCrawler(AbstractCrawler):
                     utils.logger.info(f"[ZhihuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
 
                     page += 1
+                    accumulator.begin_batch()
                     for content in content_list:
+                        valid = bool(
+                            content.content_id
+                            and (content.content_text or content.title)
+                            and content.created_time
+                            and content.creator_hash
+                            and content.user_nickname
+                            and content.image_list
+                            and content.followers_observed
+                        )
+                        should_stop = accumulator.consider(content.content_id, valid=valid)
                         await zhihu_store.update_zhihu_content(content)
+                        if should_stop:
+                            break
 
                     await self.batch_get_content_comments(content_list)
+                    if accumulator.finish_batch():
+                        break
                 except DataFetchError:
                     utils.logger.error("[ZhihuCrawler.search] Search content error")
                     return
@@ -445,11 +555,10 @@ class ZhihuCrawler(AbstractCrawler):
                 proxy=playwright_proxy,  # type: ignore
                 viewport={"width": 1920, "height": 1080},
                 user_agent=user_agent,
-                channel="chrome",  # Use system Chrome stable version
             )
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel="chrome")  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore
             browser_context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080}, user_agent=user_agent
             )

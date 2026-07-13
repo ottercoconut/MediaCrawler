@@ -58,13 +58,6 @@ def calculate_number_of_files(file_store_path: str) -> int:
         return 1
 
 
-def _filter_model_fields(model_cls, item: Dict) -> Dict:
-    """只保留目标 ORM 模型已有的列，避免把已删除/多余字段（如 avatar/gender/
-    profile_url/ip_location/user_id）传给 ORM 构造而报错。教学版兜底保护。"""
-    allowed = {col.name for col in model_cls.__table__.columns}
-    return {k: v for k, v in item.items() if k in allowed}
-
-
 class WeiboCsvStoreImplement(AbstractStore):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -116,8 +109,6 @@ class WeiboDbStoreImplement(AbstractStore):
         Returns:
 
         """
-        # 教学版兜底：过滤掉已删除/多余字段，确保不会把 user_id/avatar 等传给 ORM
-        content_item = _filter_model_fields(WeiboNote, content_item)
         note_id = content_item.get("note_id")
         async with get_session() as session:
             stmt = select(WeiboNote).where(WeiboNote.note_id == note_id)
@@ -144,8 +135,6 @@ class WeiboDbStoreImplement(AbstractStore):
         Returns:
 
         """
-        # 教学版兜底：过滤掉已删除/多余字段，确保不会把 user_id/avatar 等传给 ORM
-        comment_item = _filter_model_fields(WeiboNoteComment, comment_item)
         comment_id = comment_item.get("comment_id")
         comment_item["create_time"] = int(comment_item.get("create_time", 0) or 0)
         comment_item["comment_like_count"] = str(comment_item.get("comment_like_count", "0"))

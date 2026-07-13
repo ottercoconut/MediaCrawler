@@ -16,15 +16,10 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 #
-# 教学版说明：为防止爬取到的用户个人信息被用于定位真人并私信骚扰，
-# 本 ORM 不再持久化任何可识别用户的字段（用户 ID、IP 归属地、头像、
-# 主页链接、签名、性别等一律不落库）。原始用户 ID 在提取层经
-# tools.user_hash.anonymize_user_id 转为匿名 creator_hash 后写入，
-# 仅用于"同一创作者"的内容分组；昵称保留但经 mask_nickname 中间脱敏。
-# 创作者个人档案表（XhsCreator/DyCreator/WeiboCreator/TiebaCreator/
-# ZhihuCreator/BilibiliUpInfo/BilibiliContactInfo）已整体移除。
+# TripPostCollect 在授权环境中保留平台公开展示的作者资料和统计字段，
+# 用于证据追溯及字段完整性验证。
 
-from sqlalchemy import create_engine, Column, Integer, Text, String, BigInteger
+from sqlalchemy import JSON, BigInteger, Column, Integer, String, Text, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -96,6 +91,14 @@ class DouyinAweme(Base):
     title = Column(Text, comment='作品标题')
     desc = Column(Text, comment='作品描述')
     create_time = Column(BigInteger, index=True, comment='创建时间戳')
+    followers_count = Column(Text, comment='作者粉丝数')
+    fans_count = Column(Text, comment='作者粉丝数兼容字段')
+    following_count = Column(Text, comment='作者关注数')
+    aweme_count = Column(Text, comment='作者作品数')
+    author_liked_count = Column(Text, comment='作者获赞数')
+    followers_observed = Column(Integer, comment='响应中是否出现作者粉丝数字段')
+    author_followers_source = Column(Text, comment='作者粉丝数来源')
+    author_followers_zero_suspicious = Column(Integer, comment='作者粉丝数为0可疑标记')
     liked_count = Column(Text, comment='点赞数')
     comment_count = Column(Text, comment='评论数')
     share_count = Column(Text, comment='分享数')
@@ -170,6 +173,12 @@ class WeiboNote(Base):
     comments_count = Column(Text, comment='评论数')
     shared_count = Column(Text, comment='分享数')
     note_url = Column(Text, comment='笔记URL')
+    image_list = Column(JSON, comment='图片URL列表')
+    image_count = Column(Integer, comment='图片数量')
+    followers_count = Column(Text, comment='作者粉丝数')
+    fans_count = Column(Text, comment='作者粉丝数兼容字段')
+    followers_observed = Column(Integer, comment='响应中是否出现作者粉丝数字段')
+    author_followers_source = Column(Text, comment='作者粉丝数来源')
     source_keyword = Column(Text, default='', comment='来源关键词')
 
 class WeiboNoteComment(Base):
@@ -192,7 +201,22 @@ class XhsNote(Base):
     __tablename__ = 'xhs_note'
     id = Column(Integer, primary_key=True, comment='主键ID')
     creator_hash = Column(String(64), index=True, comment='创作者匿名哈希')
+    user_id = Column(String(255), index=True, comment='平台公开作者ID')
     nickname = Column(Text, comment='用户昵称(已脱敏)')
+    author_profile_url = Column(Text, comment='作者主页URL')
+    avatar_url = Column(Text, comment='作者头像URL')
+    author_desc = Column(Text, comment='作者简介')
+    gender = Column(Text, comment='作者公开性别')
+    ip_location = Column(Text, comment='作者公开IP属地')
+    fans = Column(Text, comment='作者粉丝数原始字段')
+    fans_count = Column(Text, comment='作者粉丝数')
+    followers_count = Column(Text, comment='标准化作者粉丝数')
+    followers_observed = Column(Integer, comment='响应中是否出现作者粉丝数字段')
+    author_followers_source = Column(Text, comment='作者粉丝数来源')
+    follows = Column(Text, comment='作者关注数原始字段')
+    following_count = Column(Text, comment='标准化作者关注数')
+    note_count = Column(Text, comment='作者笔记数')
+    interaction_count = Column(Text, comment='作者互动数')
     add_ts = Column(BigInteger, comment='添加时间戳')
     last_modify_ts = Column(BigInteger, comment='最后修改时间戳')
     note_id = Column(String(255), index=True, comment='笔记ID')
@@ -211,6 +235,7 @@ class XhsNote(Base):
     note_url = Column(Text, comment='笔记URL')
     source_keyword = Column(Text, default='', comment='来源关键词')
     xsec_token = Column(Text, comment='Xsec Token')
+    creator_profile_json = Column(Text, comment='作者公开资料原始JSON')
 
 class XhsNoteComment(Base):
     __tablename__ = 'xhs_note_comment'
@@ -279,6 +304,8 @@ class ZhihuContent(Base):
     updated_time = Column(Text, comment='更新时间')
     voteup_count = Column(Integer, default=0, comment='赞同数')
     comment_count = Column(Integer, default=0, comment='评论数')
+    image_list = Column(Text, comment='图片列表')
+    image_count = Column(Integer, default=0, comment='图片数量')
     source_keyword = Column(Text, comment='来源关键词')
     creator_hash = Column(String(64), index=True, comment='创作者匿名哈希')
     user_nickname = Column(Text, comment='用户昵称(已脱敏)')

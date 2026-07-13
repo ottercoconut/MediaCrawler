@@ -62,7 +62,7 @@ class XhsCsvStoreImplement(AbstractStore):
 
 
     async def store_creator(self, creator_item: Dict):
-        pass
+        await self.writer.write_to_csv(item_type="creators", item=creator_item)
 
     def flush(self):
         pass
@@ -90,7 +90,7 @@ class XhsJsonStoreImplement(AbstractStore):
         await self.writer.write_single_item_to_json(item_type="comments", item=comment_item)
 
     async def store_creator(self, creator_item: Dict):
-        pass
+        await self.writer.write_single_item_to_json(item_type="creators", item=creator_item)
 
     def flush(self):
         """
@@ -113,7 +113,7 @@ class XhsJsonlStoreImplement(AbstractStore):
         await self.writer.write_to_jsonl(item_type="comments", item=comment_item)
 
     async def store_creator(self, creator_item: Dict):
-        pass
+        await self.writer.write_to_jsonl(item_type="creators", item=creator_item)
 
     def flush(self):
         pass
@@ -138,7 +138,22 @@ class XhsDbStoreImplement(AbstractStore):
         last_modify_ts = int(get_current_timestamp())
         note = XhsNote(
             creator_hash=content_item.get("creator_hash"),
+            user_id=content_item.get("user_id"),
             nickname=content_item.get("nickname"),
+            author_profile_url=content_item.get("author_profile_url"),
+            avatar_url=content_item.get("avatar_url"),
+            author_desc=content_item.get("author_desc"),
+            gender=content_item.get("gender"),
+            ip_location=content_item.get("ip_location"),
+            fans=content_item.get("fans"),
+            fans_count=content_item.get("fans_count"),
+            followers_count=content_item.get("followers_count"),
+            followers_observed=content_item.get("followers_observed"),
+            author_followers_source=content_item.get("author_followers_source"),
+            follows=content_item.get("follows"),
+            following_count=content_item.get("following_count"),
+            note_count=content_item.get("note_count"),
+            interaction_count=content_item.get("interaction_count"),
             add_ts=add_ts,
             last_modify_ts=last_modify_ts,
             note_id=content_item.get("note_id"),
@@ -152,11 +167,12 @@ class XhsDbStoreImplement(AbstractStore):
             collected_count=str(content_item.get("collected_count")),
             comment_count=str(content_item.get("comment_count")),
             share_count=str(content_item.get("share_count")),
-            image_list=json.dumps(content_item.get("image_list")),
-            tag_list=json.dumps(content_item.get("tag_list")),
+            image_list=content_item.get("image_list"),
+            tag_list=content_item.get("tag_list"),
             note_url=content_item.get("note_url"),
             source_keyword=content_item.get("source_keyword", ""),
-            xsec_token=content_item.get("xsec_token", "")
+            xsec_token=content_item.get("xsec_token", ""),
+            creator_profile_json=content_item.get("creator_profile_json", ""),
         )
         session.add(note)
 
@@ -170,6 +186,25 @@ class XhsDbStoreImplement(AbstractStore):
             "comment_count": str(content_item.get("comment_count")),
             "share_count": str(content_item.get("share_count")),
             "last_update_time": content_item.get("last_update_time"),
+            "user_id": content_item.get("user_id"),
+            "nickname": content_item.get("nickname"),
+            "author_profile_url": content_item.get("author_profile_url"),
+            "avatar_url": content_item.get("avatar_url"),
+            "author_desc": content_item.get("author_desc"),
+            "gender": content_item.get("gender"),
+            "ip_location": content_item.get("ip_location"),
+            "fans": content_item.get("fans"),
+            "fans_count": content_item.get("fans_count"),
+            "followers_count": content_item.get("followers_count"),
+            "followers_observed": content_item.get("followers_observed"),
+            "author_followers_source": content_item.get("author_followers_source"),
+            "follows": content_item.get("follows"),
+            "following_count": content_item.get("following_count"),
+            "note_count": content_item.get("note_count"),
+            "interaction_count": content_item.get("interaction_count"),
+            "image_list": content_item.get("image_list"),
+            "tag_list": content_item.get("tag_list"),
+            "creator_profile_json": content_item.get("creator_profile_json", ""),
         }
         stmt = update(XhsNote).where(XhsNote.note_id == note_id).values(**update_data)
         await session.execute(stmt)
