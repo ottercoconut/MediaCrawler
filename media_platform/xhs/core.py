@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import time
 from asyncio import Task
 from typing import Dict, List, Optional
@@ -31,6 +32,7 @@ from playwright.async_api import (
     BrowserType,
     Page,
     Playwright,
+    TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 from tenacity import RetryError
@@ -45,6 +47,7 @@ from tools.trippostcollect_behavior import (
     inspect_visible_page_state,
     install_project_runtime_hints,
     project_browser_args,
+    run_required_continuity_behavior,
     run_required_human_behavior,
     run_required_request_pause,
     run_requested_post_interaction,
@@ -69,8 +72,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
     def __init__(self) -> None:
         self.index_url = "https://www.rednote.com" if config.XHS_INTERNATIONAL else "https://www.xiaohongshu.com"
         self.cookie_urls = [self.index_url]
-        # self.user_agent = utils.get_user_agent()
-        self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        self.user_agent: Optional[str] = None
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
         self.post_interaction_mode = os.environ.get("TRIPPOSTCOLLECT_XHS_POST_INTERACTION", "none").strip()
@@ -95,7 +97,107 @@ class XiaoHongShuCrawler(AbstractCrawler):
         event = await run_required_request_pause(stage, minimum, maximum)
         seconds = float(event["seconds"])
         utils.logger.info(f"[XiaoHongShuCrawler] Guarded pause stage={stage} seconds={seconds:.3f}")
+        if stage in {"search_results", "search_page"}:
+            continuity = await run_required_continuity_behavior(self.context_page, stage)
+            utils.logger.info(
+                "[XiaoHongShuCrawler] Continuity behavior "
+                f"stage={stage} status={continuity.get('status')}"
+            )
         return seconds
+
+    async def _goto_with_deadline(
+        self,
+        page: Page,
+        url: str,
+        *,
+        stage: str,
+        wait_until: str = "commit",
+    ) -> None:
+        timeout_seconds = self._env_float("TRIPPOSTCOLLECT_XHS_NAVIGATION_DEADLINE_SECONDS", 60.0)
+        timeout_seconds = max(5.0, timeout_seconds)
+        try:
+            async with asyncio.timeout(timeout_seconds + 2.0):
+                await page.goto(
+                    url,
+                    wait_until=wait_until,
+                    timeout=int(timeout_seconds * 1000),
+                )
+        except (PlaywrightTimeoutError, TimeoutError) as exc:
+            current_url = page.url or ""
+            if "/search_result" in url and "/search_result" in current_url:
+                utils.logger.warning(
+                    "[XiaoHongShuCrawler] Navigation event timed out after URL commit; "
+                    f"continuing with visible readiness gate: stage={stage}, url={current_url}"
+                )
+                return
+            raise RuntimeError(f"xhs_navigation_timeout:{stage}:{current_url}") from exc
+
+    @staticmethod
+    async def _close_page_with_deadline(page: Page) -> None:
+        try:
+            async with asyncio.timeout(10):
+                await page.close()
+        except Exception as exc:
+            utils.logger.warning(f"[XiaoHongShuCrawler] Page close did not finish cleanly: {exc}")
+
+    async def _browser_identity_headers(self) -> Dict[str, str]:
+        try:
+            async with asyncio.timeout(10):
+                identity = await self.context_page.evaluate(
+                    """() => ({
+                        webdriver: navigator.webdriver,
+                        user_agent: navigator.userAgent || '',
+                        language: navigator.language || '',
+                        platform: navigator.userAgentData
+                            ? navigator.userAgentData.platform
+                            : (navigator.platform || ''),
+                        mobile: navigator.userAgentData
+                            ? navigator.userAgentData.mobile
+                            : false,
+                        brands: navigator.userAgentData
+                            ? Array.from(navigator.userAgentData.brands || [])
+                            : [],
+                    })"""
+                )
+        except Exception as exc:
+            raise RuntimeError(f"xhs_browser_identity_unavailable:{type(exc).__name__}") from exc
+
+        user_agent = str((identity or {}).get("user_agent") or "").strip()
+        language = str((identity or {}).get("language") or "").strip()
+        platform = str((identity or {}).get("platform") or "").strip()
+        brands = (identity or {}).get("brands") or []
+        if (identity or {}).get("webdriver") is not None:
+            raise RuntimeError("xhs_browser_identity_webdriver_exposed")
+        if not user_agent or not language or not platform or not isinstance(brands, list) or not brands:
+            raise RuntimeError("xhs_browser_identity_incomplete")
+
+        ua_match = re.search(r"(?:Chrome|Chromium)/(\d+)", user_agent)
+        ua_major = ua_match.group(1) if ua_match else ""
+        normalized_brands: List[str] = []
+        chromium_major = ""
+        for item in brands:
+            if not isinstance(item, dict):
+                continue
+            brand = str(item.get("brand") or "").replace("\\", "").replace('"', "").strip()
+            version = str(item.get("version") or "").split(".", 1)[0].strip()
+            if not brand or not version:
+                continue
+            normalized_brands.append(f'"{brand}";v="{version}"')
+            if brand in {"Chromium", "Google Chrome"}:
+                chromium_major = version
+        if not normalized_brands or not ua_major or chromium_major != ua_major:
+            raise RuntimeError(
+                f"xhs_browser_identity_version_mismatch:ua={ua_major},client_hints={chromium_major}"
+            )
+
+        self.user_agent = user_agent
+        return {
+            "accept-language": language,
+            "sec-ch-ua": ", ".join(normalized_brands),
+            "sec-ch-ua-mobile": "?1" if bool((identity or {}).get("mobile")) else "?0",
+            "sec-ch-ua-platform": f'"{platform}"',
+            "user-agent": user_agent,
+        }
 
     async def _maybe_run_post_interaction(self, note_detail: Dict) -> None:
         if self.post_interaction_mode == "none" or self.post_interaction_attempted:
@@ -112,7 +214,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
         interaction_url = f"{self.index_url}/explore/{quote(note_id)}?{query}"
         page = await self.browser_context.new_page()
         try:
-            await page.goto(interaction_url, wait_until="domcontentloaded", timeout=60_000)
+            await self._goto_with_deadline(
+                page,
+                interaction_url,
+                stage="post_interaction",
+            )
             interaction = await run_requested_post_interaction(
                 page,
                 platform_key="xhs",
@@ -142,7 +248,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 f"[XiaoHongShuCrawler] Requested post interaction failed without stopping crawl: {type(exc).__name__}: {exc}"
             )
         finally:
-            await page.close()
+            await self._close_page_with_deadline(page)
 
     def _storage_state_path(self) -> str:
         explicit_path = os.environ.get("TRIPPOSTCOLLECT_XHS_STORAGE_STATE_PATH", "").strip()
@@ -450,7 +556,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
             await install_project_runtime_hints(self.browser_context)
             await self._restore_storage_state()
             self.context_page = await self._single_page_for_login()
-            await self.context_page.goto(self.index_url, wait_until="domcontentloaded", timeout=60_000)
+            await self._goto_with_deadline(
+                self.context_page,
+                self.index_url,
+                stage="initial_home",
+            )
             await self._wait_for_initial_page_settle()
 
             # Create a client to interact with the Xiaohongshu website.
@@ -484,10 +594,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
             await self._write_storage_state()
             behavior_keyword = next((item.strip() for item in config.KEYWORDS.split(",") if item.strip()), "")
             if behavior_keyword:
-                await self.context_page.goto(
+                await self._goto_with_deadline(
+                    self.context_page,
                     f"https://www.xiaohongshu.com/search_result?keyword={quote(behavior_keyword)}",
-                    wait_until="domcontentloaded",
-                    timeout=60_000,
+                    stage="behavior_search",
                 )
             behavior_evidence = await run_required_human_behavior(self.context_page, "xhs")
             if behavior_evidence.get("status") != "completed":
@@ -795,10 +905,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
         """Load an author homepage in the signed-in context when the direct request is empty."""
         page = await self.browser_context.new_page()
         try:
-            await page.goto(
+            await self._goto_with_deadline(
+                page,
                 f"{self.index_url}/user/profile/{quote(user_id)}",
-                wait_until="domcontentloaded",
-                timeout=60_000,
+                stage="creator_profile_browser",
             )
             await page.wait_for_timeout(random.randint(1_200, 3_000))
             viewport = page.viewport_size or {"width": 1280, "height": 800}
@@ -833,7 +943,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 )
             return None
         finally:
-            await page.close()
+            await self._close_page_with_deadline(page)
 
     @staticmethod
     def is_video_note(note_detail: Dict) -> bool:
@@ -955,6 +1065,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def create_xhs_client(self, httpx_proxy: Optional[str]) -> XiaoHongShuClient:
         """Create Xiaohongshu client"""
         utils.logger.info("[XiaoHongShuCrawler.create_xhs_client] Begin create Xiaohongshu API client ...")
+        identity_headers = await self._browser_identity_headers()
         cookie_str, cookie_dict = await utils.convert_browser_context_cookies(
             self.browser_context,
             urls=self.cookie_urls,
@@ -963,20 +1074,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
             proxy=httpx_proxy,
             headers={
                 "accept": "application/json, text/plain, */*",
-                "accept-language": "zh-CN,zh;q=0.9",
                 "cache-control": "no-cache",
                 "content-type": "application/json;charset=UTF-8",
                 "origin": self.index_url,
                 "pragma": "no-cache",
                 "priority": "u=1, i",
                 "referer": f"{self.index_url}/",
-                "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126", "Not.A/Brand";v="99"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"macOS"',
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-site",
-                "user-agent": self.user_agent,
+                **identity_headers,
                 "Cookie": cookie_str,
             },
             playwright_page=self.context_page,
@@ -1047,12 +1154,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def close(self):
         """Close browser context"""
-        # Special handling if using CDP mode
-        if self.cdp_manager:
-            await self.cdp_manager.cleanup()
-            self.cdp_manager = None
-        else:
-            await self.browser_context.close()
+        try:
+            async with asyncio.timeout(20):
+                # Special handling if using CDP mode
+                if self.cdp_manager:
+                    await self.cdp_manager.cleanup()
+                    self.cdp_manager = None
+                else:
+                    await self.browser_context.close()
+        except Exception as exc:
+            utils.logger.warning(f"[XiaoHongShuCrawler.close] Browser cleanup timed out or failed: {exc}")
         utils.logger.info("[XiaoHongShuCrawler.close] Browser context closed ...")
 
     async def get_notice_media(self, note_detail: Dict):
