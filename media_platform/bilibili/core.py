@@ -43,6 +43,7 @@ import config
 from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import bilibili as bilibili_store
+from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools import utils
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
@@ -111,6 +112,7 @@ class BilibiliCrawler(AbstractCrawler):
                     urls=self.cookie_urls,
                 )
 
+            await run_required_human_behavior(self.context_page, "bilibili")
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 await self.search()
@@ -515,6 +517,7 @@ class BilibiliCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
+                args=project_browser_args(),
             )
             return browser_context
         else:

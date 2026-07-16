@@ -49,51 +49,57 @@ class XiaoHongShuLogin(AbstractLogin):
         self.login_phone = login_phone
         self.cookie_str = cookie_str
 
+    async def _single_login_page(self) -> Page:
+        """Close stale tabs while login is pending, retaining the login page."""
+        try:
+            pages = [page for page in self.browser_context.pages if not page.is_closed()]
+        except Exception:
+            pages = []
+
+        page = self.context_page if self.context_page in pages else (pages[0] if pages else await self.browser_context.new_page())
+        closed_count = 0
+        for other_page in pages:
+            if other_page is page:
+                continue
+            await other_page.close()
+            closed_count += 1
+        if closed_count:
+            utils.logger.info(
+                "[XiaoHongShuLogin] Retained one login tab and closed "
+                f"{closed_count} stale tab(s)."
+            )
+        self.context_page = page
+        return page
+
     async def _check_login_state_once(self, no_logged_in_session: str) -> bool:
         """
         Verify login status using dual-check: UI elements and Cookies.
         """
         # 1. Priority check: Check if the "Me" (Profile) node appears in the sidebar
-        pages = []
-        try:
-            pages = [page for page in self.browser_context.pages if not page.is_closed()]
-        except Exception:
-            pages = [self.context_page]
+        page = await self._single_login_page()
 
         user_profile_selector = "xpath=//a[contains(@href, '/user/profile/')]//span[text()='我']"
         security_texts = ("请通过验证", "安全验证", "验证码", "身份验证", "操作频繁", "环境异常", "风险")
         login_texts = ("扫码登录", "二维码", "打开小红书扫一扫", "确认登录", "登录确认", "手机号登录")
-        visible_markers = []
+        try:
+            # Selector for elements containing "Me" text with a link pointing to the profile.
+            is_visible = await page.is_visible(user_profile_selector, timeout=500)
+            if is_visible:
+                utils.logger.info("[XiaoHongShuLogin.check_login_state] Login status confirmed by UI element ('Me' button).")
+                return True
+        except Exception:
+            pass
+        try:
+            content = await page.content()
+        except Exception:
+            content = ""
+        markers = sorted({text for text in (*security_texts, *login_texts) if text in content})
 
-        for page in reversed(pages):
-            try:
-                url = page.url or ""
-            except Exception:
-                url = ""
-            if page is not self.context_page and "xiaohongshu.com" not in url and "rednote.com" not in url:
-                continue
-            try:
-                # Selector for elements containing "Me" text with a link pointing to the profile.
-                is_visible = await page.is_visible(user_profile_selector, timeout=500)
-                if is_visible:
-                    self.context_page = page
-                    utils.logger.info("[XiaoHongShuLogin.check_login_state] Login status confirmed by UI element ('Me' button).")
-                    return True
-            except Exception:
-                pass
-            try:
-                content = await page.content()
-            except Exception:
-                content = ""
-            markers = sorted({text for text in (*security_texts, *login_texts) if text in content})
-            if markers:
-                visible_markers.append({"url": url, "markers": markers})
-
-        # 2. Alternative: Check for CAPTCHA/security/login prompts across opened pages.
-        if visible_markers:
+        # 2. Check for CAPTCHA/security/login prompts on the single login page.
+        if markers:
             utils.logger.info(
                 "[XiaoHongShuLogin.check_login_state] Visible login/security checkpoint, "
-                f"please verify manually: {visible_markers}"
+                f"please verify manually: {{'url': {page.url}, 'markers': {markers}}}"
             )
 
         # 3. Compatibility fallback: Original Cookie-based change detection
@@ -126,6 +132,7 @@ class XiaoHongShuLogin(AbstractLogin):
     async def begin(self):
         """Start login xiaohongshu"""
         utils.logger.info("[XiaoHongShuLogin.begin] Begin login xiaohongshu ...")
+        await self._single_login_page()
         if config.LOGIN_TYPE == "qrcode":
             await self.login_by_qrcode()
         elif config.LOGIN_TYPE == "phone":
@@ -153,7 +160,7 @@ class XiaoHongShuLogin(AbstractLogin):
                 timeout=5000
             )
             await element.click()
-        except Exception as e:
+        except Exception:
             utils.logger.info("[XiaoHongShuLogin.login_by_mobile] have not found mobile button icon and keep going ...")
 
         await asyncio.sleep(1)

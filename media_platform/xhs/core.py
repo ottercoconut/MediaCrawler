@@ -24,6 +24,7 @@ import random
 import time
 from asyncio import Task
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
 from playwright.async_api import (
     BrowserContext,
@@ -40,6 +41,14 @@ from model.m_xiaohongshu import NoteUrlInfo, CreatorUrlInfo
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
+from tools.trippostcollect_behavior import (
+    inspect_visible_page_state,
+    install_project_runtime_hints,
+    project_browser_args,
+    run_required_human_behavior,
+    run_required_request_pause,
+    run_requested_post_interaction,
+)
 from tools.trippostcollect_adaptive import AdaptiveAccumulator
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
@@ -64,6 +73,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
+        self.post_interaction_mode = os.environ.get("TRIPPOSTCOLLECT_XHS_POST_INTERACTION", "none").strip()
+        self.post_interaction_attempted = False
+        self.creator_profile_cache: Dict[str, Dict] = {}
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -79,12 +91,71 @@ class XiaoHongShuCrawler(AbstractCrawler):
         except ValueError:
             return default
 
+    async def _guarded_pause(self, stage: str, minimum: float, maximum: float) -> float:
+        event = await run_required_request_pause(stage, minimum, maximum)
+        seconds = float(event["seconds"])
+        utils.logger.info(f"[XiaoHongShuCrawler] Guarded pause stage={stage} seconds={seconds:.3f}")
+        return seconds
+
+    async def _maybe_run_post_interaction(self, note_detail: Dict) -> None:
+        if self.post_interaction_mode == "none" or self.post_interaction_attempted:
+            return
+        self.post_interaction_attempted = True
+        note_id = str(note_detail.get("note_id") or "").strip()
+        if not note_id:
+            utils.logger.warning("[XiaoHongShuCrawler] Skip requested post interaction: missing note_id")
+            return
+        query = (
+            f"xsec_token={quote(str(note_detail.get('xsec_token') or ''))}"
+            f"&xsec_source={quote(str(note_detail.get('xsec_source') or 'pc_search'))}"
+        )
+        interaction_url = f"{self.index_url}/explore/{quote(note_id)}?{query}"
+        page = await self.browser_context.new_page()
+        try:
+            await page.goto(interaction_url, wait_until="domcontentloaded", timeout=60_000)
+            interaction = await run_requested_post_interaction(
+                page,
+                platform_key="xhs",
+                requested_mode=self.post_interaction_mode,
+                note_id=note_id,
+            )
+            utils.logger.info(
+                "[XiaoHongShuCrawler] Post interaction "
+                f"mode={self.post_interaction_mode} note_id={note_id} status={interaction.get('status')}"
+            )
+            blocked_markers = {
+                key
+                for markers_key in ("initial_visible_markers", "visible_markers")
+                for key, present in (interaction.get(markers_key) or {}).items()
+                if present
+            }
+            if blocked_markers:
+                raise RuntimeError(f"xhs_post_interaction_visible_block:{','.join(sorted(blocked_markers))}")
+        except RuntimeError as exc:
+            if str(exc).startswith("xhs_post_interaction_visible_block:"):
+                raise
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler] Requested post interaction failed without stopping crawl: {type(exc).__name__}: {exc}"
+            )
+        except Exception as exc:
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler] Requested post interaction failed without stopping crawl: {type(exc).__name__}: {exc}"
+            )
+        finally:
+            await page.close()
+
     def _storage_state_path(self) -> str:
         explicit_path = os.environ.get("TRIPPOSTCOLLECT_XHS_STORAGE_STATE_PATH", "").strip()
-        if explicit_path:
-            return explicit_path
-        profile_name = config.USER_DATA_DIR % config.PLATFORM
-        return os.path.join(os.getcwd(), "browser_data", profile_name, "trippostcollect_storage_state.json")
+        if not explicit_path:
+            raise RuntimeError("XHS requires TRIPPOSTCOLLECT_XHS_STORAGE_STATE_PATH from xhs_runner.py")
+        return os.path.abspath(os.path.expanduser(explicit_path))
+
+    @staticmethod
+    def _profile_dir() -> str:
+        explicit_path = os.environ.get("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", "").strip()
+        if not explicit_path:
+            raise RuntimeError("XHS requires TRIPPOSTCOLLECT_XHS_PROFILE_DIR from xhs_runner.py")
+        return os.path.abspath(os.path.expanduser(explicit_path))
 
     @staticmethod
     def _cookie_for_restore(cookie: Dict) -> Dict:
@@ -221,6 +292,29 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 self.context_page = page
                 return
 
+    async def _single_page_for_login(self) -> Page:
+        """Keep exactly one tab open until the login checkpoint has succeeded."""
+        try:
+            pages = [page for page in self.browser_context.pages if not page.is_closed()]
+        except Exception:
+            pages = []
+
+        current_page = getattr(self, "context_page", None)
+        page = current_page if current_page in pages else (pages[0] if pages else await self.browser_context.new_page())
+        closed_count = 0
+        for other_page in pages:
+            if other_page is page:
+                continue
+            await other_page.close()
+            closed_count += 1
+        if closed_count:
+            utils.logger.info(
+                "[XiaoHongShuCrawler] Login stage retained one tab and closed "
+                f"{closed_count} stale tab(s)."
+            )
+        self.context_page = page
+        return page
+
     async def _profile_ui_visible(self) -> bool:
         try:
             await self._activate_latest_xhs_page()
@@ -300,7 +394,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         started = time.monotonic()
         last_print = 0.0
         while time.monotonic() - started < wait_seconds:
-            await self._activate_latest_xhs_page()
+            await self._single_page_for_login()
             cookie_markers = await self._cookie_markers()
             profile_ui = await self._profile_ui_visible()
             if profile_ui:
@@ -353,14 +447,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
+            await install_project_runtime_hints(self.browser_context)
             await self._restore_storage_state()
-            self.context_page = await self.browser_context.new_page()
+            self.context_page = await self._single_page_for_login()
             await self.context_page.goto(self.index_url, wait_until="domcontentloaded", timeout=60_000)
             await self._wait_for_initial_page_settle()
 
             # Create a client to interact with the Xiaohongshu website.
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
             if not await self.xhs_client.pong():
+                await self._single_page_for_login()
                 checkpoint_ready = False
                 if await self._wait_for_manual_checkpoint_if_needed():
                     await self.xhs_client.update_cookies(
@@ -369,6 +465,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     )
                     checkpoint_ready = await self.xhs_client.pong()
                 if not checkpoint_ready:
+                    await self._single_page_for_login()
                     login_obj = XiaoHongShuLogin(
                         login_type=config.LOGIN_TYPE,
                         login_phone="",  # input your phone number
@@ -385,6 +482,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         raise RuntimeError("[XiaoHongShuCrawler] Xiaohongshu login state not confirmed after login flow")
 
             await self._write_storage_state()
+            behavior_keyword = next((item.strip() for item in config.KEYWORDS.split(",") if item.strip()), "")
+            if behavior_keyword:
+                await self.context_page.goto(
+                    f"https://www.xiaohongshu.com/search_result?keyword={quote(behavior_keyword)}",
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
+                )
+            behavior_evidence = await run_required_human_behavior(self.context_page, "xhs")
+            if behavior_evidence.get("status") != "completed":
+                raise RuntimeError("XHS required human behavior stage did not complete")
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
@@ -466,8 +573,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             )
                             break
                         page += 1
-                        await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                        await self._guarded_pause("search_page", 12.0, 30.0)
                         continue
+                    await self._guarded_pause("search_results", 6.0, 14.0)
                     task_list = [
                         self.get_note_detail_async_task(
                             note_id=post_item.get("id"),
@@ -488,6 +596,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                 if accumulator.consider(identity, valid=False):
                                     break
                                 continue
+                            await self._maybe_run_post_interaction(note_detail)
                             await self.enrich_note_creator(note_detail)
                             creator_profile = note_detail.get("creator_profile") or {}
                             creator_item = xhs_store._normalized_creator_item(
@@ -541,9 +650,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         break
                     page += 1
 
-                    # Sleep after each page navigation
-                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
+                    await self._guarded_pause("search_page", 12.0, 30.0)
                 except DataFetchError:
                     utils.logger.error("[XiaoHongShuCrawler.search] Get note detail error")
                     accumulator.mark_runtime_failed(
@@ -659,20 +766,74 @@ class XiaoHongShuCrawler(AbstractCrawler):
         user_id = user_info.get("user_id")
         if not user_id:
             return
+        cached_creator = self.creator_profile_cache.get(str(user_id))
+        if cached_creator:
+            note_detail["creator_profile"] = cached_creator
+            return
+        creator_info = None
         try:
-            creator_info = await self.xhs_client.get_creator_info(
-                user_id=user_id,
-                xsec_token=note_detail.get("xsec_token", ""),
-                xsec_source=note_detail.get("xsec_source", "pc_search"),
-            )
+            creator_info = await self.xhs_client.get_creator_info(user_id=user_id)
         except Exception as exc:
             utils.logger.warning(
-                f"[XiaoHongShuCrawler.enrich_note_creator] creator profile fetch failed: {user_id}, {exc}"
+                "[XiaoHongShuCrawler.enrich_note_creator] "
+                f"session profile request failed, using browser fallback: {user_id}, {exc}"
             )
-            return
+
+        if not creator_info:
+            await self._guarded_pause("creator_profile_browser_fallback", 12.0, 30.0)
+            creator_info = await self._get_creator_info_from_browser(str(user_id))
         if creator_info:
+            self.creator_profile_cache[str(user_id)] = creator_info
             note_detail["creator_profile"] = creator_info
-            await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+            await self._guarded_pause("creator_profile", 8.0, 18.0)
+        else:
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler.enrich_note_creator] creator profile empty after browser fallback: {user_id}"
+            )
+
+    async def _get_creator_info_from_browser(self, user_id: str) -> Optional[Dict]:
+        """Load an author homepage in the signed-in context when the direct request is empty."""
+        page = await self.browser_context.new_page()
+        try:
+            await page.goto(
+                f"{self.index_url}/user/profile/{quote(user_id)}",
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            await page.wait_for_timeout(random.randint(1_200, 3_000))
+            viewport = page.viewport_size or {"width": 1280, "height": 800}
+            await page.mouse.move(
+                random.randint(80, max(81, viewport["width"] - 80)),
+                random.randint(80, max(81, viewport["height"] - 80)),
+                steps=random.randint(6, 14),
+            )
+            await page.mouse.wheel(0, random.randint(180, 460))
+            await page.wait_for_timeout(random.randint(500, 1_500))
+
+            html_content = await page.content()
+            creator_info = self.xhs_client.extract_creator_info_from_html(html_content)
+            if creator_info:
+                return creator_info
+
+            _, markers = await inspect_visible_page_state(page)
+            challenge = next(
+                (
+                    key
+                    for key in ("captcha_or_verify", "rate_limited", "blocked")
+                    if markers.get(key)
+                ),
+                "",
+            )
+            if challenge:
+                raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
+            if markers.get("login_required"):
+                utils.logger.warning(
+                    "[XiaoHongShuCrawler.enrich_note_creator] "
+                    f"browser profile requires login despite confirmed session: {user_id}"
+                )
+            return None
+        finally:
+            await page.close()
 
     @staticmethod
     def is_video_note(note_detail: Dict) -> bool:
@@ -742,9 +903,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
 
-                # Sleep after fetching note detail
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
+                await self._guarded_pause("note_detail", 4.0, 10.0)
 
                 return note_detail
 
@@ -761,7 +920,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""
         if not config.ENABLE_GET_COMMENTS:
-            utils.logger.info(f"[XiaoHongShuCrawler.batch_get_note_comments] Crawling comment mode is not enabled")
+            utils.logger.info("[XiaoHongShuCrawler.batch_get_note_comments] Crawling comment mode is not enabled")
             return
 
         utils.logger.info(f"[XiaoHongShuCrawler.batch_get_note_comments] Begin batch get note comments, note list: {note_list}")
@@ -838,7 +997,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         if config.SAVE_LOGIN_STATE:
             # feat issue #14
             # we will save login state to avoid login every time
-            user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
+            user_data_dir = self._profile_dir()
             browser_context = await chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
                 accept_downloads=True,
@@ -849,6 +1008,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
+                args=project_browser_args(),
             )
             return browser_context
         else:
@@ -897,7 +1057,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def get_notice_media(self, note_detail: Dict):
         if not config.ENABLE_GET_MEIDAS:
-            utils.logger.info(f"[XiaoHongShuCrawler.get_notice_media] Crawling image mode is not enabled")
+            utils.logger.info("[XiaoHongShuCrawler.get_notice_media] Crawling image mode is not enabled")
             return
         await self.get_note_images(note_detail)
         utils.logger.info("[XiaoHongShuCrawler.get_notice_media] Video media crawling is disabled by TripPostCollect policy")

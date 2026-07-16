@@ -29,6 +29,7 @@ import asyncio
 from pathlib import Path
 
 from tools import utils
+from tools.trippostcollect_behavior import project_browser_args
 
 
 class BrowserLauncher:
@@ -142,6 +143,7 @@ class BrowserLauncher:
             "--disable-blink-features=AutomationControlled",  # Disable automation control flag
             "--exclude-switches=enable-automation",  # Exclude automation switch
             "--disable-infobars",  # Disable info bars
+            *project_browser_args(),
         ]
 
         # Headless mode

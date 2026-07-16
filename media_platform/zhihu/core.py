@@ -24,6 +24,7 @@ import os
 # import random  # Removed as we now use fixed config.CRAWLER_MAX_SLEEP_SEC intervals
 from asyncio import Task
 from typing import Dict, List, Optional, Tuple, cast
+from urllib.parse import quote
 
 from playwright.async_api import (
     BrowserContext,
@@ -40,6 +41,7 @@ from model.m_zhihu import ZhihuContent, ZhihuCreator
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import zhihu as zhihu_store
 from tools import utils
+from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
@@ -205,13 +207,19 @@ class ZhihuCrawler(AbstractCrawler):
                     urls=self.cookie_urls,
                 )
 
+            crawler_type_var.set(config.CRAWLER_TYPE)
+            search_cookie_keyword = (
+                config.KEYWORDS.split(",", maxsplit=1)[0].strip()
+                if config.CRAWLER_TYPE == "search"
+                else "python"
+            )
             # Zhihu's search API requires opening the search page first to access cookies, homepage alone won't work
             utils.logger.info(
                 "[ZhihuCrawler.start] Zhihu navigating to search page to get search page cookies, this process takes about 5 seconds"
             )
             try:
                 await self.context_page.goto(
-                    f"{self.index_url}/search?q=python&search_source=Guess&utm_content=search_hot&type=content",
+                    f"{self.index_url}/search?q={quote(search_cookie_keyword)}&type=content",
                     wait_until="domcontentloaded",
                     timeout=30_000,
                 )
@@ -225,7 +233,7 @@ class ZhihuCrawler(AbstractCrawler):
                 urls=self.cookie_urls,
             )
 
-            crawler_type_var.set(config.CRAWLER_TYPE)
+            await run_required_human_behavior(self.context_page, "zhihu")
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
                 await self.search()
@@ -559,6 +567,7 @@ class ZhihuCrawler(AbstractCrawler):
                 proxy=playwright_proxy,  # type: ignore
                 viewport={"width": 1920, "height": 1080},
                 user_agent=user_agent,
+                args=project_browser_args(),
             )
             return browser_context
         else:

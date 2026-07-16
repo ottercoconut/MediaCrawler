@@ -20,7 +20,7 @@
 import asyncio
 import json
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 import httpx
 from playwright.async_api import BrowserContext, Page
@@ -477,7 +477,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         """
         if not config.ENABLE_GET_SUB_COMMENTS:
             utils.logger.info(
-                f"[XiaoHongShuCrawler.get_comments_all_sub_comments] Crawling sub_comment mode is not enabled"
+                "[XiaoHongShuCrawler.get_comments_all_sub_comments] Crawling sub_comment mode is not enabled"
             )
             return []
 
@@ -542,7 +542,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
 
     async def get_creator_info(
         self, user_id: str, xsec_token: str = "", xsec_source: str = ""
-    ) -> Dict:
+    ) -> Optional[Dict]:
         """
         Get user profile brief information by parsing user homepage HTML
         The PC user homepage has window.__INITIAL_STATE__ variable, just parse it
@@ -563,6 +563,10 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         html_content = await self.request(
             "GET", self._domain + uri, return_response=True, headers=self.headers
         )
+        return self.extract_creator_info_from_html(html_content)
+
+    def extract_creator_info_from_html(self, html_content: str) -> Optional[Dict]:
+        """Expose creator parsing for HTML loaded through the signed-in browser."""
         return self._extractor.extract_creator_info_from_html(html_content)
 
     async def get_notes_by_creator(
@@ -585,7 +589,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         Returns:
 
         """
-        uri = f"/api/sns/web/v1/user_posted"
+        uri = "/api/sns/web/v1/user_posted"
         params = {
             "num": page_size,
             "cursor": cursor,
@@ -625,7 +629,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             )
             if not notes_res:
                 utils.logger.error(
-                    f"[XiaoHongShuClient.get_notes_by_creator] The current creator may have been banned by xhs, so they cannot access the data."
+                    "[XiaoHongShuClient.get_notes_by_creator] The current creator may have been banned by xhs, so they cannot access the data."
                 )
                 break
 
@@ -667,7 +671,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         Returns:
 
         """
-        uri = f"/api/sns/web/short_url"
+        uri = "/api/sns/web/short_url"
         data = {"original_url": f"{self._domain}/discovery/item/{note_id}"}
         return await self.post(uri, data=data, return_response=True)
 

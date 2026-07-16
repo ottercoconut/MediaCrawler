@@ -169,7 +169,7 @@ class AdaptiveAccumulator:
         )
         added = len(self.new_valid_identities) - self._batch_new_before
         candidate_identities_added = len(self.seen_candidate_identities) - self._batch_candidate_before
-        self.stagnant_batches = self.stagnant_batches + 1 if candidate_identities_added == 0 else 0
+        self.stagnant_batches = self.stagnant_batches + 1 if added == 0 else 0
         if self.stagnant_batches >= self.max_stagnant_batches:
             self.stop_reason = "stagnated"
         details = {

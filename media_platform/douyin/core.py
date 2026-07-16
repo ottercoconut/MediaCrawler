@@ -22,6 +22,7 @@ import os
 import random
 from asyncio import Task
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from playwright.async_api import (
     BrowserContext,
@@ -36,6 +37,7 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
+from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
@@ -117,12 +119,22 @@ class DouYinCrawler(AbstractCrawler):
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
+                behavior_keyword = config.KEYWORDS.split(",", maxsplit=1)[0].strip()
+                search_url = f"{self.index_url}/search/{quote(behavior_keyword)}?type=general"
+                await self.context_page.goto(search_url, wait_until="domcontentloaded")
+                await run_required_human_behavior(self.context_page, "douyin")
+                await self.dy_client.update_cookies(
+                    browser_context=self.browser_context,
+                    urls=self.cookie_urls,
+                )
                 await self.search()
             elif config.CRAWLER_TYPE == "detail":
                 # Get the information and comments of the specified post
+                await run_required_human_behavior(self.context_page, "douyin")
                 await self.get_specified_awemes()
             elif config.CRAWLER_TYPE == "creator":
                 # Get the information and comments of the specified creator
+                await run_required_human_behavior(self.context_page, "douyin")
                 await self.get_creators_and_videos()
 
             utils.logger.info("[DouYinCrawler.start] Douyin Crawler finished ...")
@@ -168,14 +180,30 @@ class DouYinCrawler(AbstractCrawler):
                         break
                     if posts_res.get("data") == []:
                         utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,{posts_res.get('data')}`")
+                        source_has_more = posts_res.get("has_more") if "has_more" in posts_res else None
+                        next_search_id = posts_res.get("extra", {}).get("logid", "")
+                        if source_has_more in (True, 1) and next_search_id:
+                            page += 1
+                            accumulator.begin_batch()
+                            dy_search_id = next_search_id
+                            if accumulator.finish_batch(
+                                source_page=page - 1,
+                                source_offset=requested_offset,
+                                source_cursor=requested_search_id,
+                                next_cursor=dy_search_id,
+                                source_has_more=source_has_more,
+                                raw_batch_count=0,
+                            ):
+                                break
+                            await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                            continue
                         accumulator.mark_source_exhausted(
-                            "empty_page",
+                            "empty_cursor" if source_has_more in (True, 1) else "empty_page",
                             source_page=page,
                             source_offset=requested_offset,
                             source_cursor=requested_search_id,
-                            source_has_more=(
-                                posts_res.get("has_more") if "has_more" in posts_res else None
-                            ),
+                            next_cursor=next_search_id,
+                            source_has_more=source_has_more,
                             raw_batch_count=0,
                         )
                         break
@@ -461,6 +489,7 @@ class DouYinCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
+                args=project_browser_args(),
             )  # type: ignore
             return browser_context
         else:

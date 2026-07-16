@@ -27,6 +27,7 @@ import os
 # import random  # Removed as we now use fixed config.CRAWLER_MAX_SLEEP_SEC intervals
 from asyncio import Task
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from playwright.async_api import (
     BrowserContext,
@@ -41,6 +42,7 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import weibo as weibo_store
 from tools import utils
+from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
@@ -124,12 +126,25 @@ class WeiboCrawler(AbstractCrawler):
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for video and retrieve their comment information.
+                behavior_keyword = config.KEYWORDS.split(",", maxsplit=1)[0].strip()
+                container_id = quote(f"100103type=1&q={behavior_keyword}", safe="")
+                await self.context_page.goto(
+                    f"{self.mobile_index_url}/search?containerid={container_id}",
+                    wait_until="domcontentloaded",
+                )
+                await run_required_human_behavior(self.context_page, "weibo")
+                await self.wb_client.update_cookies(
+                    browser_context=self.browser_context,
+                    urls=self.cookie_urls,
+                )
                 await self.search()
             elif config.CRAWLER_TYPE == "detail":
                 # Get the information and comments of the specified post
+                await run_required_human_behavior(self.context_page, "weibo")
                 await self.get_specified_notes()
             elif config.CRAWLER_TYPE == "creator":
                 # Get creator's information and their notes and comments
+                await run_required_human_behavior(self.context_page, "weibo")
                 await self.get_creators_and_notes()
             else:
                 pass
@@ -422,6 +437,7 @@ class WeiboCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
+                args=project_browser_args(),
             )
             return browser_context
         else:

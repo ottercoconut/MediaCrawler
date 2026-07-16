@@ -66,4 +66,8 @@ class XiaoHongShuExtractor:
         info = json.loads(match.group(1).replace(":undefined", ":null"), strict=False)
         if info is None:
             return None
-        return info.get("user").get("userPageData")
+        user_info = info.get("user")
+        if not isinstance(user_info, dict):
+            return None
+        creator_info = user_info.get("userPageData")
+        return creator_info if isinstance(creator_info, dict) else None

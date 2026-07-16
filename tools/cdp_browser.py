@@ -291,14 +291,20 @@ class CDPBrowserManager:
         # Set user data directory (if save login state is enabled)
         user_data_dir = None
         if config.SAVE_LOGIN_STATE:
-            profile_name = config.USER_DATA_DIR % config.PLATFORM
-            if not os.environ.get("TRIPPOSTCOLLECT_SHARE_CDP_PROFILE"):
-                profile_name = f"cdp_{profile_name}"
-            user_data_dir = os.path.join(
-                os.getcwd(),
-                "browser_data",
-                profile_name,
-            )
+            explicit_profile = os.environ.get("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", "").strip()
+            if config.PLATFORM == "xhs" and not explicit_profile:
+                raise RuntimeError("XHS requires TRIPPOSTCOLLECT_XHS_PROFILE_DIR from xhs_runner.py")
+            if config.PLATFORM == "xhs":
+                user_data_dir = os.path.abspath(os.path.expanduser(explicit_profile))
+            else:
+                profile_name = config.USER_DATA_DIR % config.PLATFORM
+                if not os.environ.get("TRIPPOSTCOLLECT_SHARE_CDP_PROFILE"):
+                    profile_name = f"cdp_{profile_name}"
+                user_data_dir = os.path.join(
+                    os.getcwd(),
+                    "browser_data",
+                    profile_name,
+                )
             os.makedirs(user_data_dir, exist_ok=True)
             utils.logger.info(f"[CDPBrowserManager] User data directory: {user_data_dir}")
             self._clean_session_restore_tabs(user_data_dir)
