@@ -911,19 +911,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 stage="creator_profile_browser",
             )
             await page.wait_for_timeout(random.randint(1_200, 3_000))
-            viewport = page.viewport_size or {"width": 1280, "height": 800}
-            await page.mouse.move(
-                random.randint(80, max(81, viewport["width"] - 80)),
-                random.randint(80, max(81, viewport["height"] - 80)),
-                steps=random.randint(6, 14),
-            )
-            await page.mouse.wheel(0, random.randint(180, 460))
-            await page.wait_for_timeout(random.randint(500, 1_500))
-
-            html_content = await page.content()
-            creator_info = self.xhs_client.extract_creator_info_from_html(html_content)
-            if creator_info:
-                return creator_info
 
             _, markers = await inspect_visible_page_state(page)
             if markers.get("captcha_or_verify"):
@@ -939,11 +926,35 @@ class XiaoHongShuCrawler(AbstractCrawler):
             if challenge:
                 raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
             if markers.get("login_required"):
-                utils.logger.warning(
-                    "[XiaoHongShuCrawler.enrich_note_creator] "
-                    f"browser profile requires login despite confirmed session: {user_id}"
-                )
-            return None
+                raise RuntimeError("xhs_creator_profile_visible_block:login_required")
+
+            viewport = page.viewport_size or {"width": 1280, "height": 800}
+            await page.mouse.move(
+                random.randint(80, max(81, viewport["width"] - 80)),
+                random.randint(80, max(81, viewport["height"] - 80)),
+                steps=random.randint(6, 14),
+            )
+            await page.mouse.wheel(0, random.randint(180, 460))
+            await page.wait_for_timeout(random.randint(500, 1_500))
+
+            _, markers = await inspect_visible_page_state(page)
+            if markers.get("captcha_or_verify"):
+                return await self._wait_for_creator_profile_verification(page, user_id)
+            challenge = next(
+                (
+                    key
+                    for key in ("rate_limited", "blocked")
+                    if markers.get(key)
+                ),
+                "",
+            )
+            if challenge:
+                raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
+            if markers.get("login_required"):
+                raise RuntimeError("xhs_creator_profile_visible_block:login_required")
+
+            html_content = await page.content()
+            return self.xhs_client.extract_creator_info_from_html(html_content)
         finally:
             await self._close_page_with_deadline(page)
 

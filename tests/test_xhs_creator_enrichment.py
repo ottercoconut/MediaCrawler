@@ -75,11 +75,14 @@ async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
     creator = {"interactions": [{"type": "fans", "count": "654"}]}
 
     class Mouse:
+        move_calls = 0
+        wheel_calls = 0
+
         async def move(self, *args, **kwargs):
-            return None
+            self.move_calls += 1
 
         async def wheel(self, *args, **kwargs):
-            return None
+            self.wheel_calls += 1
 
     class VerificationPage:
         viewport_size = {"width": 1280, "height": 800}
@@ -89,6 +92,7 @@ async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
             self.brought_to_front = False
             self.closed = False
             self.content_calls = 0
+            self.inspection_calls = 0
 
         async def wait_for_timeout(self, milliseconds):
             assert not self.closed
@@ -98,7 +102,8 @@ async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
 
         async def content(self):
             self.content_calls += 1
-            return "creator" if self.content_calls > 1 else "verification"
+            assert self.inspection_calls >= 3
+            return "creator"
 
         async def close(self):
             self.closed = True
@@ -124,6 +129,7 @@ async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
     async def inspect_state(current_page):
         assert current_page is page
         assert not page.closed
+        page.inspection_calls += 1
         return "", next(marker_sequence)
 
     crawler.browser_context = BrowserContext()
@@ -141,6 +147,9 @@ async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
     assert result == creator
     assert page.brought_to_front is True
     assert page.closed is True
+    assert page.content_calls == 1
+    assert page.mouse.move_calls == 0
+    assert page.mouse.wheel_calls == 0
 
 
 @pytest.mark.asyncio
