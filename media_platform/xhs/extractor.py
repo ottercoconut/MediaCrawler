@@ -59,11 +59,15 @@ class XiaoHongShuExtractor:
             Dict: User information dictionary
         """
         match = re.search(
-            r"<script>window.__INITIAL_STATE__=(.+)<\/script>", html, re.M
+            r"<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*", html, re.M
         )
         if match is None:
             return None
-        info = json.loads(match.group(1).replace(":undefined", ":null"), strict=False)
+        state_source = html[match.end() :].replace(":undefined", ":null")
+        try:
+            info, _ = json.JSONDecoder(strict=False).raw_decode(state_source.lstrip())
+        except json.JSONDecodeError:
+            return None
         if info is None:
             return None
         user_info = info.get("user")

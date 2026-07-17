@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from media_platform.xhs.core import XiaoHongShuCrawler
+from media_platform.xhs.extractor import XiaoHongShuExtractor
 
 
 class _CreatorClient:
@@ -143,3 +144,30 @@ async def test_search_navigation_timeout_can_defer_to_visible_readiness(crawler)
         "https://www.xiaohongshu.com/search_result?keyword=test",
         stage="behavior_search",
     )
+
+
+def test_creator_html_extractor_stops_at_end_of_initial_state_object():
+    html = (
+        '<script>window.__INITIAL_STATE__={"user":{"userPageData":'
+        '{"userId":"author-8","interactions":[{"type":"fans","count":"88"}]}}}'
+        '</script><script>window.__NEXT_STATE__={"extra":true}</script>'
+    )
+
+    creator = XiaoHongShuExtractor().extract_creator_info_from_html(html)
+
+    assert creator == {
+        "userId": "author-8",
+        "interactions": [{"type": "fans", "count": "88"}],
+    }
+
+
+def test_creator_html_extractor_preserves_undefined_fallback():
+    html = (
+        '<script nonce="test"> window.__INITIAL_STATE__ = '
+        '{"user":{"userPageData":{"userId":"author-9","ipLocation":undefined}}}'
+        ";</script>"
+    )
+
+    creator = XiaoHongShuExtractor().extract_creator_info_from_html(html)
+
+    assert creator == {"userId": "author-9", "ipLocation": None}
