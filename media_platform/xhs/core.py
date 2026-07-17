@@ -926,10 +926,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 return creator_info
 
             _, markers = await inspect_visible_page_state(page)
+            if markers.get("captcha_or_verify"):
+                return await self._wait_for_creator_profile_verification(page, user_id)
             challenge = next(
                 (
                     key
-                    for key in ("captcha_or_verify", "rate_limited", "blocked")
+                    for key in ("rate_limited", "blocked")
                     if markers.get(key)
                 ),
                 "",
@@ -944,6 +946,60 @@ class XiaoHongShuCrawler(AbstractCrawler):
             return None
         finally:
             await self._close_page_with_deadline(page)
+
+    async def _wait_for_creator_profile_verification(
+        self,
+        page: Page,
+        user_id: str,
+    ) -> Optional[Dict]:
+        """Keep a QR security-check page open until the operator completes it."""
+        timeout_seconds = max(
+            30.0,
+            self._env_float("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_WAIT_SECONDS", 600.0),
+        )
+        poll_seconds = max(
+            1.0,
+            self._env_float("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_POLL_SECONDS", 2.0),
+        )
+        deadline = time.monotonic() + timeout_seconds
+        await page.bring_to_front()
+        utils.logger.warning(
+            "[XiaoHongShuCrawler] Manual QR security verification required for creator profile; "
+            f"keeping page open for up to {timeout_seconds:.0f}s: {user_id}"
+        )
+
+        while True:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("xhs_creator_profile_verification_timeout")
+
+            _, markers = await inspect_visible_page_state(page)
+            challenge = next(
+                (
+                    key
+                    for key in ("rate_limited", "blocked")
+                    if markers.get(key)
+                ),
+                "",
+            )
+            if challenge:
+                raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
+            if markers.get("login_required") and not markers.get("captcha_or_verify"):
+                raise RuntimeError("xhs_creator_profile_visible_block:login_required")
+
+            if not markers.get("captcha_or_verify"):
+                html_content = await page.content()
+                creator_info = self.xhs_client.extract_creator_info_from_html(html_content)
+                if creator_info:
+                    utils.logger.info(
+                        "[XiaoHongShuCrawler] Manual creator-profile verification completed: "
+                        f"{user_id}"
+                    )
+                    return creator_info
+
+            remaining_seconds = deadline - time.monotonic()
+            await page.wait_for_timeout(
+                int(min(poll_seconds, max(0.1, remaining_seconds)) * 1000)
+            )
 
     @staticmethod
     def is_video_note(note_detail: Dict) -> bool:

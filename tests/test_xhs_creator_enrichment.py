@@ -68,6 +68,82 @@ async def test_creator_enrichment_does_not_hide_visible_browser_block(crawler):
 
 
 @pytest.mark.asyncio
+async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
+    crawler,
+    monkeypatch,
+):
+    creator = {"interactions": [{"type": "fans", "count": "654"}]}
+
+    class Mouse:
+        async def move(self, *args, **kwargs):
+            return None
+
+        async def wheel(self, *args, **kwargs):
+            return None
+
+    class VerificationPage:
+        viewport_size = {"width": 1280, "height": 800}
+        mouse = Mouse()
+
+        def __init__(self):
+            self.brought_to_front = False
+            self.closed = False
+            self.content_calls = 0
+
+        async def wait_for_timeout(self, milliseconds):
+            assert not self.closed
+
+        async def bring_to_front(self):
+            self.brought_to_front = True
+
+        async def content(self):
+            self.content_calls += 1
+            return "creator" if self.content_calls > 1 else "verification"
+
+        async def close(self):
+            self.closed = True
+
+    class BrowserContext:
+        async def new_page(self):
+            return page
+
+    class CreatorHtmlClient:
+        @staticmethod
+        def extract_creator_info_from_html(html):
+            return creator if html == "creator" else None
+
+    page = VerificationPage()
+    marker_sequence = iter(
+        [
+            {"captcha_or_verify": True},
+            {"captcha_or_verify": True},
+            {"captcha_or_verify": False},
+        ]
+    )
+
+    async def inspect_state(current_page):
+        assert current_page is page
+        assert not page.closed
+        return "", next(marker_sequence)
+
+    crawler.browser_context = BrowserContext()
+    crawler.xhs_client = CreatorHtmlClient()
+    crawler._goto_with_deadline = AsyncMock()
+    monkeypatch.setattr(
+        "media_platform.xhs.core.inspect_visible_page_state",
+        inspect_state,
+    )
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_WAIT_SECONDS", "30")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_POLL_SECONDS", "0")
+
+    result = await crawler._get_creator_info_from_browser("author-qr")
+
+    assert result == creator
+    assert page.brought_to_front is True
+    assert page.closed is True
+
+
+@pytest.mark.asyncio
 async def test_creator_enrichment_caches_successful_author_profile(crawler):
     creator = {"interactions": [{"type": "fans", "count": "789"}]}
     crawler.xhs_client = _CreatorClient(creator)
