@@ -23,7 +23,7 @@ import asyncio
 import os
 # import random  # Removed as we now use fixed config.CRAWLER_MAX_SLEEP_SEC intervals
 from asyncio import Task
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Dict, List, Optional, cast
 from urllib.parse import quote
 
 from playwright.async_api import (
@@ -246,11 +246,7 @@ class ZhihuCrawler(AbstractCrawler):
                 )
 
             crawler_type_var.set(config.CRAWLER_TYPE)
-            search_cookie_keyword = (
-                config.KEYWORDS.split(",", maxsplit=1)[0].strip()
-                if config.CRAWLER_TYPE == "search"
-                else "python"
-            )
+            search_cookie_keyword = config.KEYWORDS.split(",", maxsplit=1)[0].strip()
             # Zhihu's search API requires opening the search page first to access cookies, homepage alone won't work
             utils.logger.info(
                 "[ZhihuCrawler.start] Zhihu navigating to search page to get search page cookies, this process takes about 5 seconds"
@@ -420,7 +416,7 @@ class ZhihuCrawler(AbstractCrawler):
         """
         if not config.ENABLE_GET_COMMENTS:
             utils.logger.info(
-                f"[ZhihuCrawler.batch_get_content_comments] Crawling comment mode is not enabled"
+                "[ZhihuCrawler.batch_get_content_comments] Crawling comment mode is not enabled"
             )
             return
 
@@ -538,12 +534,34 @@ class ZhihuCrawler(AbstractCrawler):
                 utils.logger.info(
                     f"[ZhihuCrawler.get_specified_notes] Get answer info, question_id: {question_id}, answer_id: {answer_id}"
                 )
-                result = await self.zhihu_client.get_answer_info(question_id, answer_id)
+                try:
+                    result = await self.zhihu_client.get_answer_info(question_id, answer_id)
+                except DataFetchError as exc:
+                    utils.logger.warning(
+                        "[ZhihuCrawler.get_note_detail] Answer detail request failed "
+                        f"for {answer_id}: {exc}"
+                    )
+                    return ZhihuContent(
+                        content_id=answer_id,
+                        question_id=question_id,
+                        content_type=constant.ANSWER_NAME,
+                        content_url=full_note_url,
+                        content_detail_status="request_failed",
+                    )
 
                 # Sleep after fetching answer details
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                 utils.logger.info(f"[ZhihuCrawler.get_note_detail] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching answer details {answer_id}")
 
+                if result is None:
+                    return ZhihuContent(
+                        content_id=answer_id,
+                        question_id=question_id,
+                        content_type=constant.ANSWER_NAME,
+                        content_url=full_note_url,
+                        content_detail_status="parse_failed",
+                    )
+                result.content_detail_status = "detail_observed"
                 return result
 
             elif note_type == constant.ARTICLE_NAME:
@@ -551,12 +569,32 @@ class ZhihuCrawler(AbstractCrawler):
                 utils.logger.info(
                     f"[ZhihuCrawler.get_specified_notes] Get article info, article_id: {article_id}"
                 )
-                result = await self.zhihu_client.get_article_info(article_id)
+                try:
+                    result = await self.zhihu_client.get_article_info(article_id)
+                except DataFetchError as exc:
+                    utils.logger.warning(
+                        "[ZhihuCrawler.get_note_detail] Article detail request failed "
+                        f"for {article_id}: {exc}"
+                    )
+                    return ZhihuContent(
+                        content_id=article_id,
+                        content_type=constant.ARTICLE_NAME,
+                        content_url=full_note_url,
+                        content_detail_status="request_failed",
+                    )
 
                 # Sleep after fetching article details
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                 utils.logger.info(f"[ZhihuCrawler.get_note_detail] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching article details {article_id}")
 
+                if result is None:
+                    return ZhihuContent(
+                        content_id=article_id,
+                        content_type=constant.ARTICLE_NAME,
+                        content_url=full_note_url,
+                        content_detail_status="parse_failed",
+                    )
+                result.content_detail_status = "detail_observed"
                 return result
 
             elif note_type == constant.VIDEO_NAME:
@@ -579,12 +617,13 @@ class ZhihuCrawler(AbstractCrawler):
 
         """
         get_note_detail_task_list = []
+        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
         for full_note_url in config.ZHIHU_SPECIFIED_ID_LIST:
             # remove query params
             full_note_url = full_note_url.split("?")[0]
             crawler_task = self.get_note_detail(
                 full_note_url=full_note_url,
-                semaphore=asyncio.Semaphore(config.MAX_CONCURRENCY_NUM),
+                semaphore=semaphore,
             )
             get_note_detail_task_list.append(crawler_task)
 
