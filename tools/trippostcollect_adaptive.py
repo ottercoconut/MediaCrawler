@@ -37,6 +37,35 @@ def existing_platform_identities(platform: str) -> set[str]:
                     """,
                     (platform,),
                 ).fetchall()
+                if platform == "xhs":
+                    target_key = os.environ.get(
+                        "TRIPPOSTCOLLECT_XHS_DISCOVERY_TARGET_KEY",
+                        "",
+                    ).strip()
+                    account_id = os.environ.get(
+                        "TRIPPOSTCOLLECT_XHS_ACCOUNT_ID",
+                        "",
+                    ).strip()
+                    fingerprint = os.environ.get(
+                        "TRIPPOSTCOLLECT_XHS_DISCOVERY_QUERY_FINGERPRINT",
+                        "",
+                    ).strip()
+                    if target_key and account_id and fingerprint:
+                        try:
+                            seen_rows = conn.execute(
+                                """
+                                SELECT platform_post_id
+                                FROM xhs_discovery_seen_candidates
+                                WHERE target_key=? AND account_id=? AND query_fingerprint=?
+                                """,
+                                (target_key, account_id, fingerprint),
+                            ).fetchall()
+                        except sqlite3.Error:
+                            seen_rows = []
+                        rows.extend(
+                            (platform_post_id, None)
+                            for (platform_post_id,) in seen_rows
+                        )
         except (OSError, sqlite3.Error):
             rows = []
     identities: set[str] = set()
@@ -300,7 +329,7 @@ class AdaptiveAccumulator:
         append_execution_event("adaptive_search_stopped", self.summary())
 
     def summary(self) -> dict[str, Any]:
-        return {
+        result = {
             "platform": self.platform,
             "candidate_count": self.candidate_count,
             "valid_new_count": len(self.new_valid_identities),
@@ -323,3 +352,6 @@ class AdaptiveAccumulator:
             "discovery_phase": self.last_discovery_phase,
             "stop_detail": self.stop_detail,
         }
+        if self.platform == "xhs":
+            result["candidate_identities"] = sorted(self.seen_candidate_identities)
+        return result

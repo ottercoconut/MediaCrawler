@@ -114,6 +114,39 @@ def test_known_identity_can_be_skipped_before_detail_fetch() -> None:
     assert accumulator.is_known("new-aweme") is False
 
 
+def test_xhs_persisted_seen_candidate_is_loaded_before_detail(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "xhs-seen.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE web_posts (platform_key TEXT, platform_post_id TEXT, canonical_url TEXT)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE xhs_discovery_seen_candidates (
+                target_key TEXT,
+                account_id TEXT,
+                query_fingerprint TEXT,
+                platform_post_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO xhs_discovery_seen_candidates VALUES (?, ?, ?, ?)",
+            ("qingdao_travel", "xhs-a01", "fingerprint", "seen-invalid-note"),
+        )
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_DISCOVERY_TARGET_KEY", "qingdao_travel")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_ACCOUNT_ID", "xhs-a01")
+    monkeypatch.setenv(
+        "TRIPPOSTCOLLECT_XHS_DISCOVERY_QUERY_FINGERPRINT",
+        "fingerprint",
+    )
+
+    accumulator = AdaptiveAccumulator.from_environment("xhs", hard_limit=10)
+
+    assert accumulator.is_known("seen-invalid-note") is True
+
+
 def test_refresh_batch_does_not_consume_frontier_stagnation(monkeypatch) -> None:
     monkeypatch.setattr(
         "tools.trippostcollect_adaptive.append_execution_event",

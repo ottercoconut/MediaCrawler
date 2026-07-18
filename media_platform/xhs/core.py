@@ -52,7 +52,7 @@ from tools.trippostcollect_behavior import (
     run_required_request_pause,
     run_requested_post_interaction,
 )
-from tools.trippostcollect_adaptive import AdaptiveAccumulator
+from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -626,149 +626,259 @@ class XiaoHongShuCrawler(AbstractCrawler):
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[XiaoHongShuCrawler.search] Current search keyword: {keyword}")
-            page = 1
-            search_id = get_search_id()
-            while accumulator.candidate_count < accumulator.hard_limit and not accumulator.stop_reason:
-                if page < start_page:
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Skip page {page}")
-                    page += 1
-                    continue
+            refresh_max_pages = env_int(
+                "TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES",
+                0,
+            )
+            source_exhausted = (
+                os.environ.get("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED") == "1"
+            )
+            frontier_search_id = os.environ.get(
+                "TRIPPOSTCOLLECT_DISCOVERY_RESUME_CURSOR",
+                "",
+            ) or get_search_id()
+            phases: list[tuple[str, int, int | None, str]] = []
+            if refresh_max_pages > 0:
+                phases.append(("refresh", 1, refresh_max_pages, get_search_id()))
+            if not source_exhausted:
+                phases.append(("frontier", start_page, None, frontier_search_id))
 
-                try:
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] search Xiaohongshu keyword: {keyword}, page: {page}")
+            for discovery_phase, phase_start, phase_limit, search_id in phases:
+                page = phase_start
+                phase_batches = 0
+                while (
+                    accumulator.candidate_count < accumulator.hard_limit
+                    and not accumulator.stop_reason
+                    and (phase_limit is None or phase_batches < phase_limit)
+                ):
                     requested_page = page
-                    note_ids: List[str] = []
-                    xsec_tokens: List[str] = []
-                    notes_res = await self.xhs_client.get_note_by_keyword(
-                        keyword=keyword,
-                        search_id=search_id,
-                        page=page,
-                        sort=(SearchSortType(config.SORT_TYPE) if config.SORT_TYPE != "" else SearchSortType.GENERAL),
-                    )
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Search notes response: {notes_res}")
-                    if not notes_res:
-                        utils.logger.info("[XiaoHongShuCrawler.search] No more content!")
-                        accumulator.mark_source_exhausted(
-                            "empty_response",
-                            source_page=requested_page,
-                            source_cursor=search_id,
-                            raw_batch_count=0,
+                    try:
+                        utils.logger.info(
+                            "[XiaoHongShuCrawler.search] search Xiaohongshu "
+                            f"keyword: {keyword}, page: {requested_page}, phase: {discovery_phase}"
                         )
-                        break
-                    semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-                    remaining = max(0, accumulator.hard_limit - accumulator.candidate_count)
-                    raw_items = list(notes_res.get("items") or [])
-                    source_has_more = notes_res.get("has_more") if "has_more" in notes_res else None
-                    post_items = [
-                        post_item
-                        for post_item in raw_items
-                        if post_item.get("model_type") not in ("rec_query", "hot_query")
-                    ][:remaining]
-                    if not post_items:
+                        notes_res = await self.xhs_client.get_note_by_keyword(
+                            keyword=keyword,
+                            search_id=search_id,
+                            page=requested_page,
+                            sort=(
+                                SearchSortType(config.SORT_TYPE)
+                                if config.SORT_TYPE != ""
+                                else SearchSortType.GENERAL
+                            ),
+                        )
+                        if not notes_res:
+                            utils.logger.info("[XiaoHongShuCrawler.search] No more content!")
+                            if discovery_phase == "frontier":
+                                accumulator.mark_source_exhausted(
+                                    "empty_response",
+                                    source_page=requested_page,
+                                    source_cursor=search_id,
+                                    source_has_more=False,
+                                    raw_batch_count=0,
+                                    resume_page=requested_page,
+                                    resume_cursor=search_id,
+                                    discovery_phase=discovery_phase,
+                                )
+                            break
+
+                        raw_items = list(notes_res.get("items") or [])
+                        source_has_more = (
+                            notes_res.get("has_more")
+                            if "has_more" in notes_res
+                            else None
+                        )
+                        pending_ids: set[str] = set()
+                        unknown_items: List[Dict] = []
+                        for post_item in raw_items:
+                            if post_item.get("model_type") in ("rec_query", "hot_query"):
+                                continue
+                            identity = str(post_item.get("id") or "")
+                            if accumulator.is_known(identity) or (
+                                identity and identity in pending_ids
+                            ):
+                                continue
+                            if identity:
+                                pending_ids.add(identity)
+                            unknown_items.append(post_item)
+
                         accumulator.begin_batch()
+                        remaining = max(
+                            0,
+                            accumulator.hard_limit - accumulator.candidate_count,
+                        )
+                        selected_items = unknown_items[:remaining]
+                        if not selected_items:
+                            resume_page = requested_page + 1
+                            if accumulator.finish_batch(
+                                source_page=requested_page,
+                                source_cursor=search_id,
+                                source_has_more=source_has_more,
+                                raw_batch_count=len(raw_items),
+                                resume_page=resume_page,
+                                resume_cursor=search_id,
+                                batch_complete=True,
+                                discovery_phase=discovery_phase,
+                                count_stagnation=discovery_phase == "frontier",
+                            ):
+                                break
+                            if source_has_more in (False, 0):
+                                if discovery_phase == "frontier":
+                                    accumulator.mark_source_exhausted(
+                                        "has_more_false",
+                                        source_page=requested_page,
+                                        source_cursor=search_id,
+                                        source_has_more=False,
+                                        raw_batch_count=len(raw_items),
+                                        resume_page=resume_page,
+                                        resume_cursor=search_id,
+                                        batch_complete=True,
+                                        discovery_phase=discovery_phase,
+                                    )
+                                break
+                            page = resume_page
+                            phase_batches += 1
+                            await self._guarded_pause("search_page", 12.0, 30.0)
+                            continue
+
+                        await self._guarded_pause("search_results", 6.0, 14.0)
+                        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+                        task_list = [
+                            self.get_note_detail_async_task(
+                                note_id=post_item.get("id"),
+                                xsec_source=post_item.get("xsec_source"),
+                                xsec_token=post_item.get("xsec_token"),
+                                semaphore=semaphore,
+                            )
+                            for post_item in selected_items
+                        ]
+                        note_details = await asyncio.gather(*task_list)
+                        note_ids: List[str] = []
+                        xsec_tokens: List[str] = []
+                        processed_count = 0
+                        for post_item, note_detail in zip(selected_items, note_details):
+                            identity = str(
+                                (note_detail or {}).get("note_id")
+                                or post_item.get("id")
+                                or ""
+                            )
+                            processed_count += 1
+                            if note_detail:
+                                if self.is_video_note(note_detail):
+                                    utils.logger.info(
+                                        "[XiaoHongShuCrawler.search] Skip video note, "
+                                        f"note_id: {note_detail.get('note_id')}"
+                                    )
+                                    if accumulator.consider(identity, valid=False):
+                                        break
+                                    continue
+                                await self._maybe_run_post_interaction(note_detail)
+                                await self.enrich_note_creator(note_detail)
+                                creator_profile = note_detail.get("creator_profile") or {}
+                                creator_item = (
+                                    xhs_store._normalized_creator_item(
+                                        (note_detail.get("user") or {}).get("user_id", ""),
+                                        creator_profile,
+                                    )
+                                    if creator_profile
+                                    else {}
+                                )
+                                followers_observed = any(
+                                    creator_item.get(key) not in (None, "")
+                                    for key in ("fans_count", "fans")
+                                )
+                                interact_info = note_detail.get("interact_info") or {}
+                                valid = bool(
+                                    identity
+                                    and (note_detail.get("title") or note_detail.get("desc"))
+                                    and note_detail.get("time")
+                                    and (note_detail.get("user") or {}).get("user_id")
+                                    and (note_detail.get("user") or {}).get("nickname")
+                                    and note_detail.get("image_list")
+                                    and followers_observed
+                                    and all(
+                                        interact_info.get(key) not in (None, "")
+                                        for key in (
+                                            "liked_count",
+                                            "collected_count",
+                                            "comment_count",
+                                            "share_count",
+                                        )
+                                    )
+                                )
+                                should_stop = accumulator.consider(identity, valid=valid)
+                                await xhs_store.update_xhs_note(note_detail)
+                                await self.get_notice_media(note_detail)
+                                note_ids.append(note_detail.get("note_id"))
+                                xsec_tokens.append(note_detail.get("xsec_token"))
+                                if should_stop:
+                                    break
+                            elif accumulator.consider(identity, valid=False):
+                                break
+
+                        utils.logger.info(
+                            "[XiaoHongShuCrawler.search] Note detail summaries: "
+                            f"{self.note_detail_summaries(note_details)}"
+                        )
+                        await self.batch_get_note_comments(note_ids, xsec_tokens)
+                        batch_complete = processed_count >= len(unknown_items)
+                        resume_page = (
+                            requested_page + 1 if batch_complete else requested_page
+                        )
                         if accumulator.finish_batch(
                             source_page=requested_page,
                             source_cursor=search_id,
                             source_has_more=source_has_more,
                             raw_batch_count=len(raw_items),
+                            resume_page=resume_page,
+                            resume_cursor=search_id,
+                            batch_complete=batch_complete,
+                            discovery_phase=discovery_phase,
+                            count_stagnation=discovery_phase == "frontier",
                         ):
                             break
                         if source_has_more in (False, 0):
-                            accumulator.mark_source_exhausted(
-                                "has_more_false",
-                                source_page=requested_page,
-                                source_cursor=search_id,
-                                source_has_more=source_has_more,
-                                raw_batch_count=len(raw_items),
-                            )
+                            if discovery_phase == "frontier":
+                                accumulator.mark_source_exhausted(
+                                    "has_more_false",
+                                    source_page=requested_page,
+                                    source_cursor=search_id,
+                                    source_has_more=False,
+                                    raw_batch_count=len(raw_items),
+                                    resume_page=resume_page,
+                                    resume_cursor=search_id,
+                                    batch_complete=batch_complete,
+                                    discovery_phase=discovery_phase,
+                                )
                             break
-                        page += 1
+                        page = requested_page + 1
+                        phase_batches += 1
                         await self._guarded_pause("search_page", 12.0, 30.0)
-                        continue
-                    await self._guarded_pause("search_results", 6.0, 14.0)
-                    task_list = [
-                        self.get_note_detail_async_task(
-                            note_id=post_item.get("id"),
-                            xsec_source=post_item.get("xsec_source"),
-                            xsec_token=post_item.get("xsec_token"),
-                            semaphore=semaphore,
-                        ) for post_item in post_items
-                    ]
-                    note_details = await asyncio.gather(*task_list)
-                    accumulator.begin_batch()
-                    for post_item, note_detail in zip(post_items, note_details):
-                        identity = str((note_detail or {}).get("note_id") or post_item.get("id") or "")
-                        if note_detail:
-                            if self.is_video_note(note_detail):
-                                utils.logger.info(
-                                    f"[XiaoHongShuCrawler.search] Skip video note, note_id: {note_detail.get('note_id')}"
-                                )
-                                if accumulator.consider(identity, valid=False):
-                                    break
-                                continue
-                            await self._maybe_run_post_interaction(note_detail)
-                            await self.enrich_note_creator(note_detail)
-                            creator_profile = note_detail.get("creator_profile") or {}
-                            creator_item = xhs_store._normalized_creator_item(
-                                (note_detail.get("user") or {}).get("user_id", ""),
-                                creator_profile,
-                            ) if creator_profile else {}
-                            followers_observed = any(
-                                creator_item.get(key) not in (None, "")
-                                for key in ("fans_count", "fans")
-                            )
-                            interact_info = note_detail.get("interact_info") or {}
-                            valid = bool(
-                                identity
-                                and (note_detail.get("title") or note_detail.get("desc"))
-                                and note_detail.get("time")
-                                and (note_detail.get("user") or {}).get("user_id")
-                                and (note_detail.get("user") or {}).get("nickname")
-                                and note_detail.get("image_list")
-                                and followers_observed
-                                and all(
-                                    interact_info.get(key) not in (None, "")
-                                    for key in ("liked_count", "collected_count", "comment_count", "share_count")
-                                )
-                            )
-                            should_stop = accumulator.consider(identity, valid=valid)
-                            await xhs_store.update_xhs_note(note_detail)
-                            await self.get_notice_media(note_detail)
-                            note_ids.append(note_detail.get("note_id"))
-                            xsec_tokens.append(note_detail.get("xsec_token"))
-                            if should_stop:
-                                break
-                        elif accumulator.consider(identity, valid=False):
-                            break
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Note detail summaries: {self.note_detail_summaries(note_details)}")
-                    await self.batch_get_note_comments(note_ids, xsec_tokens)
-                    if accumulator.finish_batch(
-                        source_page=requested_page,
-                        source_cursor=search_id,
-                        source_has_more=source_has_more,
-                        raw_batch_count=len(raw_items),
-                    ):
-                        break
-                    if source_has_more in (False, 0):
-                        accumulator.mark_source_exhausted(
-                            "has_more_false",
+                    except DataFetchError:
+                        utils.logger.error(
+                            "[XiaoHongShuCrawler.search] Get note detail error"
+                        )
+                        accumulator.mark_runtime_failed(
+                            "search_or_detail_request_failed",
                             source_page=requested_page,
                             source_cursor=search_id,
-                            source_has_more=source_has_more,
-                            raw_batch_count=len(raw_items),
+                            resume_page=requested_page,
+                            resume_cursor=search_id,
+                            discovery_phase=discovery_phase,
                         )
                         break
-                    page += 1
 
-                    await self._guarded_pause("search_page", 12.0, 30.0)
-                except DataFetchError:
-                    utils.logger.error("[XiaoHongShuCrawler.search] Get note detail error")
-                    accumulator.mark_runtime_failed(
-                        "search_or_detail_request_failed",
-                        source_page=page,
-                        source_cursor=search_id,
-                    )
-                    break
+            if source_exhausted and not accumulator.stop_reason:
+                accumulator.mark_source_exhausted(
+                    "saved_source_exhausted",
+                    source_page=start_page,
+                    source_cursor=frontier_search_id,
+                    source_has_more=False,
+                    raw_batch_count=0,
+                    resume_page=start_page,
+                    resume_cursor=frontier_search_id,
+                    discovery_phase="frontier",
+                )
 
     async def get_creators_and_notes(self) -> None:
         """Get creator's notes and retrieve their comment information."""
