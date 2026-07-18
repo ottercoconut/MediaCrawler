@@ -24,6 +24,10 @@ def test_batch_event_records_pagination_metadata(monkeypatch, tmp_path) -> None:
         source_cursor="search-id",
         source_has_more=True,
         raw_batch_count=20,
+        resume_page=3,
+        resume_cursor="next-search-id",
+        batch_complete=True,
+        discovery_phase="frontier",
     )
 
     event = json.loads(state_path.read_text(encoding="utf-8"))["events"][0]
@@ -32,6 +36,9 @@ def test_batch_event_records_pagination_metadata(monkeypatch, tmp_path) -> None:
     assert event["details"]["source_cursor"] == "search-id"
     assert event["details"]["source_has_more"] is True
     assert event["details"]["raw_batch_count"] == 20
+    assert event["details"]["resume_page"] == 3
+    assert event["details"]["resume_cursor"] == "next-search-id"
+    assert event["details"]["batch_complete"] is True
 
 
 def test_runtime_failure_has_distinct_stop_reason(monkeypatch, tmp_path) -> None:
@@ -91,3 +98,42 @@ def test_resume_identity_does_not_advance_continuation_target(monkeypatch, tmp_p
     assert accumulator.consider("new-note", valid=True) is True
     assert len(accumulator.existing_valid_identities) == 1
     assert len(accumulator.new_valid_identities) == 1
+
+
+def test_known_identity_can_be_skipped_before_detail_fetch() -> None:
+    accumulator = AdaptiveAccumulator(
+        platform="douyin",
+        hard_limit=10,
+        target_new=1,
+        max_stagnant_batches=3,
+        existing_identities={"known-aweme"},
+    )
+
+    assert accumulator.is_known("known-aweme") is True
+    assert accumulator.candidate_count == 0
+    assert accumulator.is_known("new-aweme") is False
+
+
+def test_refresh_batch_does_not_consume_frontier_stagnation(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tools.trippostcollect_adaptive.append_execution_event",
+        lambda *args, **kwargs: None,
+    )
+    accumulator = AdaptiveAccumulator(
+        platform="weibo",
+        hard_limit=10,
+        target_new=2,
+        max_stagnant_batches=1,
+    )
+    accumulator.begin_batch()
+
+    stopped = accumulator.finish_batch(
+        source_page=1,
+        resume_page=2,
+        batch_complete=True,
+        discovery_phase="refresh",
+        count_stagnation=False,
+    )
+
+    assert stopped is False
+    assert accumulator.stagnant_batches == 0

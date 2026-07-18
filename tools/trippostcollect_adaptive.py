@@ -93,6 +93,11 @@ class AdaptiveAccumulator:
     last_next_cursor: int | str | None = None
     last_source_has_more: bool | int | None = None
     last_raw_batch_count: int | None = None
+    last_resume_page: int | str | None = None
+    last_resume_offset: int | None = None
+    last_resume_cursor: int | str | None = None
+    last_batch_complete: bool = False
+    last_discovery_phase: str = "frontier"
     stop_detail: str = ""
     _batch_new_before: int = 0
     _batch_candidate_before: int = 0
@@ -111,6 +116,15 @@ class AdaptiveAccumulator:
         self.batch_no += 1
         self._batch_new_before = len(self.new_valid_identities)
         self._batch_candidate_before = len(self.seen_candidate_identities)
+
+    def is_known(self, identity: str) -> bool:
+        return bool(
+            identity
+            and (
+                identity in self.existing_identities
+                or identity in self.seen_candidate_identities
+            )
+        )
 
     def consider(self, identity: str, *, valid: bool) -> bool:
         if self.candidate_count >= self.hard_limit:
@@ -141,6 +155,11 @@ class AdaptiveAccumulator:
         next_cursor: int | str | None = None,
         source_has_more: bool | int | None = None,
         raw_batch_count: int | None = None,
+        resume_page: int | str | None = None,
+        resume_offset: int | None = None,
+        resume_cursor: int | str | None = None,
+        batch_complete: bool = False,
+        discovery_phase: str = "frontier",
     ) -> None:
         self.last_source_page = source_page
         self.last_source_offset = source_offset
@@ -148,6 +167,11 @@ class AdaptiveAccumulator:
         self.last_next_cursor = next_cursor
         self.last_source_has_more = source_has_more
         self.last_raw_batch_count = raw_batch_count
+        self.last_resume_page = resume_page
+        self.last_resume_offset = resume_offset
+        self.last_resume_cursor = resume_cursor
+        self.last_batch_complete = batch_complete
+        self.last_discovery_phase = discovery_phase
 
     def finish_batch(
         self,
@@ -158,6 +182,12 @@ class AdaptiveAccumulator:
         next_cursor: int | str | None = None,
         source_has_more: bool | int | None = None,
         raw_batch_count: int | None = None,
+        resume_page: int | str | None = None,
+        resume_offset: int | None = None,
+        resume_cursor: int | str | None = None,
+        batch_complete: bool = False,
+        discovery_phase: str = "frontier",
+        count_stagnation: bool = True,
     ) -> bool:
         self._record_source(
             source_page=source_page,
@@ -166,11 +196,17 @@ class AdaptiveAccumulator:
             next_cursor=next_cursor,
             source_has_more=source_has_more,
             raw_batch_count=raw_batch_count,
+            resume_page=resume_page,
+            resume_offset=resume_offset,
+            resume_cursor=resume_cursor,
+            batch_complete=batch_complete,
+            discovery_phase=discovery_phase,
         )
         added = len(self.new_valid_identities) - self._batch_new_before
         candidate_identities_added = len(self.seen_candidate_identities) - self._batch_candidate_before
-        self.stagnant_batches = self.stagnant_batches + 1 if added == 0 else 0
-        if self.stagnant_batches >= self.max_stagnant_batches:
+        if count_stagnation:
+            self.stagnant_batches = self.stagnant_batches + 1 if added == 0 else 0
+        if count_stagnation and self.stagnant_batches >= self.max_stagnant_batches:
             self.stop_reason = "stagnated"
         details = {
             "platform": self.platform,
@@ -190,6 +226,11 @@ class AdaptiveAccumulator:
             "next_cursor": next_cursor,
             "source_has_more": source_has_more,
             "raw_batch_count": raw_batch_count,
+            "resume_page": resume_page,
+            "resume_offset": resume_offset,
+            "resume_cursor": resume_cursor,
+            "batch_complete": batch_complete,
+            "discovery_phase": discovery_phase,
         }
         append_execution_event("adaptive_batch_completed", details)
         if self.stop_reason:
@@ -207,6 +248,11 @@ class AdaptiveAccumulator:
         next_cursor: int | str | None = None,
         source_has_more: bool | int | None = None,
         raw_batch_count: int | None = None,
+        resume_page: int | str | None = None,
+        resume_offset: int | None = None,
+        resume_cursor: int | str | None = None,
+        batch_complete: bool = True,
+        discovery_phase: str = "frontier",
     ) -> None:
         self._record_source(
             source_page=source_page,
@@ -215,6 +261,11 @@ class AdaptiveAccumulator:
             next_cursor=next_cursor,
             source_has_more=source_has_more,
             raw_batch_count=raw_batch_count,
+            resume_page=resume_page,
+            resume_offset=resume_offset,
+            resume_cursor=resume_cursor,
+            batch_complete=batch_complete,
+            discovery_phase=discovery_phase,
         )
         if not self.stop_reason:
             self.stop_reason = "source_exhausted"
@@ -228,11 +279,20 @@ class AdaptiveAccumulator:
         source_page: int | str | None = None,
         source_offset: int | None = None,
         source_cursor: int | str | None = None,
+        resume_page: int | str | None = None,
+        resume_offset: int | None = None,
+        resume_cursor: int | str | None = None,
+        discovery_phase: str = "frontier",
     ) -> None:
         self._record_source(
             source_page=source_page,
             source_offset=source_offset,
             source_cursor=source_cursor,
+            resume_page=resume_page,
+            resume_offset=resume_offset,
+            resume_cursor=resume_cursor,
+            batch_complete=False,
+            discovery_phase=discovery_phase,
         )
         if not self.stop_reason:
             self.stop_reason = "runtime_failed"
@@ -256,5 +316,10 @@ class AdaptiveAccumulator:
             "next_cursor": self.last_next_cursor,
             "source_has_more": self.last_source_has_more,
             "raw_batch_count": self.last_raw_batch_count,
+            "resume_page": self.last_resume_page,
+            "resume_offset": self.last_resume_offset,
+            "resume_cursor": self.last_resume_cursor,
+            "batch_complete": self.last_batch_complete,
+            "discovery_phase": self.last_discovery_phase,
             "stop_detail": self.stop_detail,
         }

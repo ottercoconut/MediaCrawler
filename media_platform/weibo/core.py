@@ -43,7 +43,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import weibo as weibo_store
 from tools import utils
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
-from tools.trippostcollect_adaptive import AdaptiveAccumulator
+from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -175,77 +175,137 @@ class WeiboCrawler(AbstractCrawler):
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[WeiboCrawler.search] Current search keyword: {keyword}")
-            page = 1
-            while accumulator.candidate_count < accumulator.hard_limit and not accumulator.stop_reason:
-                if page < start_page:
-                    utils.logger.info(f"[WeiboCrawler.search] Skip page: {page}")
-                    page += 1
-                    continue
-                utils.logger.info(f"[WeiboCrawler.search] search weibo keyword: {keyword}, page: {page}")
-                requested_page = page
-                try:
-                    search_res = await self.wb_client.get_note_by_keyword(
-                        keyword=keyword,
-                        page=requested_page,
-                        search_type=search_type,
+            phases: list[tuple[str, int, int | None]] = []
+            refresh_max_pages = env_int("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", 0)
+            if start_page > 1 and refresh_max_pages > 0:
+                phases.append(("refresh", 1, min(start_page - 1, refresh_max_pages)))
+            source_exhausted = os.environ.get("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED") == "1"
+            if not source_exhausted:
+                phases.append(("frontier", start_page, None))
+            for discovery_phase, phase_start, phase_end in phases:
+                page = phase_start
+                while (
+                    accumulator.candidate_count < accumulator.hard_limit
+                    and not accumulator.stop_reason
+                    and (phase_end is None or page <= phase_end)
+                ):
+                    utils.logger.info(
+                        f"[WeiboCrawler.search] search weibo keyword: {keyword}, page: {page}"
                     )
-                except DataFetchError:
-                    accumulator.mark_runtime_failed("search_request_failed", source_page=requested_page)
-                    raise
-                note_id_list: List[str] = []
-                note_list = filter_search_result_card(search_res.get("cards"))
-                if not note_list:
-                    accumulator.mark_source_exhausted(
-                        "empty_page",
-                        source_page=requested_page,
-                        raw_batch_count=0,
-                    )
-                    break
-                # If full text fetching is enabled, batch get full text of posts
-                note_list = await self.batch_get_notes_full_text(note_list)
-                accumulator.begin_batch()
-                for note_item in note_list:
-                    if note_item:
-                        mblog: Dict = note_item.get("mblog")
-                        if mblog:
-                            note_id = str(mblog.get("id") or "")
-                            user = mblog.get("user") or {}
-                            followers_observed = any(
-                                key in user and user.get(key) not in (None, "")
-                                for key in ("followers_count", "followers_count_str", "fans_count", "fans_count_str")
+                    requested_page = page
+                    try:
+                        search_res = await self.wb_client.get_note_by_keyword(
+                            keyword=keyword,
+                            page=requested_page,
+                            search_type=search_type,
+                        )
+                    except DataFetchError:
+                        accumulator.mark_runtime_failed(
+                            "search_request_failed",
+                            source_page=requested_page,
+                            resume_page=requested_page,
+                            discovery_phase=discovery_phase,
+                        )
+                        raise
+                    note_id_list: List[str] = []
+                    note_list = filter_search_result_card(search_res.get("cards"))
+                    if not note_list:
+                        if discovery_phase == "frontier":
+                            accumulator.mark_source_exhausted(
+                                "empty_page",
+                                source_page=requested_page,
+                                raw_batch_count=0,
+                                resume_page=requested_page,
+                                source_has_more=False,
+                                discovery_phase=discovery_phase,
                             )
-                            valid = bool(
-                                note_id
-                                and mblog.get("text")
-                                and mblog.get("created_at")
-                                and user.get("id")
-                                and user.get("screen_name")
-                                and followers_observed
-                                and weibo_store._weibo_pic_urls(mblog)
-                                and all(
-                                    mblog.get(key) not in (None, "")
-                                    for key in ("attitudes_count", "comments_count", "reposts_count")
+                        break
+                    raw_batch_count = len(note_list)
+                    pending_note_ids: set[str] = set()
+                    unknown_notes = []
+                    for note_item in note_list:
+                        note_id = str(
+                            ((note_item or {}).get("mblog") or {}).get("id") or ""
+                        )
+                        if accumulator.is_known(note_id) or (
+                            note_id and note_id in pending_note_ids
+                        ):
+                            continue
+                        if note_id:
+                            pending_note_ids.add(note_id)
+                        unknown_notes.append(note_item)
+                    note_list = unknown_notes
+                    note_list = await self.batch_get_notes_full_text(note_list)
+                    accumulator.begin_batch()
+                    processed_count = 0
+                    for note_item in note_list:
+                        processed_count += 1
+                        if not note_item:
+                            continue
+                        mblog: Dict = note_item.get("mblog")
+                        if not mblog:
+                            continue
+                        note_id = str(mblog.get("id") or "")
+                        user = mblog.get("user") or {}
+                        followers_observed = any(
+                            key in user and user.get(key) not in (None, "")
+                            for key in (
+                                "followers_count",
+                                "followers_count_str",
+                                "fans_count",
+                                "fans_count_str",
+                            )
+                        )
+                        valid = bool(
+                            note_id
+                            and mblog.get("text")
+                            and mblog.get("created_at")
+                            and user.get("id")
+                            and user.get("screen_name")
+                            and followers_observed
+                            and weibo_store._weibo_pic_urls(mblog)
+                            and all(
+                                mblog.get(key) not in (None, "")
+                                for key in (
+                                    "attitudes_count",
+                                    "comments_count",
+                                    "reposts_count",
                                 )
                             )
-                            should_stop = accumulator.consider(note_id, valid=valid)
-                            note_id_list.append(note_id)
-                            await weibo_store.update_weibo_note(note_item)
-                            await self.get_note_images(mblog)
-                            if should_stop:
-                                break
+                        )
+                        should_stop = accumulator.consider(note_id, valid=valid)
+                        note_id_list.append(note_id)
+                        await weibo_store.update_weibo_note(note_item)
+                        await self.get_note_images(mblog)
+                        if should_stop:
+                            break
 
-                page += 1
-
-                # Sleep after page navigation
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[WeiboCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
-
-                await self.batch_get_notes_comments(note_id_list)
-                if accumulator.finish_batch(
-                    source_page=requested_page,
-                    raw_batch_count=len(note_list),
-                ):
-                    break
+                    batch_complete = processed_count >= len(note_list)
+                    page += 1
+                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                    utils.logger.info(
+                        f"[WeiboCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} "
+                        f"seconds after page {page-1}"
+                    )
+                    await self.batch_get_notes_comments(note_id_list)
+                    if accumulator.finish_batch(
+                        source_page=requested_page,
+                        raw_batch_count=raw_batch_count,
+                        resume_page=page if batch_complete else requested_page,
+                        batch_complete=batch_complete,
+                        discovery_phase=discovery_phase,
+                        count_stagnation=discovery_phase == "frontier",
+                    ):
+                        break
+            if source_exhausted and not accumulator.stop_reason:
+                accumulator.mark_source_exhausted(
+                    "saved_source_exhausted",
+                    source_page=start_page,
+                    resume_page=start_page,
+                    source_has_more=False,
+                    raw_batch_count=0,
+                    discovery_phase="frontier",
+                )
 
     async def get_specified_notes(self):
         """

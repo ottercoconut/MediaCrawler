@@ -38,7 +38,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
-from tools.trippostcollect_adaptive import AdaptiveAccumulator
+from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -150,139 +150,235 @@ class DouYinCrawler(AbstractCrawler):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[DouYinCrawler.search] Current keyword: {keyword}")
             aweme_list: List[str] = []
-            page = 0
-            dy_search_id = ""
-            while accumulator.candidate_count < accumulator.hard_limit and not accumulator.stop_reason:
-                if page < start_page:
-                    utils.logger.info(f"[DouYinCrawler.search] Skip {page}")
-                    page += 1
-                    continue
-                try:
-                    utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page}")
-                    requested_offset = page * dy_limit_count - dy_limit_count
+            refresh_max_pages = env_int("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", 0)
+            source_exhausted = os.environ.get("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED") == "1"
+            frontier_offset = env_int(
+                "TRIPPOSTCOLLECT_DISCOVERY_RESUME_OFFSET",
+                max(0, (start_page - 1) * dy_limit_count),
+            )
+            frontier_cursor = os.environ.get(
+                "TRIPPOSTCOLLECT_DISCOVERY_RESUME_CURSOR",
+                "",
+            )
+            phases: list[tuple[str, int, int, str, int | None]] = []
+            if start_page > 1 and refresh_max_pages > 0:
+                phases.append(("refresh", 1, 0, "", refresh_max_pages))
+            if not source_exhausted:
+                phases.append(("frontier", start_page, frontier_offset, frontier_cursor, None))
+
+            for discovery_phase, phase_page, phase_offset, phase_cursor, phase_limit in phases:
+                page = phase_page
+                next_offset = phase_offset
+                dy_search_id = phase_cursor
+                phase_batches = 0
+                while (
+                    accumulator.candidate_count < accumulator.hard_limit
+                    and not accumulator.stop_reason
+                    and (phase_limit is None or phase_batches < phase_limit)
+                ):
+                    requested_page = page
+                    requested_offset = next_offset
                     requested_search_id = dy_search_id
-                    posts_res = await self.dy_client.search_info_by_keyword(
-                        keyword=keyword,
-                        offset=requested_offset,
-                        publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
-                        search_id=dy_search_id,
-                    )
-                    if "data" not in posts_res or posts_res.get("data") is None:
+                    try:
+                        utils.logger.info(
+                            f"[DouYinCrawler.search] search douyin keyword: {keyword}, "
+                            f"page: {requested_page}, offset: {requested_offset}"
+                        )
+                        posts_res = await self.dy_client.search_info_by_keyword(
+                            keyword=keyword,
+                            offset=requested_offset,
+                            publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
+                            search_id=requested_search_id,
+                        )
+                    except DataFetchError:
                         utils.logger.error(
-                            f"[DouYinCrawler.search] response missing data, keyword: {keyword}, page: {page}"
+                            f"[DouYinCrawler.search] search douyin keyword: {keyword} failed"
                         )
                         accumulator.mark_runtime_failed(
-                            "missing_data_field",
-                            source_page=page,
+                            "search_request_failed",
+                            source_page=requested_page,
                             source_offset=requested_offset,
                             source_cursor=requested_search_id,
+                            resume_page=requested_page,
+                            resume_offset=requested_offset,
+                            resume_cursor=requested_search_id,
+                            discovery_phase=discovery_phase,
                         )
                         break
-                    if posts_res.get("data") == []:
-                        utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,{posts_res.get('data')}`")
-                        source_has_more = posts_res.get("has_more") if "has_more" in posts_res else None
-                        next_search_id = posts_res.get("extra", {}).get("logid", "")
+                    if "data" not in posts_res or posts_res.get("data") is None:
+                        accumulator.mark_runtime_failed(
+                            "missing_data_field",
+                            source_page=requested_page,
+                            source_offset=requested_offset,
+                            source_cursor=requested_search_id,
+                            resume_page=requested_page,
+                            resume_offset=requested_offset,
+                            resume_cursor=requested_search_id,
+                            discovery_phase=discovery_phase,
+                        )
+                        break
+
+                    post_items = posts_res.get("data") or []
+                    source_has_more = (
+                        posts_res.get("has_more") if "has_more" in posts_res else None
+                    )
+                    next_search_id = posts_res.get("extra", {}).get("logid", "")
+                    resume_page = requested_page + 1
+                    resume_offset = requested_offset + dy_limit_count
+                    accumulator.begin_batch()
+                    if not post_items:
                         if source_has_more in (True, 1) and next_search_id:
-                            page += 1
-                            accumulator.begin_batch()
+                            page = resume_page
+                            next_offset = resume_offset
                             dy_search_id = next_search_id
+                            phase_batches += 1
                             if accumulator.finish_batch(
-                                source_page=page - 1,
+                                source_page=requested_page,
                                 source_offset=requested_offset,
                                 source_cursor=requested_search_id,
-                                next_cursor=dy_search_id,
+                                next_cursor=next_search_id,
                                 source_has_more=source_has_more,
                                 raw_batch_count=0,
+                                resume_page=resume_page,
+                                resume_offset=resume_offset,
+                                resume_cursor=next_search_id,
+                                batch_complete=True,
+                                discovery_phase=discovery_phase,
+                                count_stagnation=discovery_phase == "frontier",
                             ):
                                 break
                             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                             continue
-                        accumulator.mark_source_exhausted(
-                            "empty_cursor" if source_has_more in (True, 1) else "empty_page",
-                            source_page=page,
-                            source_offset=requested_offset,
-                            source_cursor=requested_search_id,
-                            next_cursor=next_search_id,
-                            source_has_more=source_has_more,
-                            raw_batch_count=0,
-                        )
+                        if discovery_phase == "frontier":
+                            accumulator.mark_source_exhausted(
+                                "empty_cursor" if source_has_more in (True, 1) else "empty_page",
+                                source_page=requested_page,
+                                source_offset=requested_offset,
+                                source_cursor=requested_search_id,
+                                next_cursor=next_search_id,
+                                source_has_more=False,
+                                raw_batch_count=0,
+                                resume_page=requested_page,
+                                resume_offset=requested_offset,
+                                resume_cursor=requested_search_id,
+                                discovery_phase=discovery_phase,
+                            )
                         break
-                except DataFetchError:
-                    utils.logger.error(f"[DouYinCrawler.search] search douyin keyword: {keyword} failed")
-                    accumulator.mark_runtime_failed(
-                        "search_request_failed",
-                        source_page=page,
-                        source_offset=page * dy_limit_count - dy_limit_count,
-                        source_cursor=dy_search_id,
-                    )
-                    break
 
-                page += 1
-                dy_search_id = posts_res.get("extra", {}).get("logid", "")
-                source_has_more = posts_res.get("has_more") if "has_more" in posts_res else None
-                raw_batch_count = len(posts_res.get("data") or [])
-                page_aweme_list = []
-                accumulator.begin_batch()
-                for post_item in posts_res.get("data"):
-                    try:
-                        aweme_info: Dict = (post_item.get("aweme_info") or post_item.get("aweme_mix_info", {}).get("mix_items")[0])
-                    except TypeError:
-                        if accumulator.consider("", valid=False):
-                            break
-                        continue
-                    aweme_info = await self.enrich_aweme_creator(aweme_info)
-                    aweme_id = str(aweme_info.get("aweme_id") or "")
-                    author = aweme_info.get("author") or {}
-                    creator_profile = aweme_info.get("creator_profile") or {}
-                    author_stats = douyin_store._normalized_author_stats(author, creator_profile)
-                    statistics = aweme_info.get("statistics") or {}
-                    valid = bool(
-                        aweme_id
-                        and aweme_info.get("desc")
-                        and aweme_info.get("create_time")
-                        and author.get("uid")
-                        and author.get("nickname")
-                        and douyin_store._extract_note_image_list(aweme_info)
-                        and author_stats.get("followers_observed")
-                        and all(
-                            statistics.get(key) not in (None, "")
-                            for key in ("digg_count", "collect_count", "comment_count", "share_count")
+                    raw_batch_count = len(post_items)
+                    page_aweme_list: List[str] = []
+                    processed_count = 0
+                    for post_item in post_items:
+                        try:
+                            aweme_info: Dict = (
+                                post_item.get("aweme_info")
+                                or post_item.get("aweme_mix_info", {}).get("mix_items")[0]
+                            )
+                        except (AttributeError, IndexError, TypeError):
+                            processed_count += 1
+                            if accumulator.consider("", valid=False):
+                                break
+                            continue
+                        aweme_id = str(aweme_info.get("aweme_id") or "")
+                        if accumulator.is_known(aweme_id):
+                            processed_count += 1
+                            continue
+                        aweme_info = await self.enrich_aweme_creator(aweme_info)
+                        author = aweme_info.get("author") or {}
+                        creator_profile = aweme_info.get("creator_profile") or {}
+                        author_stats = douyin_store._normalized_author_stats(
+                            author,
+                            creator_profile,
                         )
-                    )
-                    should_stop = accumulator.consider(aweme_id, valid=valid)
-                    aweme_list.append(aweme_id)
-                    page_aweme_list.append(aweme_id)
-                    await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
-                    await self.get_aweme_media(aweme_item=aweme_info)
-                    if should_stop:
-                        break
-                
-                # Batch get note comments for the current page
-                await self.batch_get_note_comments(page_aweme_list)
-                if accumulator.finish_batch(
-                    source_page=page - 1,
-                    source_offset=requested_offset,
-                    source_cursor=requested_search_id,
-                    next_cursor=dy_search_id,
-                    source_has_more=source_has_more,
-                    raw_batch_count=raw_batch_count,
-                ):
-                    break
-                if source_has_more in (False, 0):
-                    accumulator.mark_source_exhausted(
-                        "has_more_false",
-                        source_page=page - 1,
+                        statistics = aweme_info.get("statistics") or {}
+                        valid = bool(
+                            aweme_id
+                            and aweme_info.get("desc")
+                            and aweme_info.get("create_time")
+                            and author.get("uid")
+                            and author.get("nickname")
+                            and douyin_store._extract_note_image_list(aweme_info)
+                            and author_stats.get("followers_observed")
+                            and all(
+                                statistics.get(key) not in (None, "")
+                                for key in (
+                                    "digg_count",
+                                    "collect_count",
+                                    "comment_count",
+                                    "share_count",
+                                )
+                            )
+                        )
+                        should_stop = accumulator.consider(aweme_id, valid=valid)
+                        processed_count += 1
+                        aweme_list.append(aweme_id)
+                        page_aweme_list.append(aweme_id)
+                        await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
+                        await self.get_aweme_media(aweme_item=aweme_info)
+                        if should_stop:
+                            break
+
+                    await self.batch_get_note_comments(page_aweme_list)
+                    batch_complete = processed_count >= raw_batch_count
+                    if not batch_complete:
+                        resume_page = requested_page
+                        resume_offset = requested_offset
+                        next_search_id = requested_search_id
+                    if accumulator.finish_batch(
+                        source_page=requested_page,
                         source_offset=requested_offset,
                         source_cursor=requested_search_id,
-                        next_cursor=dy_search_id,
+                        next_cursor=next_search_id,
                         source_has_more=source_has_more,
                         raw_batch_count=raw_batch_count,
-                    )
-                    break
+                        resume_page=resume_page,
+                        resume_offset=resume_offset,
+                        resume_cursor=next_search_id,
+                        batch_complete=batch_complete,
+                        discovery_phase=discovery_phase,
+                        count_stagnation=discovery_phase == "frontier",
+                    ):
+                        break
+                    if source_has_more in (False, 0):
+                        if discovery_phase == "frontier":
+                            accumulator.mark_source_exhausted(
+                                "has_more_false",
+                                source_page=requested_page,
+                                source_offset=requested_offset,
+                                source_cursor=requested_search_id,
+                                next_cursor=next_search_id,
+                                source_has_more=False,
+                                raw_batch_count=raw_batch_count,
+                                resume_page=resume_page,
+                                resume_offset=resume_offset,
+                                resume_cursor=next_search_id,
+                                batch_complete=batch_complete,
+                                discovery_phase=discovery_phase,
+                            )
+                        break
 
-                # Sleep after each page navigation
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
+                    page = requested_page + 1
+                    next_offset = requested_offset + dy_limit_count
+                    dy_search_id = next_search_id
+                    phase_batches += 1
+                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                    utils.logger.info(
+                        f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} "
+                        f"seconds after page {requested_page}"
+                    )
+            if source_exhausted and not accumulator.stop_reason:
+                accumulator.mark_source_exhausted(
+                    "saved_source_exhausted",
+                    source_page=start_page,
+                    source_offset=frontier_offset,
+                    source_cursor=frontier_cursor,
+                    source_has_more=False,
+                    raw_batch_count=0,
+                    resume_page=start_page,
+                    resume_offset=frontier_offset,
+                    resume_cursor=frontier_cursor,
+                    discovery_phase="frontier",
+                )
             utils.logger.info(f"[DouYinCrawler.search] keyword:{keyword}, aweme_list:{aweme_list}")
 
     async def enrich_aweme_creator(self, aweme_info: Dict) -> Dict:

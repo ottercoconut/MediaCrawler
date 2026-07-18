@@ -42,7 +42,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import zhihu as zhihu_store
 from tools import utils
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
-from tools.trippostcollect_adaptive import AdaptiveAccumulator
+from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -258,67 +258,117 @@ class ZhihuCrawler(AbstractCrawler):
             utils.logger.info(
                 f"[ZhihuCrawler.search] Current search keyword: {keyword}"
             )
-            page = 1
-            while accumulator.candidate_count < accumulator.hard_limit and not accumulator.stop_reason:
-                if page < start_page:
-                    utils.logger.info(f"[ZhihuCrawler.search] Skip page {page}")
-                    page += 1
-                    continue
-
-                try:
-                    utils.logger.info(
-                        f"[ZhihuCrawler.search] search zhihu keyword: {keyword}, page: {page}"
-                    )
-                    content_list: List[ZhihuContent] = (
-                        await self.zhihu_client.get_note_by_keyword(
-                            keyword=keyword,
-                            page=page,
+            phases: list[tuple[str, int, int | None]] = []
+            refresh_max_pages = env_int("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", 0)
+            if start_page > 1 and refresh_max_pages > 0:
+                phases.append(("refresh", 1, min(start_page - 1, refresh_max_pages)))
+            source_exhausted = os.environ.get("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED") == "1"
+            if not source_exhausted:
+                phases.append(("frontier", start_page, None))
+            for discovery_phase, phase_start, phase_end in phases:
+                page = phase_start
+                while (
+                    accumulator.candidate_count < accumulator.hard_limit
+                    and not accumulator.stop_reason
+                    and (phase_end is None or page <= phase_end)
+                ):
+                    try:
+                        requested_page = page
+                        utils.logger.info(
+                            f"[ZhihuCrawler.search] search zhihu keyword: {keyword}, "
+                            f"page: {requested_page}"
                         )
-                    )
-                    utils.logger.info(
-                        f"[ZhihuCrawler.search] Search contents :{content_list}"
-                    )
-                    if not content_list:
-                        utils.logger.info("No more content!")
-                        accumulator.mark_source_exhausted(
-                            "empty_page",
-                            source_page=page,
-                            raw_batch_count=0,
+                        content_list: List[ZhihuContent] = (
+                            await self.zhihu_client.get_note_by_keyword(
+                                keyword=keyword,
+                                page=requested_page,
+                            )
                         )
-                        break
-
-                    # Sleep after page navigation
-                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                    utils.logger.info(f"[ZhihuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
-
-                    requested_page = page
-                    page += 1
-                    accumulator.begin_batch()
-                    for content in content_list:
-                        valid = bool(
-                            content.content_id
-                            and (content.content_text or content.title)
-                            and content.created_time
-                            and content.creator_hash
-                            and content.user_nickname
-                            and content.image_list
-                            and content.followers_observed
-                        )
-                        should_stop = accumulator.consider(content.content_id, valid=valid)
-                        await zhihu_store.update_zhihu_content(content)
-                        if should_stop:
+                        if not content_list:
+                            utils.logger.info("No more content!")
+                            if discovery_phase == "frontier":
+                                accumulator.mark_source_exhausted(
+                                    "empty_page",
+                                    source_page=requested_page,
+                                    raw_batch_count=0,
+                                    resume_page=requested_page,
+                                    source_has_more=False,
+                                    discovery_phase=discovery_phase,
+                                )
                             break
 
-                    await self.batch_get_content_comments(content_list)
-                    if accumulator.finish_batch(
-                        source_page=requested_page,
-                        raw_batch_count=len(content_list),
-                    ):
-                        break
-                except DataFetchError:
-                    utils.logger.error("[ZhihuCrawler.search] Search content error")
-                    accumulator.mark_runtime_failed("search_request_failed", source_page=page)
-                    return
+                        raw_batch_count = len(content_list)
+                        pending_content_ids: set[str] = set()
+                        unknown_contents: List[ZhihuContent] = []
+                        for content in content_list:
+                            content_id = str(content.content_id or "")
+                            if accumulator.is_known(content_id) or (
+                                content_id and content_id in pending_content_ids
+                            ):
+                                continue
+                            if content_id:
+                                pending_content_ids.add(content_id)
+                            unknown_contents.append(content)
+                        content_list = unknown_contents
+                        await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                        utils.logger.info(
+                            f"[ZhihuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} "
+                            f"seconds after page {requested_page}"
+                        )
+
+                        page += 1
+                        accumulator.begin_batch()
+                        processed_count = 0
+                        stored_contents: List[ZhihuContent] = []
+                        for content in content_list:
+                            valid = bool(
+                                content.content_id
+                                and (content.content_text or content.title)
+                                and content.created_time
+                                and content.creator_hash
+                                and content.user_nickname
+                                and content.image_list
+                                and content.followers_observed
+                            )
+                            should_stop = accumulator.consider(
+                                str(content.content_id or ""),
+                                valid=valid,
+                            )
+                            processed_count += 1
+                            stored_contents.append(content)
+                            await zhihu_store.update_zhihu_content(content)
+                            if should_stop:
+                                break
+
+                        await self.batch_get_content_comments(stored_contents)
+                        batch_complete = processed_count >= len(content_list)
+                        if accumulator.finish_batch(
+                            source_page=requested_page,
+                            raw_batch_count=raw_batch_count,
+                            resume_page=page if batch_complete else requested_page,
+                            batch_complete=batch_complete,
+                            discovery_phase=discovery_phase,
+                            count_stagnation=discovery_phase == "frontier",
+                        ):
+                            break
+                    except DataFetchError:
+                        utils.logger.error("[ZhihuCrawler.search] Search content error")
+                        accumulator.mark_runtime_failed(
+                            "search_request_failed",
+                            source_page=page,
+                            resume_page=page,
+                            discovery_phase=discovery_phase,
+                        )
+                        return
+            if source_exhausted and not accumulator.stop_reason:
+                accumulator.mark_source_exhausted(
+                    "saved_source_exhausted",
+                    source_page=start_page,
+                    resume_page=start_page,
+                    source_has_more=False,
+                    raw_batch_count=0,
+                    discovery_phase="frontier",
+                )
 
     async def batch_get_content_comments(self, content_list: List[ZhihuContent]):
         """
