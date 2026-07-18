@@ -38,7 +38,12 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
-from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
+from tools.trippostcollect_adaptive import (
+    AdaptiveAccumulator,
+    append_execution_event,
+    env_int,
+    should_reseed_douyin_frontier,
+)
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -167,10 +172,15 @@ class DouYinCrawler(AbstractCrawler):
                 phases.append(("frontier", start_page, frontier_offset, frontier_cursor, None))
 
             for discovery_phase, phase_page, phase_offset, phase_cursor, phase_limit in phases:
+                refresh_candidate_before = len(accumulator.seen_candidate_identities)
                 page = phase_page
                 next_offset = phase_offset
                 dy_search_id = phase_cursor
                 phase_batches = 0
+                source_has_more = None
+                next_search_id = ""
+                resume_page = page
+                resume_offset = next_offset
                 while (
                     accumulator.candidate_count < accumulator.hard_limit
                     and not accumulator.stop_reason
@@ -365,6 +375,38 @@ class DouYinCrawler(AbstractCrawler):
                     utils.logger.info(
                         f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} "
                         f"seconds after page {requested_page}"
+                    )
+                refresh_new_candidate_count = (
+                    len(accumulator.seen_candidate_identities)
+                    - refresh_candidate_before
+                )
+                if (
+                    discovery_phase == "refresh"
+                    and should_reseed_douyin_frontier(
+                        saved_source_exhausted=source_exhausted,
+                        refresh_has_more=source_has_more,
+                        refresh_next_cursor=next_search_id,
+                        refresh_new_candidate_count=refresh_new_candidate_count,
+                    )
+                    and not accumulator.stop_reason
+                ):
+                    source_exhausted = False
+                    phases.append(
+                        ("frontier", resume_page, resume_offset, next_search_id, None)
+                    )
+                    append_execution_event(
+                        "discovery_frontier_reseeded",
+                        {
+                            "platform": "douyin",
+                            "reason": "new_candidates_after_saved_exhaustion",
+                            "saved_resume_page": start_page,
+                            "saved_resume_offset": frontier_offset,
+                            "saved_resume_cursor": frontier_cursor,
+                            "resume_page": resume_page,
+                            "resume_offset": resume_offset,
+                            "resume_cursor": next_search_id,
+                            "refresh_new_candidate_count": refresh_new_candidate_count,
+                        },
                     )
             if source_exhausted and not accumulator.stop_reason:
                 accumulator.mark_source_exhausted(

@@ -39,6 +39,10 @@ class ZhihuContent(BaseModel):
     comment_count: int = Field(default=0, description="Comment count")
     image_list: list[str] = Field(default_factory=list, description="Content image URLs")
     image_count: int = Field(default=0, description="Content image count")
+    content_detail_status: str = Field(
+        default="search_payload",
+        description="Detail enrichment status for search results",
+    )
     source_keyword: str = Field(default="", description="Source keyword")
     creator_hash: str = Field(default="", description="Creator anonymized hash")
     creator_url_token: str = Field(default="", description="Creator URL token")

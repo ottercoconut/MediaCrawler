@@ -78,6 +78,23 @@ def extract_image_urls_from_html(html_content: str) -> List[str]:
     return image_urls
 
 
+def merge_search_content_detail(
+    search_content: ZhihuContent,
+    detail_content: ZhihuContent,
+) -> ZhihuContent:
+    """Merge full-page fields without replacing trusted search-author metadata."""
+    if detail_content.content_text:
+        search_content.content_text = detail_content.content_text
+    if detail_content.title and not search_content.title:
+        search_content.title = detail_content.title
+    if detail_content.desc and not search_content.desc:
+        search_content.desc = detail_content.desc
+    search_content.image_list = list(detail_content.image_list)
+    search_content.image_count = len(search_content.image_list)
+    search_content.content_detail_status = "detail_observed"
+    return search_content
+
+
 def sign(url: str, cookies: str) -> Dict:
     """
     zhihu sign algorithm

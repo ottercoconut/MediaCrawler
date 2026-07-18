@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from tools.trippostcollect_adaptive import AdaptiveAccumulator
+from tools.trippostcollect_adaptive import (
+    AdaptiveAccumulator,
+    should_reseed_douyin_frontier,
+)
 
 
 def test_batch_event_records_pagination_metadata(monkeypatch, tmp_path) -> None:
@@ -170,3 +173,39 @@ def test_refresh_batch_does_not_consume_frontier_stagnation(monkeypatch) -> None
 
     assert stopped is False
     assert accumulator.stagnant_batches == 0
+
+
+def test_candidate_identity_stagnation_allows_new_invalid_results(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tools.trippostcollect_adaptive.append_execution_event",
+        lambda *args, **kwargs: None,
+    )
+    accumulator = AdaptiveAccumulator(
+        platform="weibo",
+        hard_limit=10,
+        target_new=2,
+        max_stagnant_batches=1,
+        stagnation_basis="candidate_identity",
+    )
+    accumulator.begin_batch()
+    accumulator.consider("text-only", valid=False)
+
+    stopped = accumulator.finish_batch(source_page=1)
+
+    assert stopped is False
+    assert accumulator.stagnant_batches == 0
+
+
+def test_douyin_reseed_requires_new_candidate_and_cursor() -> None:
+    assert should_reseed_douyin_frontier(
+        saved_source_exhausted=True,
+        refresh_has_more=True,
+        refresh_next_cursor="new-search-id",
+        refresh_new_candidate_count=1,
+    ) is True
+    assert should_reseed_douyin_frontier(
+        saved_source_exhausted=True,
+        refresh_has_more=True,
+        refresh_next_cursor="new-search-id",
+        refresh_new_candidate_count=0,
+    ) is False

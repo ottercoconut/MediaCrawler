@@ -48,7 +48,7 @@ from var import crawler_type_var, source_keyword_var
 
 from .client import ZhiHuClient
 from .exception import DataFetchError
-from .help import ZhihuExtractor, judge_zhihu_url
+from .help import ZhihuExtractor, judge_zhihu_url, merge_search_content_detail
 from .login import ZhiHuLogin
 
 
@@ -125,6 +125,44 @@ class ZhihuCrawler(AbstractCrawler):
             )
             await asyncio.sleep(settle_seconds)
         await self._activate_latest_zhihu_page()
+
+    async def enrich_search_content_detail(
+        self,
+        content: ZhihuContent,
+    ) -> ZhihuContent:
+        """Fetch the full answer/article when search HTML has no content image."""
+        if content.image_list or content.content_type not in {
+            constant.ANSWER_NAME,
+            constant.ARTICLE_NAME,
+        }:
+            return content
+
+        try:
+            if content.content_type == constant.ANSWER_NAME:
+                detail = await self.zhihu_client.get_answer_info(
+                    content.question_id,
+                    content.content_id,
+                )
+            else:
+                detail = await self.zhihu_client.get_article_info(content.content_id)
+        except DataFetchError as exc:
+            content.content_detail_status = "request_failed"
+            utils.logger.warning(
+                "[ZhihuCrawler.enrich_search_content_detail] Detail request failed "
+                f"for {content.content_type}:{content.content_id}: {exc}"
+            )
+        else:
+            if detail is None:
+                content.content_detail_status = "parse_failed"
+                utils.logger.warning(
+                    "[ZhihuCrawler.enrich_search_content_detail] Detail parse failed "
+                    f"for {content.content_type}:{content.content_id}"
+                )
+            else:
+                merge_search_content_detail(content, detail)
+
+        await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+        return content
 
     async def start(self) -> None:
         """
@@ -321,6 +359,7 @@ class ZhihuCrawler(AbstractCrawler):
                         processed_count = 0
                         stored_contents: List[ZhihuContent] = []
                         for content in content_list:
+                            content = await self.enrich_search_content_detail(content)
                             valid = bool(
                                 content.content_id
                                 and (content.content_text or content.title)

@@ -97,6 +97,7 @@ class ZhihuDbStoreImplement(AbstractStore):
             content_item: content item dict
         """
         content_item = dict(content_item)
+        content_item.pop("content_detail_status", None)
         if isinstance(content_item.get("image_list"), list):
             content_item["image_list"] = json.dumps(content_item["image_list"], ensure_ascii=False)
         content_id = content_item.get("content_id")

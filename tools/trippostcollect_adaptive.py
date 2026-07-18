@@ -66,6 +66,31 @@ def existing_platform_identities(platform: str) -> set[str]:
                             (platform_post_id, None)
                             for (platform_post_id,) in seen_rows
                         )
+                else:
+                    job_id = os.environ.get(
+                        "TRIPPOSTCOLLECT_DISCOVERY_JOB_ID",
+                        "",
+                    ).strip()
+                    fingerprint = os.environ.get(
+                        "TRIPPOSTCOLLECT_DISCOVERY_QUERY_FINGERPRINT",
+                        "",
+                    ).strip()
+                    if job_id and fingerprint:
+                        try:
+                            seen_rows = conn.execute(
+                                """
+                                SELECT platform_post_id
+                                FROM crawl_discovery_seen_candidates
+                                WHERE job_id=? AND platform_key=? AND query_fingerprint=?
+                                """,
+                                (int(job_id), platform, fingerprint),
+                            ).fetchall()
+                        except (ValueError, sqlite3.Error):
+                            seen_rows = []
+                        rows.extend(
+                            (platform_post_id, None)
+                            for (platform_post_id,) in seen_rows
+                        )
         except (OSError, sqlite3.Error):
             rows = []
     identities: set[str] = set()
@@ -108,6 +133,7 @@ class AdaptiveAccumulator:
     hard_limit: int
     target_new: int
     max_stagnant_batches: int
+    stagnation_basis: str = "valid_new"
     candidate_count: int = 0
     existing_identities: set[str] = field(default_factory=set)
     seen_candidate_identities: set[str] = field(default_factory=set)
@@ -138,6 +164,9 @@ class AdaptiveAccumulator:
             hard_limit=max(1, hard_limit),
             target_new=max(1, env_int("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", hard_limit)),
             max_stagnant_batches=max(1, env_int("TRIPPOSTCOLLECT_MAX_STAGNANT_BATCHES", 3)),
+            stagnation_basis=(
+                "candidate_identity" if platform == "weibo" else "valid_new"
+            ),
             existing_identities=existing_platform_identities(platform),
         )
 
@@ -233,8 +262,15 @@ class AdaptiveAccumulator:
         )
         added = len(self.new_valid_identities) - self._batch_new_before
         candidate_identities_added = len(self.seen_candidate_identities) - self._batch_candidate_before
+        stagnation_progress = (
+            candidate_identities_added
+            if self.stagnation_basis == "candidate_identity"
+            else added
+        )
         if count_stagnation:
-            self.stagnant_batches = self.stagnant_batches + 1 if added == 0 else 0
+            self.stagnant_batches = (
+                self.stagnant_batches + 1 if stagnation_progress == 0 else 0
+            )
         if count_stagnation and self.stagnant_batches >= self.max_stagnant_batches:
             self.stop_reason = "stagnated"
         details = {
@@ -246,6 +282,7 @@ class AdaptiveAccumulator:
             "batch_new_count": added,
             "batch_candidate_identity_count": candidate_identities_added,
             "stagnant_batches": self.stagnant_batches,
+            "stagnation_basis": self.stagnation_basis,
             "target_new": self.target_new,
             "hard_limit": self.hard_limit,
             "stop_reason": self.stop_reason or "continue",
@@ -337,6 +374,7 @@ class AdaptiveAccumulator:
             "target_new": self.target_new,
             "hard_limit": self.hard_limit,
             "stagnant_batches": self.stagnant_batches,
+            "stagnation_basis": self.stagnation_basis,
             "stop_reason": self.stop_reason or "running",
             "pages_fetched": self.batch_no,
             "source_page": self.last_source_page,
@@ -352,6 +390,21 @@ class AdaptiveAccumulator:
             "discovery_phase": self.last_discovery_phase,
             "stop_detail": self.stop_detail,
         }
-        if self.platform == "xhs":
-            result["candidate_identities"] = sorted(self.seen_candidate_identities)
+        result["candidate_identities"] = sorted(self.seen_candidate_identities)
         return result
+
+
+def should_reseed_douyin_frontier(
+    *,
+    saved_source_exhausted: bool,
+    refresh_has_more: bool | int | None,
+    refresh_next_cursor: str | None,
+    refresh_new_candidate_count: int,
+) -> bool:
+    """Start a new cursor epoch only when refresh proves new identities and continuation."""
+    return bool(
+        saved_source_exhausted
+        and refresh_has_more in (True, 1)
+        and str(refresh_next_cursor or "").strip()
+        and refresh_new_candidate_count > 0
+    )
