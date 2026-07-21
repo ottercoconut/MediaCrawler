@@ -31,6 +31,7 @@ import config
 from base.base_crawler import AbstractApiClient
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
+from tools.trippostcollect_behavior import run_required_api_captcha_verification
 
 if TYPE_CHECKING:
     from proxy.proxy_ip_pool import ProxyIpPool
@@ -133,12 +134,23 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
 
         if response.status_code == 471 or response.status_code == 461:
-            # someday someone maybe will bypass captcha
-            verify_type = response.headers["Verifytype"]
-            verify_uuid = response.headers["Verifyuuid"]
-            msg = f"CAPTCHA appeared, request failed, Verifytype: {verify_type}, Verifyuuid: {verify_uuid}, Response: {response}"
-            utils.logger.error(msg)
-            raise Exception(msg)
+            verify_type = response.headers.get("Verifytype", "")
+            verify_uuid = response.headers.get("Verifyuuid", "")
+            utils.logger.warning(
+                "[XiaoHongShuClient.request] API CAPTCHA requires operator verification: "
+                f"Verifytype={verify_type}, Verifyuuid={verify_uuid}, status={response.status_code}"
+            )
+            await run_required_api_captcha_verification(
+                self.playwright_page,
+                verify_type=verify_type,
+                verify_uuid=verify_uuid,
+                verify_biz=response.status_code,
+            )
+            await self.update_cookies(
+                browser_context=self.playwright_page.context,
+                urls=self.cookie_urls,
+            )
+            raise DataFetchError("XHS API CAPTCHA completed; retrying the original request")
 
         if return_response:
             return response.text

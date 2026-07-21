@@ -105,6 +105,34 @@ async def run_required_continuity_behavior(page: Page, stage: str) -> dict[str, 
     )
 
 
+async def run_required_api_captcha_verification(
+    page: Page,
+    *,
+    verify_type: str,
+    verify_uuid: str,
+    verify_biz: int,
+) -> dict[str, Any]:
+    if not _enabled():
+        raise RuntimeError("required TripPostCollect API captcha verification is disabled")
+    scripts_dir = Path(os.environ.get("TRIPPOSTCOLLECT_PROJECT_SCRIPTS", "")).expanduser()
+    evidence_path = os.environ.get("TRIPPOSTCOLLECT_HUMAN_BEHAVIOR_EVIDENCE", "").strip()
+    profile_name = os.environ.get("TRIPPOSTCOLLECT_HUMAN_BEHAVIOR_PROFILE", "").strip()
+    if not scripts_dir.is_dir() or not evidence_path or profile_name != "xhs_guarded":
+        raise RuntimeError("required TripPostCollect API captcha configuration is incomplete")
+    scripts_value = str(scripts_dir.resolve())
+    if scripts_value not in sys.path:
+        sys.path.insert(0, scripts_value)
+    from mediacrawler_behavior import run_xhs_api_captcha_verification
+
+    return await run_xhs_api_captcha_verification(
+        page,
+        evidence_path=evidence_path,
+        verify_type=verify_type,
+        verify_uuid=verify_uuid,
+        verify_biz=verify_biz,
+    )
+
+
 async def inspect_visible_page_state(page: Page) -> tuple[str, dict[str, bool]]:
     """Reuse the project's visible challenge checks without replacing run evidence."""
     scripts_dir = Path(os.environ.get("TRIPPOSTCOLLECT_PROJECT_SCRIPTS", "")).expanduser()
