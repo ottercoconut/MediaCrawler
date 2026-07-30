@@ -75,6 +75,7 @@ class WeiboClient(ProxyRefreshMixin):
         await self._refresh_proxy_if_expired()
 
         enable_return_response = kwargs.pop("return_response", False)
+        allow_empty_search = kwargs.pop("allow_empty_search", False)
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
 
@@ -93,6 +94,13 @@ class WeiboClient(ProxyRefreshMixin):
 
         ok_code = data.get("ok")
         if ok_code == 0:  # response error
+            response_data = data.get("data") or {}
+            if (
+                allow_empty_search
+                and str(data.get("msg") or "").strip() == "这里还没有内容"
+                and not (response_data.get("cards") or [])
+            ):
+                return response_data
             utils.logger.error(f"[WeiboClient.request] request {method}:{url} err, res:{data}")
             raise DataFetchError(data.get("msg", "response error"))
         elif ok_code != 1:  # unknown error
@@ -169,7 +177,7 @@ class WeiboClient(ProxyRefreshMixin):
             "page_type": "searchall",
             "page": page,
         }
-        return await self.get(uri, params)
+        return await self.get(uri, params, allow_empty_search=True)
 
     async def get_note_comments(self, mid_id: str, max_id: int, max_id_type: int = 0) -> Dict:
         """get notes comments
