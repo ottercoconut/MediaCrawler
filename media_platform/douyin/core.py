@@ -182,8 +182,7 @@ class DouYinCrawler(AbstractCrawler):
                 resume_page = page
                 resume_offset = next_offset
                 while (
-                    accumulator.candidate_count < accumulator.hard_limit
-                    and not accumulator.stop_reason
+                    accumulator.can_continue
                     and (phase_limit is None or phase_batches < phase_limit)
                 ):
                     requested_page = page

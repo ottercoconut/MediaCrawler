@@ -133,6 +133,7 @@ class AdaptiveAccumulator:
     hard_limit: int
     target_new: int
     max_stagnant_batches: int
+    completion_mode: str = "target-new-posts"
     stagnation_basis: str = "valid_new"
     candidate_count: int = 0
     existing_identities: set[str] = field(default_factory=set)
@@ -159,15 +160,33 @@ class AdaptiveAccumulator:
 
     @classmethod
     def from_environment(cls, platform: str, hard_limit: int) -> "AdaptiveAccumulator":
+        completion_mode = os.environ.get(
+            "TRIPPOSTCOLLECT_COMPLETION_MODE",
+            "target-new-posts",
+        ).strip()
+        if completion_mode not in {"target-new-posts", "source-exhausted"}:
+            completion_mode = "target-new-posts"
         return cls(
             platform=platform,
             hard_limit=max(1, hard_limit),
             target_new=max(1, env_int("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", hard_limit)),
             max_stagnant_batches=max(1, env_int("TRIPPOSTCOLLECT_MAX_STAGNANT_BATCHES", 3)),
+            completion_mode=completion_mode,
             stagnation_basis=(
                 "candidate_identity" if platform == "weibo" else "valid_new"
             ),
             existing_identities=existing_platform_identities(platform),
+        )
+
+    @property
+    def exhaustion_mode(self) -> bool:
+        return self.completion_mode == "source-exhausted"
+
+    @property
+    def can_continue(self) -> bool:
+        return bool(
+            not self.stop_reason
+            and (self.exhaustion_mode or self.candidate_count < self.hard_limit)
         )
 
     def begin_batch(self) -> None:
@@ -185,7 +204,7 @@ class AdaptiveAccumulator:
         )
 
     def consider(self, identity: str, *, valid: bool) -> bool:
-        if self.candidate_count >= self.hard_limit:
+        if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
             self.stop_reason = "candidate_hard_limit_reached"
             return True
         self.candidate_count += 1
@@ -196,10 +215,10 @@ class AdaptiveAccumulator:
                 self.existing_valid_identities.add(identity)
             else:
                 self.new_valid_identities.add(identity)
-        if len(self.new_valid_identities) >= self.target_new:
+        if not self.exhaustion_mode and len(self.new_valid_identities) >= self.target_new:
             self.stop_reason = "target_new_met"
             return True
-        if self.candidate_count >= self.hard_limit:
+        if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
             self.stop_reason = "candidate_hard_limit_reached"
             return True
         return False
@@ -271,7 +290,11 @@ class AdaptiveAccumulator:
             self.stagnant_batches = (
                 self.stagnant_batches + 1 if stagnation_progress == 0 else 0
             )
-        if count_stagnation and self.stagnant_batches >= self.max_stagnant_batches:
+        if (
+            count_stagnation
+            and not self.exhaustion_mode
+            and self.stagnant_batches >= self.max_stagnant_batches
+        ):
             self.stop_reason = "stagnated"
         details = {
             "platform": self.platform,
@@ -285,6 +308,8 @@ class AdaptiveAccumulator:
             "stagnation_basis": self.stagnation_basis,
             "target_new": self.target_new,
             "hard_limit": self.hard_limit,
+            "completion_mode": self.completion_mode,
+            "quantity_limits_enforced": not self.exhaustion_mode,
             "stop_reason": self.stop_reason or "continue",
             "source_page": source_page,
             "source_offset": source_offset,
@@ -373,6 +398,8 @@ class AdaptiveAccumulator:
             "valid_existing_count": len(self.existing_valid_identities),
             "target_new": self.target_new,
             "hard_limit": self.hard_limit,
+            "completion_mode": self.completion_mode,
+            "quantity_limits_enforced": not self.exhaustion_mode,
             "stagnant_batches": self.stagnant_batches,
             "stagnation_basis": self.stagnation_basis,
             "stop_reason": self.stop_reason or "running",

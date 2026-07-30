@@ -647,8 +647,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 page = phase_start
                 phase_batches = 0
                 while (
-                    accumulator.candidate_count < accumulator.hard_limit
-                    and not accumulator.stop_reason
+                    accumulator.can_continue
                     and (phase_limit is None or phase_batches < phase_limit)
                 ):
                     requested_page = page
@@ -703,11 +702,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             unknown_items.append(post_item)
 
                         accumulator.begin_batch()
-                        remaining = max(
-                            0,
-                            accumulator.hard_limit - accumulator.candidate_count,
-                        )
-                        selected_items = unknown_items[:remaining]
+                        if accumulator.exhaustion_mode:
+                            selected_items = unknown_items
+                        else:
+                            remaining = max(
+                                0,
+                                accumulator.hard_limit - accumulator.candidate_count,
+                            )
+                            selected_items = unknown_items[:remaining]
                         if not selected_items:
                             resume_page = requested_page + 1
                             if accumulator.finish_batch(

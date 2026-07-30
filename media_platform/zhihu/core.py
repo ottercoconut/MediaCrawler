@@ -302,8 +302,7 @@ class ZhihuCrawler(AbstractCrawler):
             for discovery_phase, phase_start, phase_end in phases:
                 page = phase_start
                 while (
-                    accumulator.candidate_count < accumulator.hard_limit
-                    and not accumulator.stop_reason
+                    accumulator.can_continue
                     and (phase_end is None or page <= phase_end)
                 ):
                     try:
