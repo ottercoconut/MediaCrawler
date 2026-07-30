@@ -322,6 +322,7 @@ class AdaptiveAccumulator:
             "resume_cursor": resume_cursor,
             "batch_complete": batch_complete,
             "discovery_phase": discovery_phase,
+            "candidate_identities": sorted(self.seen_candidate_identities),
         }
         append_execution_event("adaptive_batch_completed", details)
         if self.stop_reason:
