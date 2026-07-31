@@ -57,11 +57,27 @@ class FakeBrowserResponse:
         "?keyword=%E9%9D%92%E5%B2%9B%E6%B5%B7%E6%BB%A8%E6%97%85%E6%B8%B8&offset=0"
     )
 
-    def __init__(self, payload: bytes):
+    def __init__(self, payload: bytes, *, url: str | None = None):
         self.payload = payload
+        if url is not None:
+            self.url = url
 
     async def body(self) -> bytes:
         return self.payload
+
+
+class FakeWaterfallLocator:
+    async def evaluate_all(self, script: str):
+        return [str(100 + index) for index in range(10)]
+
+
+class FakeWaterfallPage:
+    def on(self, event: str, callback) -> None:
+        assert event == "response"
+
+    def locator(self, selector: str) -> FakeWaterfallLocator:
+        assert selector == '[id^="waterfall_item_"]:visible'
+        return FakeWaterfallLocator()
 
 
 def prepare_empty_search(monkeypatch, tmp_path, *, result_count: int, visible_text: str):
@@ -233,6 +249,48 @@ async def test_latest_non_verify_browser_response_wins_over_prefetch_verify(
     response = await client.search_info_by_keyword(keyword="青岛海滨旅游")
     assert response["data"][0]["aweme_info"]["aweme_id"] == "456"
     assert response["extra"]["logid"] == "healthy-search-id"
+
+
+@pytest.mark.asyncio
+async def test_visible_first_page_rebuild_requires_healthy_next_page(
+    monkeypatch,
+) -> None:
+    next_page_payload = (
+        b'{"status_code":0,"data":[{"aweme_info":{"aweme_id":"456"}}],'
+        b'"has_more":1,"extra":{"logid":"later-search-id"}}'
+    )
+    next_page_url = (
+        "https://www.douyin.com/aweme/v1/web/general/search/single/"
+        "?keyword=%E9%9D%92%E5%B2%9B%E6%B5%B7%E6%BB%A8%E6%97%85%E6%B8%B8"
+        "&offset=10&search_id=first-page-search-id"
+    )
+    client = DouYinClient(
+        headers={"User-Agent": "test-agent"},
+        playwright_page=FakeWaterfallPage(),
+        cookie_dict={},
+    )
+    await client.capture_browser_search_response(
+        FakeBrowserResponse(next_page_payload, url=next_page_url)
+    )
+
+    async def verify_first_page(uri, params=None, headers=None):
+        return {
+            "status_code": 0,
+            "data": [],
+            "has_more": 0,
+            "search_nil_info": {"search_nil_type": "verify_check"},
+        }
+
+    async def fake_detail(aweme_id: str):
+        return {"aweme_id": aweme_id, "images": [{"url_list": ["https://img.test/1"]}]}
+
+    monkeypatch.setattr(client, "get", verify_first_page)
+    monkeypatch.setattr(client, "get_video_by_id", fake_detail)
+    response = await client.search_info_by_keyword(keyword="青岛海滨旅游")
+    assert len(response["data"]) == 10
+    assert response["data"][0]["aweme_info"]["aweme_id"] == "100"
+    assert response["has_more"] == 1
+    assert response["extra"]["logid"] == "first-page-search-id"
 
 
 @pytest.mark.asyncio

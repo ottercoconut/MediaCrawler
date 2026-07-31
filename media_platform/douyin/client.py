@@ -93,7 +93,11 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                 "search_id": (query.get("search_id") or [""])[0],
                 "payload": payload,
             }
-        except Exception:
+        except Exception as exc:
+            utils.logger.warning(
+                "[DouYinClient.capture_browser_search_response] browser response ignored, "
+                f"reason: {type(exc).__name__}"
+            )
             return
         self._observed_search_responses.append(record)
         nil_info = payload.get("search_nil_info")
@@ -153,6 +157,88 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             f"search_nil_type: {nil_info.get('search_nil_type') if isinstance(nil_info, dict) else ''}"
         )
         return payload
+
+    async def _build_visible_first_page_fallback(
+        self,
+        *,
+        keyword: str,
+        offset: int,
+        search_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Rebuild page zero only when visible cards and a healthy next page prove the chain."""
+        if offset != 0 or search_id or self.playwright_page is None:
+            return None
+        if self._observed_search_response_tasks:
+            await asyncio.gather(
+                *tuple(self._observed_search_response_tasks),
+                return_exceptions=True,
+            )
+        next_page_records = []
+        for record in self._observed_search_responses:
+            payload = record["payload"]
+            nil_info = payload.get("search_nil_info")
+            if (
+                record["keyword"] == keyword
+                and record["offset"] > 0
+                and record["search_id"]
+                and payload.get("data")
+                and not (
+                    isinstance(nil_info, dict)
+                    and nil_info.get("search_nil_type") == "verify_check"
+                )
+            ):
+                next_page_records.append(record)
+        if not next_page_records:
+            return None
+        next_page = min(next_page_records, key=lambda record: record["offset"])
+        expected_first_page_count = next_page["offset"]
+        try:
+            visible_ids = await self.playwright_page.locator(
+                '[id^="waterfall_item_"]:visible'
+            ).evaluate_all(
+                r"""elements => elements
+                    .map(element => String(element.id || '').replace('waterfall_item_', ''))
+                    .filter(value => /^\d+$/.test(value))"""
+            )
+        except Exception as exc:
+            utils.logger.warning(
+                "[DouYinClient._build_visible_first_page_fallback] visible card read failed, "
+                f"reason: {type(exc).__name__}"
+            )
+            return None
+        first_page_ids = list(dict.fromkeys(visible_ids))[:expected_first_page_count]
+        if len(first_page_ids) < expected_first_page_count:
+            utils.logger.warning(
+                "[DouYinClient._build_visible_first_page_fallback] insufficient visible cards, "
+                f"expected: {expected_first_page_count}, observed: {len(first_page_ids)}"
+            )
+            return None
+
+        data = []
+        for aweme_id in first_page_ids:
+            try:
+                aweme_detail = await self.get_video_by_id(aweme_id)
+            except Exception as exc:
+                utils.logger.warning(
+                    "[DouYinClient._build_visible_first_page_fallback] detail fetch failed, "
+                    f"aweme_id: {aweme_id}, reason: {type(exc).__name__}"
+                )
+                continue
+            if isinstance(aweme_detail, dict) and aweme_detail.get("aweme_id"):
+                data.append({"aweme_info": aweme_detail})
+        if not data:
+            return None
+        utils.logger.info(
+            "[DouYinClient._build_visible_first_page_fallback] rebuilt visible first page, "
+            f"visible_ids: {len(first_page_ids)}, detail_count: {len(data)}, "
+            f"next_offset: {next_page['offset']}, next_search_id_present: True"
+        )
+        return {
+            "status_code": 0,
+            "data": data,
+            "has_more": 1,
+            "extra": {"logid": next_page["search_id"]},
+        }
 
     async def __process_req_params(
         self,
@@ -354,7 +440,19 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             query_params,
             headers=headers,
         )
-        return validate_douyin_search_response(response)
+        try:
+            return validate_douyin_search_response(response)
+        except SearchResponseError as exc:
+            if exc.reason != "search_verify_check":
+                raise
+            fallback = await self._build_visible_first_page_fallback(
+                keyword=keyword,
+                offset=offset,
+                search_id=search_id,
+            )
+            if fallback is None:
+                raise
+            return validate_douyin_search_response(fallback)
 
     async def get_video_by_id(self, aweme_id: str) -> Any:
         """
