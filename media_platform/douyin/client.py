@@ -20,6 +20,7 @@
 import asyncio
 import copy
 import json
+import re
 import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, Dict, Union, Optional
 
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
 from .exception import *
 from .field import *
 from .help import *
-from .search_safety import validate_douyin_search_response
+from .search_safety import decode_douyin_json_body, validate_douyin_search_response
 
 
 class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
@@ -66,8 +67,61 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         ]
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
+        self._observed_search_responses: list[dict[str, Any]] = []
+        self._observed_search_response_tasks: set[asyncio.Task] = set()
+        if self.playwright_page is not None:
+            self.playwright_page.on("response", self._schedule_browser_search_response)
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
+
+    def _schedule_browser_search_response(self, response: Any) -> None:
+        if "/aweme/v1/web/general/search/" not in response.url:
+            return
+        task = asyncio.create_task(self.capture_browser_search_response(response))
+        self._observed_search_response_tasks.add(task)
+        task.add_done_callback(self._observed_search_response_tasks.discard)
+
+    async def capture_browser_search_response(self, response: Any) -> None:
+        """Cache a browser-issued search response so the API client does not repeat it."""
+        try:
+            parsed_url = urllib.parse.urlparse(response.url)
+            query = urllib.parse.parse_qs(parsed_url.query)
+            payload = decode_douyin_json_body(await response.body())
+            record = {
+                "keyword": (query.get("keyword") or [""])[0],
+                "offset": int((query.get("offset") or ["0"])[0]),
+                "search_id": (query.get("search_id") or [""])[0],
+                "payload": payload,
+            }
+        except Exception:
+            return
+        self._observed_search_responses.append(record)
+
+    async def _take_observed_search_response(
+        self,
+        *,
+        keyword: str,
+        offset: int,
+        search_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if self._observed_search_response_tasks:
+            await asyncio.gather(
+                *tuple(self._observed_search_response_tasks),
+                return_exceptions=True,
+            )
+        for index, record in enumerate(self._observed_search_responses):
+            if (
+                record["keyword"] == keyword
+                and record["offset"] == offset
+                and record["search_id"] == search_id
+            ):
+                payload = self._observed_search_responses.pop(index)["payload"]
+                utils.logger.info(
+                    "[DouYinClient.search_info_by_keyword] reuse browser search response, "
+                    f"offset: {offset}, search_id_present: {bool(search_id)}"
+                )
+                return payload
+        return None
 
     async def __process_req_params(
         self,
@@ -80,35 +134,69 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         if not params:
             return
         headers = headers or self.headers
+        browser_facts = await self.playwright_page.evaluate(  # type: ignore
+            """() => ({
+                language: navigator.language || 'zh-CN',
+                platform: navigator.platform || 'MacIntel',
+                userAgent: navigator.userAgent || '',
+                online: navigator.onLine,
+                hardwareConcurrency: navigator.hardwareConcurrency || 8,
+                deviceMemory: navigator.deviceMemory || 8,
+                screenWidth: window.screen.width || 1920,
+                screenHeight: window.screen.height || 1080,
+                effectiveType: navigator.connection?.effectiveType || '4g',
+                downlink: navigator.connection?.downlink || 10,
+                rtt: navigator.connection?.rtt || 50,
+            })"""
+        )
         local_storage: Dict = await self.playwright_page.evaluate("() => window.localStorage")  # type: ignore
+        user_agent = str(browser_facts.get("userAgent") or headers.get("User-Agent") or "")
+        browser_version_match = re.search(r"(?:Chrome|Chromium)/(\d+(?:\.\d+){0,3})", user_agent)
+        browser_version = browser_version_match.group(1) if browser_version_match else "125.0.0.0"
+        web_id = ""
+        for storage_key in ("__tea_cache_tokens_1300", "__tea_cache_tokens_6383"):
+            try:
+                web_id = str(json.loads(local_storage.get(storage_key, "{}")).get("web_id") or "")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+            if web_id:
+                break
+        platform_name = str(browser_facts.get("platform") or "MacIntel")
         common_params = {
             "device_platform": "webapp",
             "aid": "6383",
             "channel": "channel_pc_web",
             "version_code": "190600",
             "version_name": "19.6.0",
-            "update_version_code": "170400",
             "pc_client_type": "1",
             "cookie_enabled": "true",
-            "browser_language": "zh-CN",
-            "browser_platform": "MacIntel",
+            "browser_language": str(browser_facts.get("language") or "zh-CN"),
+            "browser_platform": platform_name,
             "browser_name": "Chrome",
-            "browser_version": "125.0.0.0",
-            "browser_online": "true",
+            "browser_version": browser_version,
+            "browser_online": str(bool(browser_facts.get("online", True))).lower(),
             "engine_name": "Blink",
-            "os_name": "Mac OS",
+            "engine_version": browser_version,
+            "os_name": "Mac OS" if "Mac" in platform_name else platform_name,
             "os_version": "10.15.7",
-            "cpu_core_num": "8",
-            "device_memory": "8",
-            "engine_version": "109.0",
+            "cpu_core_num": str(browser_facts.get("hardwareConcurrency") or 8),
+            "device_memory": str(browser_facts.get("deviceMemory") or 8),
             "platform": "PC",
-            "screen_width": "2560",
-            "screen_height": "1440",
-            'effective_type': '4g',
-            "round_trip_time": "50",
-            "webid": get_web_id(),
+            "screen_width": str(browser_facts.get("screenWidth") or 1920),
+            "screen_height": str(browser_facts.get("screenHeight") or 1080),
+            "effective_type": str(browser_facts.get("effectiveType") or "4g"),
+            "downlink": str(browser_facts.get("downlink") or 10),
+            "round_trip_time": str(browser_facts.get("rtt") or 50),
+            "webid": web_id or get_web_id(),
             "msToken": local_storage.get("xmst"),
+            "update_version_code": "0" if "/general/search/stream/" in uri else "170400",
         }
+        verify_fp = str(self.cookie_dict.get("s_v_web_id") or "")
+        uifid = str(self.cookie_dict.get("UIFID_TEMP") or self.cookie_dict.get("UIFID") or "")
+        if verify_fp:
+            common_params.update({"verifyFp": verify_fp, "fp": verify_fp})
+        if uifid:
+            common_params["uifid"] = uifid
         params.update(common_params)
         query_string = urllib.parse.urlencode(params)
 
@@ -128,10 +216,10 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
         try:
-            if response.text == "" or response.text == "blocked":
+            if response.content == b"" or response.text == "blocked":
                 utils.logger.error(f"request params incrr, response.text: {response.text}")
                 raise Exception("account blocked")
-            return response.json()
+            return decode_douyin_json_body(response.content)
         except Exception as e:
             raise DataFetchError(f"{e}, {response.text}")
 
@@ -186,19 +274,35 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         :param search_id: ·
         :return:
         """
+        observed_response = await self._take_observed_search_response(
+            keyword=keyword,
+            offset=offset,
+            search_id=search_id,
+        )
+        if observed_response is not None:
+            return validate_douyin_search_response(observed_response)
+
         query_params = {
             'search_channel': search_channel.value,
             'enable_history': '1',
             'keyword': keyword,
-            'search_source': 'tab_search',
+            'search_source': 'normal_search',
             'query_correct_type': '1',
             'is_filter_search': '0',
-            'from_group_id': '7378810571505847586',
+            'from_group_id': '',
+            'disable_rs': '0',
             'offset': offset,
-            'count': '15',
-            'need_filter_settings': '1',
-            'list_type': 'multi',
+            'count': '10',
+            'need_filter_settings': '0',
+            'list_type': 'single',
+            'pc_search_top_1_params': json.dumps(
+                {"enable_ai_search_top_1": 1},
+                separators=(",", ":"),
+            ),
             'search_id': search_id,
+            'pc_libra_divert': 'Mac',
+            'support_h265': '1',
+            'support_dash': '1',
         }
         if sort_type.value != SearchSortType.GENERAL.value or publish_time.value != PublishTimeType.UNLIMITED.value:
             query_params["filter_selected"] = json.dumps({"sort_type": str(sort_type.value), "publish_time": str(publish_time.value)})
@@ -207,8 +311,15 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         referer_url = f"https://www.douyin.com/search/{keyword}?aid=f594bbd9-a0e2-4651-9319-ebe3cb6298c1&type=general"
         headers = copy.copy(self.headers)
         headers["Referer"] = urllib.parse.quote(referer_url, safe=':/')
+        endpoint = (
+            "/aweme/v1/web/general/search/stream/"
+            if offset == 0 and not search_id
+            else "/aweme/v1/web/general/search/single/"
+        )
+        if endpoint.endswith("/stream/"):
+            query_params["need_filter_settings"] = "1"
         response = await self.get(
-            "/aweme/v1/web/general/search/single/",
+            endpoint,
             query_params,
             headers=headers,
         )

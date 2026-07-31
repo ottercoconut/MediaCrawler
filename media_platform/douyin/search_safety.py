@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict
 
 from playwright.async_api import Page
@@ -14,6 +15,8 @@ DOUYIN_RESULT_LINK_SELECTOR = ', '.join(
         'a[href*="/video/"]:visible',
         'a[href*="/note/"]:visible',
         '[data-e2e*="search-result"]:visible',
+        '.search-result-card:visible',
+        '[id^="waterfall_item_"]:visible',
     )
 )
 DOUYIN_NO_RESULT_MARKERS = (
@@ -26,10 +29,47 @@ DOUYIN_NO_RESULT_MARKERS = (
 )
 
 
+def decode_douyin_json_body(body: bytes) -> Dict[str, Any]:
+    """Decode normal JSON or Douyin's raw HTTP-chunk-framed stream body."""
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload_bytes = bytearray()
+        cursor = 0
+        while True:
+            line_end = body.find(b"\r\n", cursor)
+            if line_end < 0:
+                raise SearchResponseError("invalid_stream_chunk_header")
+            size_text = body[cursor:line_end].split(b";", maxsplit=1)[0].strip()
+            try:
+                chunk_size = int(size_text, 16)
+            except ValueError as exc:
+                raise SearchResponseError("invalid_stream_chunk_size") from exc
+            cursor = line_end + 2
+            if chunk_size == 0:
+                break
+            chunk_end = cursor + chunk_size
+            if chunk_end > len(body) or body[chunk_end:chunk_end + 2] != b"\r\n":
+                raise SearchResponseError("truncated_stream_chunk")
+            payload_bytes.extend(body[cursor:chunk_end])
+            cursor = chunk_end + 2
+        try:
+            payload = json.loads(payload_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise SearchResponseError("invalid_stream_json") from exc
+    if not isinstance(payload, dict):
+        raise SearchResponseError("search_response_not_object")
+    return payload
+
+
 def validate_douyin_search_response(payload: Any) -> Dict[str, Any]:
     """Reject parseable error envelopes before pagination interprets them as data."""
     if not isinstance(payload, dict):
         raise SearchResponseError("search_response_not_object")
+
+    search_nil_info = payload.get("search_nil_info")
+    if isinstance(search_nil_info, dict) and search_nil_info.get("search_nil_type") == "verify_check":
+        raise SearchResponseError("search_verify_check")
 
     status_code = payload.get("status_code")
     if status_code not in (None, 0, "0"):

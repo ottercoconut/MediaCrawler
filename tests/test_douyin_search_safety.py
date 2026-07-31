@@ -6,9 +6,12 @@ import pytest
 
 import config
 from media_platform.douyin.core import DouYinCrawler
+from media_platform.douyin.client import DouYinClient
 from media_platform.douyin.exception import SearchResponseError
 from media_platform.douyin.search_safety import (
+    DOUYIN_RESULT_LINK_SELECTOR,
     classify_empty_first_page,
+    decode_douyin_json_body,
     validate_douyin_search_response,
 )
 
@@ -46,6 +49,19 @@ class FakeSearchPage:
         if selector == "body":
             return FakeLocator(text=self.visible_text)
         return FakeLocator(count=self.result_count)
+
+
+class FakeBrowserResponse:
+    url = (
+        "https://www.douyin.com/aweme/v1/web/general/search/stream/"
+        "?keyword=%E9%9D%92%E5%B2%9B%E6%B5%B7%E6%BB%A8%E6%97%85%E6%B8%B8&offset=0"
+    )
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    async def body(self) -> bytes:
+        return self.payload
 
 
 def prepare_empty_search(monkeypatch, tmp_path, *, result_count: int, visible_text: str):
@@ -100,11 +116,94 @@ def test_empty_terminal_response_remains_available_for_page_verification() -> No
     assert validate_douyin_search_response(payload) is payload
 
 
+def test_verify_check_search_response_is_rejected() -> None:
+    with pytest.raises(SearchResponseError) as raised:
+        validate_douyin_search_response(
+            {
+                "status_code": 0,
+                "data": [],
+                "has_more": 0,
+                "search_nil_info": {"search_nil_type": "verify_check"},
+            }
+        )
+    assert raised.value.reason == "search_verify_check"
+
+
+def test_raw_chunk_framed_stream_response_is_decoded() -> None:
+    payload = b'{"status_code":0,"data":[],"has_more":0}'
+    framed = f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n"
+    assert decode_douyin_json_body(framed) == {
+        "status_code": 0,
+        "data": [],
+        "has_more": 0,
+    }
+
+
 def test_empty_first_page_classifier_prefers_visible_results() -> None:
     assert classify_empty_first_page(
         visible_result_count=4,
         visible_text="暂无搜索结果",
     ) == "visible_results"
+
+
+def test_visible_result_selector_covers_new_waterfall_cards() -> None:
+    assert '.search-result-card:visible' in DOUYIN_RESULT_LINK_SELECTOR
+    assert '[id^="waterfall_item_"]:visible' in DOUYIN_RESULT_LINK_SELECTOR
+
+
+@pytest.mark.asyncio
+async def test_search_request_uses_current_single_column_contract(monkeypatch) -> None:
+    captured = {}
+    client = DouYinClient(
+        headers={"User-Agent": "test-agent"},
+        playwright_page=None,
+        cookie_dict={},
+    )
+
+    async def fake_get(uri, params=None, headers=None):
+        captured.update({"uri": uri, "params": params, "headers": headers})
+        return {
+            "status_code": 0,
+            "data": [],
+            "has_more": 0,
+            "extra": {"logid": "request-log-id"},
+        }
+
+    monkeypatch.setattr(client, "get", fake_get)
+    await client.search_info_by_keyword(keyword="青岛海滨旅游")
+
+    assert captured["uri"] == "/aweme/v1/web/general/search/stream/"
+    assert captured["params"]["count"] == "10"
+    assert captured["params"]["list_type"] == "single"
+    assert captured["params"]["search_source"] == "normal_search"
+    assert captured["params"]["from_group_id"] == ""
+    assert captured["params"]["disable_rs"] == "0"
+    assert captured["params"]["need_filter_settings"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_browser_search_response_is_reused_before_duplicate_api_request(
+    monkeypatch,
+) -> None:
+    payload = (
+        b'{"status_code":0,"data":[{"aweme_info":{"aweme_id":"123"}}],'
+        b'"has_more":1,"extra":{"logid":"next-search-id"}}'
+    )
+    framed = f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n"
+    client = DouYinClient(
+        headers={"User-Agent": "test-agent"},
+        playwright_page=None,
+        cookie_dict={},
+    )
+    await client.capture_browser_search_response(FakeBrowserResponse(framed))
+
+    async def duplicate_request(*args, **kwargs):
+        raise AssertionError("browser-captured first page must be reused")
+
+    monkeypatch.setattr(client, "get", duplicate_request)
+    response = await client.search_info_by_keyword(keyword="青岛海滨旅游")
+    assert response["data"][0]["aweme_info"]["aweme_id"] == "123"
+    assert response["extra"]["logid"] == "next-search-id"
 
 
 @pytest.mark.asyncio
