@@ -172,7 +172,25 @@ class DouYinCrawler(AbstractCrawler):
             if not source_exhausted:
                 phases.append(("frontier", start_page, frontier_offset, frontier_cursor, None))
 
+            refresh_session_cursor = ""
             for discovery_phase, phase_page, phase_offset, phase_cursor, phase_limit in phases:
+                if (
+                    discovery_phase == "frontier"
+                    and refresh_session_cursor
+                    and phase_cursor != refresh_session_cursor
+                ):
+                    append_execution_event(
+                        "douyin_frontier_cursor_rebound",
+                        {
+                            "platform": "douyin",
+                            "source_page": phase_page,
+                            "source_offset": phase_offset,
+                            "saved_cursor_present": bool(phase_cursor),
+                            "refresh_cursor_present": True,
+                            "page_offset_preserved": True,
+                        },
+                    )
+                    phase_cursor = refresh_session_cursor
                 refresh_candidate_before = len(accumulator.seen_candidate_identities)
                 page = phase_page
                 next_offset = phase_offset
@@ -462,6 +480,13 @@ class DouYinCrawler(AbstractCrawler):
                     len(accumulator.seen_candidate_identities)
                     - refresh_candidate_before
                 )
+                if (
+                    discovery_phase == "refresh"
+                    and source_has_more in (True, 1)
+                    and next_search_id
+                    and not accumulator.stop_reason
+                ):
+                    refresh_session_cursor = next_search_id
                 if (
                     discovery_phase == "refresh"
                     and should_reseed_douyin_frontier(

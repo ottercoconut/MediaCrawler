@@ -410,3 +410,37 @@ async def test_followup_pages_keep_initial_search_id_when_logid_rotates(
     observed = [event for event in events if event["type"] == "douyin_search_response_observed"]
     assert observed[1]["details"]["cursor_source"] == "request_search_id"
     assert observed[1]["details"]["response_logid_matches_cursor"] is False
+
+
+@pytest.mark.asyncio
+async def test_deep_frontier_rebinds_to_current_refresh_session_cursor(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    crawler, state_path = prepare_empty_search(
+        monkeypatch,
+        tmp_path,
+        result_count=0,
+        visible_text="综合 视频 用户",
+    )
+    client = RotatingLogIdClient()
+    crawler.dy_client = client
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    monkeypatch.setattr(config, "START_PAGE", 3)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_OFFSET", "20")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_CURSOR", "stale-prior-session-id")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "2")
+
+    await crawler.search()
+
+    assert [call["offset"] for call in client.calls] == [0, 10, 20]
+    assert [call["search_id"] for call in client.calls] == [
+        "",
+        "stable-search-id",
+        "stable-search-id",
+    ]
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    rebound = [event for event in events if event["type"] == "douyin_frontier_cursor_rebound"]
+    assert rebound[-1]["details"]["source_page"] == 3
+    assert rebound[-1]["details"]["source_offset"] == 20
+    assert rebound[-1]["details"]["page_offset_preserved"] is True
