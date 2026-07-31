@@ -5,6 +5,7 @@ import json
 import pytest
 
 import config
+from media_platform.douyin import client as douyin_client
 from media_platform.douyin.core import DouYinCrawler
 from media_platform.douyin.client import DouYinClient
 from media_platform.douyin.exception import SearchResponseError
@@ -111,6 +112,22 @@ class FakeBrowserResponse:
         return self.payload
 
 
+class FakeDirectResponse:
+    content = b"not-json-or-a-chunked-stream"
+    text = "not-json-or-a-chunked-stream"
+
+
+class FakeAsyncClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def request(self, *args, **kwargs):
+        return FakeDirectResponse()
+
+
 class FakeWaterfallLocator:
     async def evaluate_all(self, script: str):
         return [str(100 + index) for index in range(10)]
@@ -198,6 +215,30 @@ def test_raw_chunk_framed_stream_response_is_decoded() -> None:
         "data": [],
         "has_more": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_direct_request_preserves_search_decode_failure(monkeypatch) -> None:
+    client = DouYinClient(
+        headers={"User-Agent": "test-agent"},
+        playwright_page=None,
+        cookie_dict={},
+    )
+
+    async def proxy_is_current() -> None:
+        return None
+
+    monkeypatch.setattr(client, "_refresh_proxy_if_expired", proxy_is_current)
+    monkeypatch.setattr(
+        douyin_client,
+        "make_async_client",
+        lambda **kwargs: FakeAsyncClient(),
+    )
+
+    with pytest.raises(SearchResponseError) as raised:
+        await client.request(method="GET", url="https://www.douyin.com/search")
+
+    assert raised.value.reason == "invalid_stream_chunk_header"
 
 
 def test_empty_first_page_classifier_prefers_visible_results() -> None:

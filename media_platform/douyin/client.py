@@ -95,9 +95,10 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                 "payload": payload,
             }
         except Exception as exc:
+            reason = getattr(exc, "reason", type(exc).__name__)
             utils.logger.warning(
                 "[DouYinClient.capture_browser_search_response] browser response ignored, "
-                f"reason: {type(exc).__name__}"
+                f"reason: {reason}"
             )
             return
         self._observed_search_responses.append(record)
@@ -386,6 +387,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                 utils.logger.error(f"request params incrr, response.text: {response.text}")
                 raise Exception("account blocked")
             return decode_douyin_json_body(response.content)
+        except SearchResponseError:
+            raise
         except Exception as e:
             raise DataFetchError(f"{e}, {response.text}")
 
