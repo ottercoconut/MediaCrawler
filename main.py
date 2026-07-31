@@ -29,7 +29,6 @@ if sys.stderr and hasattr(sys.stderr, 'buffer'):
     if sys.stderr.encoding and sys.stderr.encoding.lower() != 'utf-8':
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-import asyncio
 from typing import Optional, Type
 
 import cmd_arg
@@ -123,7 +122,14 @@ async def main() -> None:
 async def async_cleanup() -> None:
     global crawler
     if crawler:
-        if getattr(crawler, "cdp_manager", None):
+        if config.PLATFORM == "xhs" and callable(getattr(crawler, "close", None)):
+            try:
+                await crawler.close(force=True)
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "closed" not in error_msg and "disconnected" not in error_msg:
+                    print(f"[Main] Error closing XHS crawler safely: {e}")
+        elif getattr(crawler, "cdp_manager", None):
             try:
                 await crawler.cdp_manager.cleanup(force=True)
             except Exception as e:

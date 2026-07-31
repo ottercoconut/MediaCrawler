@@ -22,7 +22,7 @@ import asyncio
 import functools
 import os
 import sys
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from playwright.async_api import BrowserContext, Page
 from tenacity import (RetryError, retry, retry_if_result, stop_after_attempt,
@@ -41,27 +41,56 @@ class XiaoHongShuLogin(AbstractLogin):
                  browser_context: BrowserContext,
                  context_page: Page,
                  login_phone: Optional[str] = "",
-                 cookie_str: str = ""
+                 cookie_str: str = "",
+                 close_page: Optional[Callable[..., Awaitable[None]]] = None,
+                 new_page: Optional[Callable[[], Awaitable[Page]]] = None,
                  ):
         config.LOGIN_TYPE = login_type
         self.browser_context = browser_context
         self.context_page = context_page
         self.login_phone = login_phone
         self.cookie_str = cookie_str
+        self.close_page = close_page
+        self.new_page = new_page
+
+    async def _new_login_page(self) -> Page:
+        if self.new_page:
+            return await self.new_page()
+        return await self.browser_context.new_page()
+
+    async def _close_extra_login_page(self, page: Page) -> None:
+        if self.close_page:
+            await self.close_page(page, reason="login_tab_normalization")
+            return
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        utils.logger.warning(
+            "[XiaoHongShuLogin] Unexpected login tab detected; keeping it visible "
+            "for at least 30s before close."
+        )
+        await asyncio.sleep(30)
+        if not page.is_closed():
+            await page.close()
 
     async def _single_login_page(self) -> Page:
-        """Close stale tabs while login is pending, retaining the login page."""
+        """Retain one login tab without immediately closing unexpected tabs."""
         try:
             pages = [page for page in self.browser_context.pages if not page.is_closed()]
         except Exception:
             pages = []
 
-        page = self.context_page if self.context_page in pages else (pages[0] if pages else await self.browser_context.new_page())
+        page = (
+            self.context_page
+            if self.context_page in pages
+            else (pages[0] if pages else await self._new_login_page())
+        )
         closed_count = 0
         for other_page in pages:
             if other_page is page:
                 continue
-            await other_page.close()
+            await self._close_extra_login_page(other_page)
             closed_count += 1
         if closed_count:
             utils.logger.info(

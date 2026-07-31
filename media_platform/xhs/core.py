@@ -63,6 +63,9 @@ from .help import parse_note_info_from_note_url, parse_creator_info_from_url, ge
 from .login import XiaoHongShuLogin
 
 
+XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS = 30.0
+
+
 class XiaoHongShuCrawler(AbstractCrawler):
     context_page: Page
     xhs_client: XiaoHongShuClient
@@ -78,6 +81,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.post_interaction_mode = os.environ.get("TRIPPOSTCOLLECT_XHS_POST_INTERACTION", "none").strip()
         self.post_interaction_attempted = False
         self.creator_profile_cache: Dict[str, Dict] = {}
+        self._owned_page_open_depth = 0
+        self._owned_pages: Dict[int, Page] = {}
+        self._unexpected_pages: Dict[int, tuple[Page, float]] = {}
+        self._unexpected_page_guard_tasks: Dict[int, Task[None]] = {}
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -92,6 +99,163 @@ class XiaoHongShuCrawler(AbstractCrawler):
             return max(0, int(os.environ.get(name, str(default))))
         except ValueError:
             return default
+
+    @staticmethod
+    def _page_is_closed(page: Page) -> bool:
+        try:
+            return page.is_closed()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _popup_monotonic() -> float:
+        return time.monotonic()
+
+    @staticmethod
+    async def _popup_sleep(seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+    def _install_unexpected_page_guard(self) -> None:
+        """Protect every page not explicitly opened by the crawler for at least 30 seconds."""
+        try:
+            pages = list(self.browser_context.pages)
+        except Exception:
+            pages = []
+        self.browser_context.on("page", self._on_browser_page)
+        if pages:
+            primary_page = pages[0]
+            self._owned_pages[id(primary_page)] = primary_page
+            for extra_page in pages[1:]:
+                self._on_browser_page(extra_page)
+
+    def _on_browser_page(self, page: Page) -> None:
+        page_id = id(page)
+        if self._owned_pages.get(page_id) is page:
+            return
+        if self._owned_page_open_depth > 0:
+            self._owned_pages[page_id] = page
+            return
+        if page_id in self._unexpected_pages:
+            return
+        opened_at = self._popup_monotonic()
+        self._unexpected_pages[page_id] = (page, opened_at)
+        task = asyncio.create_task(self._hold_unexpected_page(page, opened_at))
+        self._unexpected_page_guard_tasks[page_id] = task
+
+    async def _hold_unexpected_page(self, page: Page, opened_at: float) -> None:
+        """Surface an unexpected tab and keep it alive without trying to classify it."""
+        try:
+            await page.bring_to_front()
+        except Exception as exc:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] Could not bring unexpected tab to front: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        remaining = max(
+            0.0,
+            XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS
+            - (self._popup_monotonic() - opened_at),
+        )
+        utils.logger.warning(
+            "[XiaoHongShuCrawler] Unexpected browser tab opened; keeping it visible "
+            f"for at least {XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS:.0f}s before any "
+            f"crawler-initiated close: {getattr(page, 'url', '')}"
+        )
+        if remaining > 0:
+            await self._popup_sleep(remaining)
+
+    async def _new_owned_page(self) -> Page:
+        """Open a crawler-owned page without treating it as a platform popup."""
+        self._owned_page_open_depth += 1
+        try:
+            page = await self.browser_context.new_page()
+        finally:
+            self._owned_page_open_depth -= 1
+        self._owned_pages[id(page)] = page
+        return page
+
+    async def _wait_before_page_close(self, page: Page, *, reason: str) -> None:
+        page_id = id(page)
+        if page_id not in self._unexpected_pages:
+            return
+        task = self._unexpected_page_guard_tasks.get(page_id)
+        if task and not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                utils.logger.warning(
+                    "[XiaoHongShuCrawler] Unexpected-tab guard task failed; "
+                    f"enforcing remaining hold directly: {type(exc).__name__}: {exc}"
+                )
+        _, opened_at = self._unexpected_pages[page_id]
+        remaining = max(
+            0.0,
+            XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS
+            - (self._popup_monotonic() - opened_at),
+        )
+        if remaining > 0:
+            await self._popup_sleep(remaining)
+        utils.logger.info(
+            "[XiaoHongShuCrawler] Unexpected-tab minimum hold completed; "
+            f"close may proceed: reason={reason}, url={getattr(page, 'url', '')}"
+        )
+
+    async def _wait_for_all_unexpected_page_guards(self) -> None:
+        """Drain all popup hold periods before Playwright or the context can close them."""
+        while True:
+            guarded_pages = [
+                page
+                for page, _ in self._unexpected_pages.values()
+                if not self._page_is_closed(page)
+            ]
+            pending = [
+                page
+                for page in guarded_pages
+                if self._popup_monotonic() - self._unexpected_pages[id(page)][1]
+                < XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS
+            ]
+            if not pending:
+                return
+            await asyncio.gather(
+                *(
+                    self._wait_before_page_close(page, reason="browser_context_cleanup")
+                    for page in pending
+                )
+            )
+
+    async def _prepare_browser_shutdown(self) -> None:
+        """Close pages through the guard before context or Playwright teardown."""
+        while True:
+            await self._wait_for_all_unexpected_page_guards()
+            try:
+                pages = [
+                    page
+                    for page in self.browser_context.pages
+                    if not self._page_is_closed(page)
+                ]
+            except Exception:
+                return
+            if not pages:
+                return
+            page_ids_before = {id(page) for page in pages}
+            for page in pages:
+                await self._close_page_with_deadline(
+                    page,
+                    reason="browser_shutdown",
+                )
+            await asyncio.sleep(0)
+            try:
+                remaining_ids = {
+                    id(page)
+                    for page in self.browser_context.pages
+                    if not self._page_is_closed(page)
+                }
+            except Exception:
+                return
+            if not remaining_ids or remaining_ids == page_ids_before:
+                return
 
     async def _guarded_pause(self, stage: str, minimum: float, maximum: float) -> float:
         event = await run_required_request_pause(stage, minimum, maximum)
@@ -132,8 +296,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 return
             raise RuntimeError(f"xhs_navigation_timeout:{stage}:{current_url}") from exc
 
-    @staticmethod
-    async def _close_page_with_deadline(page: Page) -> None:
+    async def _close_page_with_deadline(
+        self,
+        page: Page,
+        *,
+        reason: str = "crawler_page_cleanup",
+    ) -> None:
+        await self._wait_before_page_close(page, reason=reason)
+        if self._page_is_closed(page):
+            return
         try:
             async with asyncio.timeout(10):
                 await page.close()
@@ -212,7 +383,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             f"&xsec_source={quote(str(note_detail.get('xsec_source') or 'pc_search'))}"
         )
         interaction_url = f"{self.index_url}/explore/{quote(note_id)}?{query}"
-        page = await self.browser_context.new_page()
+        page = await self._new_owned_page()
         try:
             await self._goto_with_deadline(
                 page,
@@ -248,7 +419,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 f"[XiaoHongShuCrawler] Requested post interaction failed without stopping crawl: {type(exc).__name__}: {exc}"
             )
         finally:
-            await self._close_page_with_deadline(page)
+            await self._close_page_with_deadline(
+                page,
+                reason="post_interaction_cleanup",
+            )
 
     def _storage_state_path(self) -> str:
         explicit_path = os.environ.get("TRIPPOSTCOLLECT_XHS_STORAGE_STATE_PATH", "").strip()
@@ -406,12 +580,19 @@ class XiaoHongShuCrawler(AbstractCrawler):
             pages = []
 
         current_page = getattr(self, "context_page", None)
-        page = current_page if current_page in pages else (pages[0] if pages else await self.browser_context.new_page())
+        page = (
+            current_page
+            if current_page in pages
+            else (pages[0] if pages else await self._new_owned_page())
+        )
         closed_count = 0
         for other_page in pages:
             if other_page is page:
                 continue
-            await other_page.close()
+            await self._close_page_with_deadline(
+                other_page,
+                reason="login_tab_normalization",
+            )
             closed_count += 1
         if closed_count:
             utils.logger.info(
@@ -529,93 +710,108 @@ class XiaoHongShuCrawler(AbstractCrawler):
             playwright_proxy_format, httpx_proxy_format = utils.format_proxy_info(ip_proxy_info)
 
         async with async_playwright() as playwright:
-            # Choose launch mode based on configuration
-            if config.ENABLE_CDP_MODE:
-                utils.logger.info("[XiaoHongShuCrawler] Launching browser using CDP mode")
-                self.browser_context = await self.launch_browser_with_cdp(
+            try:
+                await self._run_browser_session(
                     playwright,
                     playwright_proxy_format,
-                    self.user_agent,
-                    headless=config.CDP_HEADLESS,
+                    httpx_proxy_format,
                 )
-                if self.cdp_manager:
-                    await self.cdp_manager.add_stealth_script()
-            else:
-                utils.logger.info("[XiaoHongShuCrawler] Launching browser using standard mode")
-                # Launch a browser context.
-                chromium = playwright.chromium
-                self.browser_context = await self.launch_browser(
-                    chromium,
-                    playwright_proxy_format,
-                    self.user_agent,
-                    headless=config.HEADLESS,
-                )
-                # stealth.min.js is a js script to prevent the website from detecting the crawler.
-                await self.browser_context.add_init_script(path="libs/stealth.min.js")
+            finally:
+                await self._prepare_browser_shutdown()
 
-            await install_project_runtime_hints(self.browser_context)
-            await self._restore_storage_state()
-            self.context_page = await self._single_page_for_login()
+    async def _run_browser_session(
+        self,
+        playwright: Playwright,
+        playwright_proxy_format: Optional[Dict],
+        httpx_proxy_format: Optional[str],
+    ) -> None:
+        if config.ENABLE_CDP_MODE:
+            utils.logger.info("[XiaoHongShuCrawler] Launching browser using CDP mode")
+            self.browser_context = await self.launch_browser_with_cdp(
+                playwright,
+                playwright_proxy_format,
+                self.user_agent,
+                headless=config.CDP_HEADLESS,
+            )
+            if self.cdp_manager:
+                await self.cdp_manager.add_stealth_script()
+        else:
+            utils.logger.info("[XiaoHongShuCrawler] Launching browser using standard mode")
+            chromium = playwright.chromium
+            self.browser_context = await self.launch_browser(
+                chromium,
+                playwright_proxy_format,
+                self.user_agent,
+                headless=config.HEADLESS,
+            )
+            await self.browser_context.add_init_script(path="libs/stealth.min.js")
+
+        self._install_unexpected_page_guard()
+        await install_project_runtime_hints(self.browser_context)
+        await self._restore_storage_state()
+        self.context_page = await self._single_page_for_login()
+        await self._goto_with_deadline(
+            self.context_page,
+            self.index_url,
+            stage="initial_home",
+        )
+        await self._wait_for_initial_page_settle()
+
+        self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
+        if not await self.xhs_client.pong():
+            await self._single_page_for_login()
+            checkpoint_ready = False
+            if await self._wait_for_manual_checkpoint_if_needed():
+                await self.xhs_client.update_cookies(
+                    browser_context=self.browser_context,
+                    urls=self.cookie_urls,
+                )
+                checkpoint_ready = await self.xhs_client.pong()
+            if not checkpoint_ready:
+                await self._single_page_for_login()
+                login_obj = XiaoHongShuLogin(
+                    login_type=config.LOGIN_TYPE,
+                    login_phone="",  # input your phone number
+                    browser_context=self.browser_context,
+                    context_page=self.context_page,
+                    cookie_str=config.COOKIES,
+                    close_page=self._close_page_with_deadline,
+                    new_page=self._new_owned_page,
+                )
+                await login_obj.begin()
+                await self.xhs_client.update_cookies(
+                    browser_context=self.browser_context,
+                    urls=self.cookie_urls,
+                )
+                if not await self.xhs_client.pong():
+                    raise RuntimeError(
+                        "[XiaoHongShuCrawler] Xiaohongshu login state not confirmed "
+                        "after login flow"
+                    )
+
+        await self._write_storage_state()
+        behavior_keyword = next(
+            (item.strip() for item in config.KEYWORDS.split(",") if item.strip()),
+            "",
+        )
+        if behavior_keyword:
             await self._goto_with_deadline(
                 self.context_page,
-                self.index_url,
-                stage="initial_home",
+                f"https://www.xiaohongshu.com/search_result?keyword={quote(behavior_keyword)}",
+                stage="behavior_search",
             )
-            await self._wait_for_initial_page_settle()
+        behavior_evidence = await run_required_human_behavior(self.context_page, "xhs")
+        if behavior_evidence.get("status") != "completed":
+            raise RuntimeError("XHS required human behavior stage did not complete")
+        crawler_type_var.set(config.CRAWLER_TYPE)
+        if config.CRAWLER_TYPE == "search":
+            await self.search()
+        elif config.CRAWLER_TYPE == "detail":
+            await self.get_specified_notes()
+        elif config.CRAWLER_TYPE == "creator":
+            await self.get_creators_and_notes()
 
-            # Create a client to interact with the Xiaohongshu website.
-            self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
-            if not await self.xhs_client.pong():
-                await self._single_page_for_login()
-                checkpoint_ready = False
-                if await self._wait_for_manual_checkpoint_if_needed():
-                    await self.xhs_client.update_cookies(
-                        browser_context=self.browser_context,
-                        urls=self.cookie_urls,
-                    )
-                    checkpoint_ready = await self.xhs_client.pong()
-                if not checkpoint_ready:
-                    await self._single_page_for_login()
-                    login_obj = XiaoHongShuLogin(
-                        login_type=config.LOGIN_TYPE,
-                        login_phone="",  # input your phone number
-                        browser_context=self.browser_context,
-                        context_page=self.context_page,
-                        cookie_str=config.COOKIES,
-                    )
-                    await login_obj.begin()
-                    await self.xhs_client.update_cookies(
-                        browser_context=self.browser_context,
-                        urls=self.cookie_urls,
-                    )
-                    if not await self.xhs_client.pong():
-                        raise RuntimeError("[XiaoHongShuCrawler] Xiaohongshu login state not confirmed after login flow")
-
-            await self._write_storage_state()
-            behavior_keyword = next((item.strip() for item in config.KEYWORDS.split(",") if item.strip()), "")
-            if behavior_keyword:
-                await self._goto_with_deadline(
-                    self.context_page,
-                    f"https://www.xiaohongshu.com/search_result?keyword={quote(behavior_keyword)}",
-                    stage="behavior_search",
-                )
-            behavior_evidence = await run_required_human_behavior(self.context_page, "xhs")
-            if behavior_evidence.get("status") != "completed":
-                raise RuntimeError("XHS required human behavior stage did not complete")
-            crawler_type_var.set(config.CRAWLER_TYPE)
-            if config.CRAWLER_TYPE == "search":
-                # Search for notes and retrieve their comment information.
-                await self.search()
-            elif config.CRAWLER_TYPE == "detail":
-                # Get the information and comments of the specified post
-                await self.get_specified_notes()
-            elif config.CRAWLER_TYPE == "creator":
-                # Get creator's information and their notes and comments
-                await self.get_creators_and_notes()
-            else:
-                pass
-
-            utils.logger.info("[XiaoHongShuCrawler.start] Xhs Crawler finished ...")
+        utils.logger.info("[XiaoHongShuCrawler.start] Xhs Crawler finished ...")
 
     async def search(self) -> None:
         """Search for notes and retrieve their comment information."""
@@ -1015,7 +1211,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def _get_creator_info_from_browser(self, user_id: str) -> Optional[Dict]:
         """Load an author homepage in the signed-in context when the direct request is empty."""
-        page = await self.browser_context.new_page()
+        page = await self._new_owned_page()
         try:
             await self._goto_with_deadline(
                 page,
@@ -1068,7 +1264,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
             html_content = await page.content()
             return self.xhs_client.extract_creator_info_from_html(html_content)
         finally:
-            await self._close_page_with_deadline(page)
+            await self._close_page_with_deadline(
+                page,
+                reason="creator_profile_cleanup",
+            )
 
     async def _wait_for_creator_profile_verification(
         self,
@@ -1331,13 +1530,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
             chromium = playwright.chromium
             return await self.launch_browser(chromium, playwright_proxy, user_agent, headless)
 
-    async def close(self):
+    async def close(self, *, force: bool = False):
         """Close browser context"""
+        await self._prepare_browser_shutdown()
         try:
             async with asyncio.timeout(20):
                 # Special handling if using CDP mode
                 if self.cdp_manager:
-                    await self.cdp_manager.cleanup()
+                    await self.cdp_manager.cleanup(force=force)
                     self.cdp_manager = None
                 else:
                     await self.browser_context.close()
