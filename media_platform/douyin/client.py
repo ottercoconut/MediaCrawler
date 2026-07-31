@@ -20,6 +20,7 @@
 import asyncio
 import copy
 import json
+import random
 import re
 import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, Dict, Union, Optional
@@ -157,6 +158,54 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             f"search_nil_type: {nil_info.get('search_nil_type') if isinstance(nil_info, dict) else ''}"
         )
         return payload
+
+    async def _scroll_for_observed_search_response(
+        self,
+        *,
+        keyword: str,
+        offset: int,
+        search_id: str,
+    ) -> bool:
+        """Drive the visible results page until its own request reaches the wanted offset."""
+        if self.playwright_page is None or offset <= 0 or not search_id:
+            return False
+        for attempt in range(1, 9):
+            try:
+                viewport = self.playwright_page.viewport_size or {"width": 1920, "height": 1080}
+                await self.playwright_page.mouse.move(
+                    max(10, int(viewport["width"] * random.uniform(0.68, 0.88))),
+                    max(10, int(viewport["height"] * random.uniform(0.55, 0.82))),
+                    steps=random.randint(3, 7),
+                )
+                await self.playwright_page.mouse.wheel(0, random.randint(650, 1050))
+                await self.playwright_page.wait_for_timeout(random.randint(1400, 2400))
+            except Exception as exc:
+                utils.logger.warning(
+                    "[DouYinClient._scroll_for_observed_search_response] visible scroll failed, "
+                    f"offset: {offset}, attempt: {attempt}, reason: {type(exc).__name__}"
+                )
+                return False
+            if self._observed_search_response_tasks:
+                await asyncio.gather(
+                    *tuple(self._observed_search_response_tasks),
+                    return_exceptions=True,
+                )
+            if any(
+                record["keyword"] == keyword
+                and record["offset"] == offset
+                and record["search_id"] == search_id
+                for record in self._observed_search_responses
+            ):
+                utils.logger.info(
+                    "[DouYinClient._scroll_for_observed_search_response] browser page reached offset, "
+                    f"offset: {offset}, attempts: {attempt}"
+                )
+                return True
+        utils.logger.warning(
+            "[DouYinClient._scroll_for_observed_search_response] browser page did not reach offset, "
+            f"offset: {offset}, attempts: 8"
+        )
+        return False
 
     async def _build_visible_first_page_fallback(
         self,
@@ -396,6 +445,17 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             offset=offset,
             search_id=search_id,
         )
+        if observed_response is None and offset > 0 and search_id:
+            await self._scroll_for_observed_search_response(
+                keyword=keyword,
+                offset=offset,
+                search_id=search_id,
+            )
+            observed_response = await self._take_observed_search_response(
+                keyword=keyword,
+                offset=offset,
+                search_id=search_id,
+            )
         if observed_response is not None:
             return validate_douyin_search_response(observed_response)
 

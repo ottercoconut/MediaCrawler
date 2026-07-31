@@ -339,6 +339,45 @@ async def test_visible_first_page_rebuild_requires_healthy_next_page(
 
 
 @pytest.mark.asyncio
+async def test_followup_page_scrolls_for_browser_response_before_direct_request(
+    monkeypatch,
+) -> None:
+    client = DouYinClient(
+        headers={"User-Agent": "test-agent"},
+        playwright_page=None,
+        cookie_dict={},
+    )
+
+    async def fake_scroll(*, keyword: str, offset: int, search_id: str) -> bool:
+        client._observed_search_responses.append(
+            {
+                "keyword": keyword,
+                "offset": offset,
+                "search_id": search_id,
+                "payload": {
+                    "status_code": 0,
+                    "data": [{"aweme_info": {"aweme_id": "789"}}],
+                    "has_more": 1,
+                    "extra": {"logid": "request-log-id"},
+                },
+            }
+        )
+        return True
+
+    async def duplicate_request(*args, **kwargs):
+        raise AssertionError("followup page must reuse browser response after scrolling")
+
+    monkeypatch.setattr(client, "_scroll_for_observed_search_response", fake_scroll)
+    monkeypatch.setattr(client, "get", duplicate_request)
+    response = await client.search_info_by_keyword(
+        keyword="青岛海滨旅游",
+        offset=40,
+        search_id="stable-search-id",
+    )
+    assert response["data"][0]["aweme_info"]["aweme_id"] == "789"
+
+
+@pytest.mark.asyncio
 async def test_visible_results_turn_empty_first_api_page_into_runtime_failure(
     monkeypatch,
     tmp_path,
