@@ -26,6 +26,35 @@ class EmptySearchClient:
         }
 
 
+class RotatingLogIdClient:
+    def __init__(self):
+        self.calls = []
+
+    async def search_info_by_keyword(self, **kwargs):
+        self.calls.append(kwargs)
+        offset = kwargs["offset"]
+        if offset == 0:
+            return {
+                "status_code": 0,
+                "data": [],
+                "has_more": 1,
+                "extra": {"logid": "stable-search-id"},
+            }
+        if offset == 10:
+            return {
+                "status_code": 0,
+                "data": [],
+                "has_more": 1,
+                "extra": {"logid": "request-log-id-only"},
+            }
+        return {
+            "status_code": 0,
+            "data": [],
+            "has_more": 0,
+            "extra": {"logid": "terminal-request-log-id"},
+        }
+
+
 class FakeLocator:
     def __init__(self, *, count: int = 0, text: str = ""):
         self._count = count
@@ -352,3 +381,32 @@ async def test_ambiguous_empty_first_page_is_runtime_failure(monkeypatch, tmp_pa
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"]
     assert stopped[-1]["details"]["stop_reason"] == "runtime_failed"
     assert stopped[-1]["details"]["stop_detail"] == "ambiguous_empty_first_page"
+
+
+@pytest.mark.asyncio
+async def test_followup_pages_keep_initial_search_id_when_logid_rotates(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    crawler, state_path = prepare_empty_search(
+        monkeypatch,
+        tmp_path,
+        result_count=0,
+        visible_text="综合 视频 用户",
+    )
+    client = RotatingLogIdClient()
+    crawler.dy_client = client
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+
+    await crawler.search()
+
+    assert [call["offset"] for call in client.calls] == [0, 10, 20]
+    assert [call["search_id"] for call in client.calls] == [
+        "",
+        "stable-search-id",
+        "stable-search-id",
+    ]
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    observed = [event for event in events if event["type"] == "douyin_search_response_observed"]
+    assert observed[1]["details"]["cursor_source"] == "request_search_id"
+    assert observed[1]["details"]["response_logid_matches_cursor"] is False

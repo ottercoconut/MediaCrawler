@@ -248,7 +248,8 @@ class DouYinCrawler(AbstractCrawler):
                     source_has_more = (
                         posts_res.get("has_more") if "has_more" in posts_res else None
                     )
-                    next_search_id = posts_res.get("extra", {}).get("logid", "")
+                    response_logid = posts_res.get("extra", {}).get("logid", "")
+                    next_search_id = requested_search_id or response_logid
                     resume_page = requested_page + 1
                     resume_offset = requested_offset + dy_limit_count
                     fresh_first_page = bool(
@@ -269,6 +270,14 @@ class DouYinCrawler(AbstractCrawler):
                             "data_count": len(post_items),
                             "has_more": source_has_more,
                             "next_search_id_present": bool(next_search_id),
+                            "cursor_source": (
+                                "request_search_id"
+                                if requested_search_id
+                                else "response_logid"
+                            ),
+                            "response_logid_matches_cursor": bool(
+                                response_logid and response_logid == next_search_id
+                            ),
                         },
                     )
                     accumulator.begin_batch()
