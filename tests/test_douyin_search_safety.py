@@ -207,6 +207,35 @@ async def test_browser_search_response_is_reused_before_duplicate_api_request(
 
 
 @pytest.mark.asyncio
+async def test_latest_non_verify_browser_response_wins_over_prefetch_verify(
+    monkeypatch,
+) -> None:
+    verify_payload = (
+        b'{"status_code":0,"data":[],"has_more":0,'
+        b'"search_nil_info":{"search_nil_type":"verify_check"}}'
+    )
+    healthy_payload = (
+        b'{"status_code":0,"data":[{"aweme_info":{"aweme_id":"456"}}],'
+        b'"has_more":1,"extra":{"logid":"healthy-search-id"}}'
+    )
+    client = DouYinClient(
+        headers={"User-Agent": "test-agent"},
+        playwright_page=None,
+        cookie_dict={},
+    )
+    await client.capture_browser_search_response(FakeBrowserResponse(verify_payload))
+    await client.capture_browser_search_response(FakeBrowserResponse(healthy_payload))
+
+    async def duplicate_request(*args, **kwargs):
+        raise AssertionError("healthy browser response must win")
+
+    monkeypatch.setattr(client, "get", duplicate_request)
+    response = await client.search_info_by_keyword(keyword="青岛海滨旅游")
+    assert response["data"][0]["aweme_info"]["aweme_id"] == "456"
+    assert response["extra"]["logid"] == "healthy-search-id"
+
+
+@pytest.mark.asyncio
 async def test_visible_results_turn_empty_first_api_page_into_runtime_failure(
     monkeypatch,
     tmp_path,

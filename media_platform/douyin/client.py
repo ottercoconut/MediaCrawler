@@ -96,6 +96,13 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         except Exception:
             return
         self._observed_search_responses.append(record)
+        nil_info = payload.get("search_nil_info")
+        utils.logger.info(
+            "[DouYinClient.capture_browser_search_response] observed browser response, "
+            f"offset: {record['offset']}, search_id_present: {bool(record['search_id'])}, "
+            f"data_count: {len(payload.get('data') or [])}, has_more: {payload.get('has_more')}, "
+            f"search_nil_type: {nil_info.get('search_nil_type') if isinstance(nil_info, dict) else ''}"
+        )
 
     async def _take_observed_search_response(
         self,
@@ -109,19 +116,43 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                 *tuple(self._observed_search_response_tasks),
                 return_exceptions=True,
             )
-        for index, record in enumerate(self._observed_search_responses):
+        matches = [
+            (index, record)
+            for index, record in enumerate(self._observed_search_responses)
             if (
                 record["keyword"] == keyword
                 and record["offset"] == offset
                 and record["search_id"] == search_id
+            )
+        ]
+        if not matches:
+            return None
+
+        selected_index, selected_record = matches[-1]
+        for candidate_index, candidate_record in reversed(matches):
+            nil_info = candidate_record["payload"].get("search_nil_info")
+            if not (
+                isinstance(nil_info, dict)
+                and nil_info.get("search_nil_type") == "verify_check"
             ):
-                payload = self._observed_search_responses.pop(index)["payload"]
-                utils.logger.info(
-                    "[DouYinClient.search_info_by_keyword] reuse browser search response, "
-                    f"offset: {offset}, search_id_present: {bool(search_id)}"
-                )
-                return payload
-        return None
+                selected_index, selected_record = candidate_index, candidate_record
+                break
+        matched_indexes = {index for index, _ in matches}
+        self._observed_search_responses = [
+            record
+            for index, record in enumerate(self._observed_search_responses)
+            if index not in matched_indexes
+        ]
+        payload = selected_record["payload"]
+        nil_info = payload.get("search_nil_info")
+        utils.logger.info(
+            "[DouYinClient.search_info_by_keyword] reuse browser search response, "
+            f"offset: {offset}, search_id_present: {bool(search_id)}, "
+            f"duplicates: {len(matches)}, selected_index: {selected_index}, "
+            f"data_count: {len(payload.get('data') or [])}, "
+            f"search_nil_type: {nil_info.get('search_nil_type') if isinstance(nil_info, dict) else ''}"
+        )
+        return payload
 
     async def __process_req_params(
         self,
