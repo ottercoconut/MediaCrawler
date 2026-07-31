@@ -173,21 +173,35 @@ class DouYinCrawler(AbstractCrawler):
                 phases.append(("frontier", start_page, frontier_offset, frontier_cursor, None))
 
             refresh_session_cursor = ""
+            refresh_resume_page: int | None = None
+            refresh_resume_offset: int | None = None
             for discovery_phase, phase_page, phase_offset, phase_cursor, phase_limit in phases:
                 if (
                     discovery_phase == "frontier"
                     and refresh_session_cursor
                     and phase_cursor != refresh_session_cursor
                 ):
+                    saved_page = phase_page
+                    saved_offset = phase_offset
+                    covered_by_refresh = bool(
+                        refresh_resume_page is not None
+                        and refresh_resume_offset is not None
+                        and refresh_resume_offset >= phase_offset
+                    )
+                    if covered_by_refresh:
+                        phase_page = refresh_resume_page
+                        phase_offset = refresh_resume_offset
                     append_execution_event(
                         "douyin_frontier_cursor_rebound",
                         {
                             "platform": "douyin",
-                            "source_page": phase_page,
-                            "source_offset": phase_offset,
+                            "saved_page": saved_page,
+                            "saved_offset": saved_offset,
+                            "resume_page": phase_page,
+                            "resume_offset": phase_offset,
                             "saved_cursor_present": bool(phase_cursor),
                             "refresh_cursor_present": True,
-                            "page_offset_preserved": True,
+                            "covered_by_refresh": covered_by_refresh,
                         },
                     )
                     phase_cursor = refresh_session_cursor
@@ -487,6 +501,8 @@ class DouYinCrawler(AbstractCrawler):
                     and not accumulator.stop_reason
                 ):
                     refresh_session_cursor = next_search_id
+                    refresh_resume_page = resume_page
+                    refresh_resume_offset = resume_offset
                 if (
                     discovery_phase == "refresh"
                     and should_reseed_douyin_frontier(
