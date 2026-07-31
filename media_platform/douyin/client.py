@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 from .exception import *
 from .field import *
 from .help import *
+from .search_safety import validate_douyin_search_response
 
 
 class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
@@ -206,7 +207,12 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         referer_url = f"https://www.douyin.com/search/{keyword}?aid=f594bbd9-a0e2-4651-9319-ebe3cb6298c1&type=general"
         headers = copy.copy(self.headers)
         headers["Referer"] = urllib.parse.quote(referer_url, safe=':/')
-        return await self.get("/aweme/v1/web/general/search/single/", query_params, headers=headers)
+        response = await self.get(
+            "/aweme/v1/web/general/search/single/",
+            query_params,
+            headers=headers,
+        )
+        return validate_douyin_search_response(response)
 
     async def get_video_by_id(self, aweme_id: str) -> Any:
         """

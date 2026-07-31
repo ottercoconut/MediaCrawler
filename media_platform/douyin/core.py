@@ -48,10 +48,11 @@ from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
 from .client import DouYinClient
-from .exception import DataFetchError
+from .exception import DataFetchError, SearchResponseError
 from .field import PublishTimeType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
+from .search_safety import inspect_empty_first_page
 
 
 class DouYinCrawler(AbstractCrawler):
@@ -199,6 +200,22 @@ class DouYinCrawler(AbstractCrawler):
                             publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
                             search_id=requested_search_id,
                         )
+                    except SearchResponseError as exc:
+                        utils.logger.error(
+                            f"[DouYinCrawler.search] invalid search response for "
+                            f"keyword: {keyword}, reason: {exc.reason}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            exc.reason,
+                            source_page=requested_page,
+                            source_offset=requested_offset,
+                            source_cursor=requested_search_id,
+                            resume_page=requested_page,
+                            resume_offset=requested_offset,
+                            resume_cursor=requested_search_id,
+                            discovery_phase=discovery_phase,
+                        )
+                        break
                     except DataFetchError:
                         utils.logger.error(
                             f"[DouYinCrawler.search] search douyin keyword: {keyword} failed"
@@ -234,6 +251,26 @@ class DouYinCrawler(AbstractCrawler):
                     next_search_id = posts_res.get("extra", {}).get("logid", "")
                     resume_page = requested_page + 1
                     resume_offset = requested_offset + dy_limit_count
+                    fresh_first_page = bool(
+                        requested_page == 1
+                        and requested_offset == 0
+                        and not requested_search_id
+                    )
+                    append_execution_event(
+                        "douyin_search_response_observed",
+                        {
+                            "platform": "douyin",
+                            "discovery_phase": discovery_phase,
+                            "source_page": requested_page,
+                            "source_offset": requested_offset,
+                            "source_cursor_present": bool(requested_search_id),
+                            "fresh_first_page": fresh_first_page,
+                            "status_code": posts_res.get("status_code"),
+                            "data_count": len(post_items),
+                            "has_more": source_has_more,
+                            "next_search_id_present": bool(next_search_id),
+                        },
+                    )
                     accumulator.begin_batch()
                     if not post_items:
                         if source_has_more in (True, 1) and next_search_id:
@@ -258,9 +295,46 @@ class DouYinCrawler(AbstractCrawler):
                                 break
                             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                             continue
+                        if fresh_first_page:
+                            page_check = await inspect_empty_first_page(self.context_page)
+                            append_execution_event(
+                                "douyin_empty_first_page_checked",
+                                {
+                                    "platform": "douyin",
+                                    "discovery_phase": discovery_phase,
+                                    "source_page": requested_page,
+                                    "source_offset": requested_offset,
+                                    "source_cursor_present": False,
+                                    "api_has_more": source_has_more,
+                                    "next_search_id_present": bool(next_search_id),
+                                    **page_check,
+                                },
+                            )
+                            if page_check["classification"] != "explicit_no_results":
+                                failure_detail = (
+                                    "empty_api_response_with_visible_results"
+                                    if page_check["classification"] == "visible_results"
+                                    else "ambiguous_empty_first_page"
+                                )
+                                accumulator.mark_runtime_failed(
+                                    failure_detail,
+                                    source_page=requested_page,
+                                    source_offset=requested_offset,
+                                    source_cursor=requested_search_id,
+                                    resume_page=requested_page,
+                                    resume_offset=requested_offset,
+                                    resume_cursor=requested_search_id,
+                                    discovery_phase=discovery_phase,
+                                )
+                                break
                         if discovery_phase == "frontier":
+                            empty_detail = (
+                                "verified_empty_first_page"
+                                if fresh_first_page
+                                else "empty_page"
+                            )
                             accumulator.mark_source_exhausted(
-                                "empty_cursor" if source_has_more in (True, 1) else "empty_page",
+                                empty_detail,
                                 source_page=requested_page,
                                 source_offset=requested_offset,
                                 source_cursor=requested_search_id,

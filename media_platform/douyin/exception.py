@@ -25,5 +25,13 @@ class DataFetchError(RequestError):
     """something error when fetch"""
 
 
+class SearchResponseError(DataFetchError):
+    """Douyin search returned JSON that is not a valid search result response."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
 class IPBlockError(RequestError):
     """fetch so fast that the server block us ip"""
