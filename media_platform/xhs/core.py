@@ -63,7 +63,7 @@ from .help import parse_note_info_from_note_url, parse_creator_info_from_url, ge
 from .login import XiaoHongShuLogin
 
 
-XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS = 30.0
+XHS_NEW_PAGE_MIN_HOLD_SECONDS = 30.0
 
 
 class XiaoHongShuCrawler(AbstractCrawler):
@@ -81,10 +81,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.post_interaction_mode = os.environ.get("TRIPPOSTCOLLECT_XHS_POST_INTERACTION", "none").strip()
         self.post_interaction_attempted = False
         self.creator_profile_cache: Dict[str, Dict] = {}
-        self._owned_page_open_depth = 0
-        self._owned_pages: Dict[int, Page] = {}
-        self._unexpected_pages: Dict[int, tuple[Page, float]] = {}
-        self._unexpected_page_guard_tasks: Dict[int, Task[None]] = {}
+        self._crawler_page_open_depth = 0
+        self._initial_pages: Dict[int, Page] = {}
+        self._new_pages: Dict[int, tuple[Page, float, str]] = {}
+        self._new_page_guard_tasks: Dict[int, Task[None]] = {}
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -115,8 +115,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def _popup_sleep(seconds: float) -> None:
         await asyncio.sleep(seconds)
 
-    def _install_unexpected_page_guard(self) -> None:
-        """Protect every page not explicitly opened by the crawler for at least 30 seconds."""
+    def _install_new_page_guard(self) -> None:
+        """Protect every page appearing after browser launch for at least 30 seconds."""
         try:
             pages = list(self.browser_context.pages)
         except Exception:
@@ -124,61 +124,64 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.browser_context.on("page", self._on_browser_page)
         if pages:
             primary_page = pages[0]
-            self._owned_pages[id(primary_page)] = primary_page
+            self._initial_pages[id(primary_page)] = primary_page
             for extra_page in pages[1:]:
-                self._on_browser_page(extra_page)
+                self._register_new_page(extra_page, source="preexisting_extra")
 
     def _on_browser_page(self, page: Page) -> None:
+        source = "crawler_opened" if self._crawler_page_open_depth > 0 else "platform_opened"
+        self._register_new_page(page, source=source)
+
+    def _register_new_page(self, page: Page, *, source: str) -> None:
         page_id = id(page)
-        if self._owned_pages.get(page_id) is page:
+        if self._initial_pages.get(page_id) is page:
             return
-        if self._owned_page_open_depth > 0:
-            self._owned_pages[page_id] = page
-            return
-        if page_id in self._unexpected_pages:
+        if page_id in self._new_pages:
             return
         opened_at = self._popup_monotonic()
-        self._unexpected_pages[page_id] = (page, opened_at)
-        task = asyncio.create_task(self._hold_unexpected_page(page, opened_at))
-        self._unexpected_page_guard_tasks[page_id] = task
+        self._new_pages[page_id] = (page, opened_at, source)
+        task = asyncio.create_task(self._hold_new_page(page, opened_at, source))
+        self._new_page_guard_tasks[page_id] = task
 
-    async def _hold_unexpected_page(self, page: Page, opened_at: float) -> None:
-        """Surface an unexpected tab and keep it alive without trying to classify it."""
+    async def _hold_new_page(self, page: Page, opened_at: float, source: str) -> None:
+        """Surface any new tab and keep it alive without trying to classify it."""
         try:
             await page.bring_to_front()
         except Exception as exc:
             utils.logger.warning(
-                "[XiaoHongShuCrawler] Could not bring unexpected tab to front: "
+                "[XiaoHongShuCrawler] Could not bring new tab to front: "
                 f"{type(exc).__name__}: {exc}"
             )
         remaining = max(
             0.0,
-            XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS
+            XHS_NEW_PAGE_MIN_HOLD_SECONDS
             - (self._popup_monotonic() - opened_at),
         )
         utils.logger.warning(
-            "[XiaoHongShuCrawler] Unexpected browser tab opened; keeping it visible "
-            f"for at least {XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS:.0f}s before any "
-            f"crawler-initiated close: {getattr(page, 'url', '')}"
+            "[XiaoHongShuCrawler] New browser tab opened; keeping it visible "
+            f"for at least {XHS_NEW_PAGE_MIN_HOLD_SECONDS:.0f}s before any "
+            f"crawler-initiated close: source={source}, url={getattr(page, 'url', '')}"
         )
         if remaining > 0:
             await self._popup_sleep(remaining)
 
-    async def _new_owned_page(self) -> Page:
-        """Open a crawler-owned page without treating it as a platform popup."""
-        self._owned_page_open_depth += 1
+    async def _new_guarded_page(self) -> Page:
+        """Open a crawler-requested page while retaining the universal new-tab guard."""
+        self._crawler_page_open_depth += 1
         try:
             page = await self.browser_context.new_page()
         finally:
-            self._owned_page_open_depth -= 1
-        self._owned_pages[id(page)] = page
+            self._crawler_page_open_depth -= 1
+        # Playwright normally emits ``page`` before ``new_page`` returns. Registering
+        # explicitly as well keeps the guard correct if that event is delayed.
+        self._register_new_page(page, source="crawler_opened")
         return page
 
     async def _wait_before_page_close(self, page: Page, *, reason: str) -> None:
         page_id = id(page)
-        if page_id not in self._unexpected_pages:
+        if page_id not in self._new_pages:
             return
-        task = self._unexpected_page_guard_tasks.get(page_id)
+        task = self._new_page_guard_tasks.get(page_id)
         if task and not task.done():
             try:
                 await asyncio.shield(task)
@@ -186,35 +189,36 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 raise
             except Exception as exc:
                 utils.logger.warning(
-                    "[XiaoHongShuCrawler] Unexpected-tab guard task failed; "
+                    "[XiaoHongShuCrawler] New-tab guard task failed; "
                     f"enforcing remaining hold directly: {type(exc).__name__}: {exc}"
                 )
-        _, opened_at = self._unexpected_pages[page_id]
+        _, opened_at, source = self._new_pages[page_id]
         remaining = max(
             0.0,
-            XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS
+            XHS_NEW_PAGE_MIN_HOLD_SECONDS
             - (self._popup_monotonic() - opened_at),
         )
         if remaining > 0:
             await self._popup_sleep(remaining)
         utils.logger.info(
-            "[XiaoHongShuCrawler] Unexpected-tab minimum hold completed; "
-            f"close may proceed: reason={reason}, url={getattr(page, 'url', '')}"
+            "[XiaoHongShuCrawler] New-tab minimum hold completed; "
+            f"close may proceed: source={source}, reason={reason}, "
+            f"url={getattr(page, 'url', '')}"
         )
 
-    async def _wait_for_all_unexpected_page_guards(self) -> None:
-        """Drain all popup hold periods before Playwright or the context can close them."""
+    async def _wait_for_all_new_page_guards(self) -> None:
+        """Drain all new-tab hold periods before Playwright or the context can close them."""
         while True:
             guarded_pages = [
                 page
-                for page, _ in self._unexpected_pages.values()
+                for page, _, _ in self._new_pages.values()
                 if not self._page_is_closed(page)
             ]
             pending = [
                 page
                 for page in guarded_pages
-                if self._popup_monotonic() - self._unexpected_pages[id(page)][1]
-                < XHS_UNEXPECTED_PAGE_MIN_HOLD_SECONDS
+                if self._popup_monotonic() - self._new_pages[id(page)][1]
+                < XHS_NEW_PAGE_MIN_HOLD_SECONDS
             ]
             if not pending:
                 return
@@ -228,7 +232,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def _prepare_browser_shutdown(self) -> None:
         """Close pages through the guard before context or Playwright teardown."""
         while True:
-            await self._wait_for_all_unexpected_page_guards()
+            await self._wait_for_all_new_page_guards()
             try:
                 pages = [
                     page
@@ -383,7 +387,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             f"&xsec_source={quote(str(note_detail.get('xsec_source') or 'pc_search'))}"
         )
         interaction_url = f"{self.index_url}/explore/{quote(note_id)}?{query}"
-        page = await self._new_owned_page()
+        page = await self._new_guarded_page()
         try:
             await self._goto_with_deadline(
                 page,
@@ -583,7 +587,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         page = (
             current_page
             if current_page in pages
-            else (pages[0] if pages else await self._new_owned_page())
+            else (pages[0] if pages else await self._new_guarded_page())
         )
         closed_count = 0
         for other_page in pages:
@@ -746,7 +750,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
-        self._install_unexpected_page_guard()
+        self._install_new_page_guard()
         await install_project_runtime_hints(self.browser_context)
         await self._restore_storage_state()
         self.context_page = await self._single_page_for_login()
@@ -776,7 +780,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     context_page=self.context_page,
                     cookie_str=config.COOKIES,
                     close_page=self._close_page_with_deadline,
-                    new_page=self._new_owned_page,
+                    new_page=self._new_guarded_page,
                 )
                 await login_obj.begin()
                 await self.xhs_client.update_cookies(
@@ -1211,7 +1215,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def _get_creator_info_from_browser(self, user_id: str) -> Optional[Dict]:
         """Load an author homepage in the signed-in context when the direct request is empty."""
-        page = await self._new_owned_page()
+        page = await self._new_guarded_page()
         try:
             await self._goto_with_deadline(
                 page,

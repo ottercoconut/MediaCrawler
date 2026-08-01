@@ -74,7 +74,7 @@ async def test_unexpected_xhs_tab_waits_30_seconds_before_login_cleanup() -> Non
     install_fake_clock(crawler, events)
     crawler.browser_context = context
     crawler.context_page = primary
-    crawler._install_unexpected_page_guard()
+    crawler._install_new_page_guard()
 
     context.emit_page(popup)
     selected = await crawler._single_page_for_login()
@@ -98,10 +98,10 @@ async def test_extra_tab_present_at_guard_install_is_also_protected() -> None:
     crawler.browser_context = context
     crawler.context_page = primary
 
-    crawler._install_unexpected_page_guard()
+    crawler._install_new_page_guard()
     await crawler._single_page_for_login()
 
-    assert id(popup) in crawler._unexpected_pages
+    assert crawler._new_pages[id(popup)][2] == "preexisting_extra"
     assert events == [
         ("front", "startup-security-popup"),
         ("sleep", pytest.approx(30.0)),
@@ -110,7 +110,7 @@ async def test_extra_tab_present_at_guard_install_is_also_protected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_crawler_owned_xhs_tab_does_not_use_popup_hold() -> None:
+async def test_crawler_opened_xhs_tab_waits_30_seconds_after_failed_scroll() -> None:
     events: list[tuple[str, object]] = []
     primary = FakePage("search", events)
     context = FakeContext([primary], events)
@@ -118,14 +118,18 @@ async def test_crawler_owned_xhs_tab_does_not_use_popup_hold() -> None:
     install_fake_clock(crawler, events)
     crawler.browser_context = context
     crawler.context_page = primary
-    crawler._install_unexpected_page_guard()
+    crawler._install_new_page_guard()
 
-    page = await crawler._new_owned_page()
-    await crawler._close_page_with_deadline(page, reason="test_cleanup")
+    page = await crawler._new_guarded_page()
+    events.append(("scroll_effect", False))
+    await crawler._close_page_with_deadline(page, reason="creator_profile_cleanup")
 
-    assert crawler._owned_pages[id(page)] is page
-    assert id(page) not in crawler._unexpected_pages
-    assert ("sleep", 30.0) not in events
+    assert crawler._new_pages[id(page)][2] == "crawler_opened"
+    scroll_index = events.index(("scroll_effect", False))
+    sleep_index = next(index for index, event in enumerate(events) if event[0] == "sleep")
+    close_index = events.index(("close", "crawler-owned"))
+    assert events[sleep_index][1] == pytest.approx(30.0)
+    assert scroll_index < sleep_index < close_index
     assert page.closed is True
 
 
@@ -139,7 +143,7 @@ async def test_xhs_context_cleanup_waits_for_unexpected_tab() -> None:
     install_fake_clock(crawler, events)
     crawler.browser_context = context
     crawler.context_page = primary
-    crawler._install_unexpected_page_guard()
+    crawler._install_new_page_guard()
 
     context.emit_page(popup)
     await crawler.close()
