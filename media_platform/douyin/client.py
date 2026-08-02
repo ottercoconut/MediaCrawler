@@ -43,6 +43,15 @@ from .help import *
 from .search_safety import decode_douyin_json_body, validate_douyin_search_response
 
 
+FIRST_PAGE_VISIBLE_FALLBACK_REASONS = {
+    "search_verify_check",
+    "invalid_stream_chunk_header",
+    "invalid_stream_chunk_size",
+    "truncated_stream_chunk",
+    "invalid_stream_json",
+}
+
+
 class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
 
     def __init__(
@@ -498,15 +507,15 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         )
         if endpoint.endswith("/stream/"):
             query_params["need_filter_settings"] = "1"
-        response = await self.get(
-            endpoint,
-            query_params,
-            headers=headers,
-        )
         try:
+            response = await self.get(
+                endpoint,
+                query_params,
+                headers=headers,
+            )
             return validate_douyin_search_response(response)
         except SearchResponseError as exc:
-            if exc.reason != "search_verify_check":
+            if exc.reason not in FIRST_PAGE_VISIBLE_FALLBACK_REASONS:
                 raise
             fallback = await self._build_visible_first_page_fallback(
                 keyword=keyword,

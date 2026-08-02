@@ -337,9 +337,11 @@ async def test_latest_non_verify_browser_response_wins_over_prefetch_verify(
     assert response["extra"]["logid"] == "healthy-search-id"
 
 
+@pytest.mark.parametrize("failure_reason", ["search_verify_check", "invalid_stream_json"])
 @pytest.mark.asyncio
 async def test_visible_first_page_rebuild_requires_healthy_next_page(
     monkeypatch,
+    failure_reason,
 ) -> None:
     next_page_payload = (
         b'{"status_code":0,"data":[{"aweme_info":{"aweme_id":"456"}}],'
@@ -359,7 +361,9 @@ async def test_visible_first_page_rebuild_requires_healthy_next_page(
         FakeBrowserResponse(next_page_payload, url=next_page_url)
     )
 
-    async def verify_first_page(uri, params=None, headers=None):
+    async def unreadable_first_page(uri, params=None, headers=None):
+        if failure_reason == "invalid_stream_json":
+            raise SearchResponseError(failure_reason)
         return {
             "status_code": 0,
             "data": [],
@@ -370,13 +374,38 @@ async def test_visible_first_page_rebuild_requires_healthy_next_page(
     async def fake_detail(aweme_id: str):
         return {"aweme_id": aweme_id, "images": [{"url_list": ["https://img.test/1"]}]}
 
-    monkeypatch.setattr(client, "get", verify_first_page)
+    monkeypatch.setattr(client, "get", unreadable_first_page)
     monkeypatch.setattr(client, "get_video_by_id", fake_detail)
     response = await client.search_info_by_keyword(keyword="青岛海滨旅游")
     assert len(response["data"]) == 10
     assert response["data"][0]["aweme_info"]["aweme_id"] == "100"
     assert response["has_more"] == 1
     assert response["extra"]["logid"] == "first-page-search-id"
+
+
+@pytest.mark.asyncio
+async def test_visible_first_page_rebuild_does_not_mask_business_error(
+    monkeypatch,
+) -> None:
+    client = DouYinClient(
+        headers={"User-Agent": "test-agent"},
+        playwright_page=FakeWaterfallPage(),
+        cookie_dict={},
+    )
+
+    async def business_error(uri, params=None, headers=None):
+        raise SearchResponseError("search_business_status_nonzero")
+
+    async def forbidden_fallback(**kwargs):
+        raise AssertionError("business response errors must not use visible-page fallback")
+
+    monkeypatch.setattr(client, "get", business_error)
+    monkeypatch.setattr(client, "_build_visible_first_page_fallback", forbidden_fallback)
+
+    with pytest.raises(SearchResponseError) as raised:
+        await client.search_info_by_keyword(keyword="青岛海滨旅游")
+
+    assert raised.value.reason == "search_business_status_nonzero"
 
 
 @pytest.mark.asyncio
