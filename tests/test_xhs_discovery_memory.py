@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import config
+from playwright.async_api import Error as PlaywrightError
 from media_platform.xhs import core as xhs_core
 from media_platform.xhs.core import XiaoHongShuCrawler
 
@@ -150,3 +151,32 @@ async def test_top_refresh_uses_fresh_search_id_before_saved_frontier(monkeypatc
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
     assert stopped["details"]["discovery_phase"] == "refresh"
+
+
+@pytest.mark.asyncio
+async def test_browser_context_close_is_recorded_as_resumable_runtime_failure(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[{"id": "new-note"}],
+    )
+    crawler.enrich_note_creator = AsyncMock(
+        side_effect=PlaywrightError(
+            "BrowserContext.new_page: Target page, context or browser has been closed"
+        )
+    )
+
+    await crawler.search()
+
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == "browser_context_closed"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["batch_complete"] is False

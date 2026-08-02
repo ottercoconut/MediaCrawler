@@ -30,6 +30,7 @@ from urllib.parse import quote
 from playwright.async_api import (
     BrowserContext,
     BrowserType,
+    Error as PlaywrightError,
     Page,
     Playwright,
     TimeoutError as PlaywrightTimeoutError,
@@ -1062,6 +1063,28 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         )
                         accumulator.mark_runtime_failed(
                             "search_or_detail_request_failed",
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            resume_page=requested_page,
+                            resume_cursor=search_id,
+                            discovery_phase=discovery_phase,
+                        )
+                        break
+                    except PlaywrightError as exc:
+                        detail = (
+                            "browser_context_closed"
+                            if (
+                                exc.__class__.__name__ == "TargetClosedError"
+                                or "context or browser has been closed" in str(exc).lower()
+                            )
+                            else "browser_runtime_failed"
+                        )
+                        utils.logger.error(
+                            "[XiaoHongShuCrawler.search] Browser runtime error on "
+                            f"page {requested_page}: {exc!r}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            detail,
                             source_page=requested_page,
                             source_cursor=search_id,
                             resume_page=requested_page,
