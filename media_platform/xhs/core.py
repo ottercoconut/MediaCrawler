@@ -707,6 +707,108 @@ class XiaoHongShuCrawler(AbstractCrawler):
             await asyncio.sleep(2)
         return False
 
+    @staticmethod
+    def _request_failure_exception(exc: BaseException) -> BaseException:
+        """Return the request exception hidden by tenacity, when available."""
+        if not isinstance(exc, RetryError):
+            return exc
+        try:
+            nested = exc.last_attempt.exception()
+        except Exception:
+            nested = None
+        return nested if isinstance(nested, BaseException) else exc
+
+    @classmethod
+    def _is_login_expired_failure(cls, exc: BaseException) -> bool:
+        nested = cls._request_failure_exception(exc)
+        text = str(nested).lower()
+        return isinstance(nested, DataFetchError) and any(
+            marker in text
+            for marker in (
+                "登录已过期",
+                "登录状态已失效",
+                "登录失效",
+                "login expired",
+                "login has expired",
+                "session expired",
+            )
+        )
+
+    async def _wait_for_midrun_login_recovery(self, keyword: str) -> bool:
+        """Keep the headed browser open while the operator restores an expired login."""
+        wait_seconds = self._env_int("TRIPPOSTCOLLECT_XHS_LOGIN_WAIT_SECONDS", 0)
+        if wait_seconds <= 0:
+            return False
+
+        utils.logger.warning(
+            "[XiaoHongShuCrawler] Xiaohongshu login expired during search; "
+            f"keeping every browser tab open for up to {wait_seconds}s so the "
+            "operator can complete login/security verification."
+        )
+        await self._activate_latest_xhs_page()
+        try:
+            await self.context_page.bring_to_front()
+        except Exception:
+            pass
+        try:
+            await self.context_page.reload(wait_until="domcontentloaded", timeout=30_000)
+        except Exception as exc:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] Could not refresh the visible page before "
+                f"manual login recovery; leaving it open: {type(exc).__name__}: {exc}"
+            )
+
+        started = time.monotonic()
+        last_print = 0.0
+        last_pong = -10.0
+        while time.monotonic() - started < wait_seconds:
+            await self._activate_latest_xhs_page()
+            try:
+                await self.context_page.bring_to_front()
+            except Exception:
+                pass
+
+            elapsed = time.monotonic() - started
+            profile_ui = await self._profile_ui_visible()
+            if profile_ui and elapsed - last_pong >= 5.0:
+                last_pong = elapsed
+                await self.xhs_client.update_cookies(
+                    browser_context=self.browser_context,
+                    urls=self.cookie_urls,
+                )
+                if await self.xhs_client.pong():
+                    search_url = f"{self.index_url}/search_result?keyword={quote(keyword)}"
+                    await self._goto_with_deadline(
+                        self.context_page,
+                        search_url,
+                        stage="midrun_login_recovered",
+                    )
+                    await self.xhs_client.update_cookies(
+                        browser_context=self.browser_context,
+                        urls=self.cookie_urls,
+                    )
+                    await self._write_storage_state()
+                    utils.logger.info(
+                        "[XiaoHongShuCrawler] Mid-run login recovery confirmed; "
+                        "retrying the same search page."
+                    )
+                    return True
+
+            if elapsed - last_print >= 10.0:
+                checkpoint_markers = await self._visible_checkpoint_markers()
+                utils.logger.info(
+                    "[XiaoHongShuCrawler] Waiting for mid-run Xiaohongshu login "
+                    f"recovery: profile_ui={profile_ui}, visible={checkpoint_markers}"
+                )
+                last_print = elapsed
+            await asyncio.sleep(2)
+
+        utils.logger.error(
+            "[XiaoHongShuCrawler] Mid-run login/security verification timed out; "
+            "the current source page will remain the recovery frontier."
+        )
+        return False
+
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
         if config.ENABLE_IP_PROXY:
@@ -1057,9 +1159,26 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         page = requested_page + 1
                         phase_batches += 1
                         await self._guarded_pause("search_page", 12.0, 30.0)
-                    except DataFetchError:
+                    except (DataFetchError, RetryError) as exc:
+                        if self._is_login_expired_failure(exc):
+                            if await self._wait_for_midrun_login_recovery(keyword):
+                                continue
+                            utils.logger.error(
+                                "[XiaoHongShuCrawler.search] Login remained expired "
+                                f"on page {requested_page}."
+                            )
+                            accumulator.mark_runtime_failed(
+                                "login_required",
+                                source_page=requested_page,
+                                source_cursor=search_id,
+                                resume_page=requested_page,
+                                resume_cursor=search_id,
+                                discovery_phase=discovery_phase,
+                            )
+                            break
                         utils.logger.error(
-                            "[XiaoHongShuCrawler.search] Get note detail error"
+                            "[XiaoHongShuCrawler.search] Search or note detail "
+                            f"request failed: {self._request_failure_exception(exc)!r}"
                         )
                         accumulator.mark_runtime_failed(
                             "search_or_detail_request_failed",

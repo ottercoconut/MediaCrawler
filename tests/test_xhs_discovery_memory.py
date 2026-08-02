@@ -8,8 +8,10 @@ import pytest
 
 import config
 from playwright.async_api import Error as PlaywrightError
+from tenacity import Future, RetryError
 from media_platform.xhs import core as xhs_core
 from media_platform.xhs.core import XiaoHongShuCrawler
+from media_platform.xhs.exception import DataFetchError
 
 
 class SearchClient:
@@ -20,6 +22,19 @@ class SearchClient:
     async def get_note_by_keyword(self, **kwargs):
         self.calls.append(kwargs)
         return {"items": self.items, "has_more": True}
+
+
+class LoginExpiredSearchClient:
+    def __init__(self, *, recover: bool):
+        self.recover = recover
+        self.calls = []
+
+    async def get_note_by_keyword(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.recover or len(self.calls) == 1:
+            failure = DataFetchError("登录已过期")
+            raise RetryError(Future.construct(3, failure, has_exception=True))
+        return {"items": [], "has_more": False}
 
 
 def valid_note(note_id: str) -> dict:
@@ -177,6 +192,58 @@ async def test_browser_context_close_is_recorded_as_resumable_runtime_failure(
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
     assert stopped["details"]["stop_reason"] == "runtime_failed"
     assert stopped["details"]["stop_detail"] == "browser_context_closed"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["batch_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_wrapped_login_expiry_waits_and_retries_same_search_page(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[],
+    )
+    crawler.xhs_client = LoginExpiredSearchClient(recover=True)
+    crawler._wait_for_midrun_login_recovery = AsyncMock(return_value=True)
+
+    await crawler.search()
+
+    assert [call["page"] for call in crawler.xhs_client.calls] == [3, 3]
+    crawler._wait_for_midrun_login_recovery.assert_awaited_once_with("青岛旅游")
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
+    assert stopped["details"]["stop_detail"] == "has_more_false"
+
+
+@pytest.mark.asyncio
+async def test_wrapped_login_expiry_timeout_keeps_current_page_as_frontier(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[],
+    )
+    crawler.xhs_client = LoginExpiredSearchClient(recover=False)
+    crawler._wait_for_midrun_login_recovery = AsyncMock(return_value=False)
+
+    await crawler.search()
+
+    assert [call["page"] for call in crawler.xhs_client.calls] == [3]
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == "login_required"
     assert stopped["details"]["resume_page"] == 3
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["batch_complete"] is False
