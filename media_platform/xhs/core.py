@@ -1323,6 +1323,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         Note: Must specify note_id, xsec_source, xsec_token
         """
         get_note_detail_task_list = []
+        detail_semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
         for full_note_url in config.XHS_SPECIFIED_NOTE_URL_LIST:
             note_url_info: NoteUrlInfo = parse_note_info_from_note_url(full_note_url)
             utils.logger.info(f"[XiaoHongShuCrawler.get_specified_notes] Parse note url info: {note_url_info}")
@@ -1330,7 +1331,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 note_id=note_url_info.note_id,
                 xsec_source=note_url_info.xsec_source,
                 xsec_token=note_url_info.xsec_token,
-                semaphore=asyncio.Semaphore(config.MAX_CONCURRENCY_NUM),
+                semaphore=detail_semaphore,
             )
             get_note_detail_task_list.append(crawler_task)
 
