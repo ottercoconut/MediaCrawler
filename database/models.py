@@ -175,6 +175,8 @@ class WeiboNote(Base):
     note_url = Column(Text, comment='笔记URL')
     image_list = Column(JSON, comment='图片URL列表')
     image_count = Column(Integer, comment='图片数量')
+    image_list_source = Column(Text, comment='正文图片权威来源字段')
+    image_assets = Column(JSON, comment='正文图片PID、URL与来源顺序')
     followers_count = Column(Text, comment='作者粉丝数')
     fans_count = Column(Text, comment='作者粉丝数兼容字段')
     followers_observed = Column(Integer, comment='响应中是否出现作者粉丝数字段')

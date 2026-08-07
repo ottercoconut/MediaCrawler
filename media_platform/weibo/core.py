@@ -26,7 +26,7 @@ import asyncio
 import os
 # import random  # Removed as we now use fixed config.CRAWLER_MAX_SLEEP_SEC intervals
 from asyncio import Task
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from urllib.parse import quote
 
 from playwright.async_api import (
@@ -42,6 +42,7 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import weibo as weibo_store
 from tools import utils
+from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
 from tools.cdp_browser import CDPBrowserManager
@@ -52,6 +53,19 @@ from .exception import DataFetchError
 from .field import SearchType
 from .help import filter_search_result_card
 from .login import WeiboLogin
+
+
+class WeiboImageDownloadError(RuntimeError):
+    """A post image failed before the candidate could cross the safe frontier."""
+
+    def __init__(self, note_id: str, source_index: int, code: str):
+        super().__init__(
+            f"Weibo image download failed: note_id={note_id}, "
+            f"source_index={source_index}, code={code}"
+        )
+        self.note_id = note_id
+        self.source_index = source_index
+        self.code = code
 
 
 class WeiboCrawler(AbstractCrawler):
@@ -272,10 +286,20 @@ class WeiboCrawler(AbstractCrawler):
                                 )
                             )
                         )
-                        should_stop = accumulator.consider(note_id, valid=valid)
-                        note_id_list.append(note_id)
+                        if valid:
+                            try:
+                                await self.get_note_images(mblog)
+                            except WeiboImageDownloadError:
+                                accumulator.mark_runtime_failed(
+                                    "image_download_failed",
+                                    source_page=requested_page,
+                                    resume_page=requested_page,
+                                    discovery_phase=discovery_phase,
+                                )
+                                raise
                         await weibo_store.update_weibo_note(note_item)
-                        await self.get_note_images(mblog)
+                        note_id_list.append(note_id)
+                        should_stop = accumulator.consider(note_id, valid=valid)
                         if should_stop:
                             break
 
@@ -393,29 +417,64 @@ class WeiboCrawler(AbstractCrawler):
         :return:
         """
         if not config.ENABLE_GET_MEIDAS:
-            utils.logger.info(f"[WeiboCrawler.get_note_images] Crawling image mode is not enabled")
+            utils.logger.info("[WeiboCrawler.get_note_images] Crawling image mode is not enabled")
             return
 
-        pics: List = mblog.get("pics")
-        if not pics:
+        note_id = str(mblog.get("id") or "")
+        image_assets = weibo_store._weibo_pic_assets(mblog)
+        if not image_assets:
             return
-        for pic in pics:
-            if isinstance(pic, str):
-                url = pic
-                pid = url.split("/")[-1].split(".")[0]
-            elif isinstance(pic, dict):
-                url = pic.get("url")
-                pid = pic.get("pid", "")
-            else:
-                continue
-            if not url:
-                continue
-            content = await self.wb_client.get_note_image(url)
+        fetched_assets: List[Dict] = []
+        for asset in image_assets:
+            content = await self.wb_client.get_note_image(asset["url"])
             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-            utils.logger.info(f"[WeiboCrawler.get_note_images] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching image")
-            if content != None:
-                extension_file_name = url.split(".")[-1]
-                await weibo_store.update_weibo_note_image(pid, content, extension_file_name)
+            utils.logger.info(
+                f"[WeiboCrawler.get_note_images] Sleeping for "
+                f"{config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching image"
+            )
+            if content is None:
+                failure = {
+                    **asset,
+                    "attempts": 1,
+                    "http_status": None,
+                    "error_code": "image_download_retryable",
+                }
+                await weibo_store.record_weibo_note_image_failure(note_id, failure)
+                raise WeiboImageDownloadError(
+                    note_id,
+                    int(asset["source_index"]),
+                    "image_download_retryable",
+                )
+            fetched_assets.append(
+                {
+                    **asset,
+                    "content": content,
+                    "attempts": 1,
+                    "http_status": 200,
+                }
+            )
+        try:
+            await weibo_store.update_weibo_note_images(note_id, fetched_assets)
+        except ImageStagingError as exc:
+            source_index = int(exc.source_index or 0)
+            failed_asset = next(
+                (
+                    asset
+                    for asset in image_assets
+                    if int(asset["source_index"]) == source_index
+                ),
+                image_assets[0],
+            )
+            await weibo_store.record_weibo_note_image_failure(
+                note_id,
+                {
+                    **failed_asset,
+                    "attempts": 1,
+                    "http_status": 200,
+                    "error_code": exc.code,
+                },
+            )
+            raise WeiboImageDownloadError(note_id, source_index, exc.code) from exc
 
     async def get_creators_and_notes(self) -> None:
         """

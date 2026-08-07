@@ -70,6 +70,32 @@ def _weibo_pic_urls(mblog: Dict) -> List[str]:
     return urls
 
 
+def _weibo_pic_assets(mblog: Dict) -> List[Dict]:
+    """Return authoritative body-image metadata in the same order as image_list."""
+
+    assets: List[Dict] = []
+    seen = set()
+    pics = mblog.get("pics") or []
+    if not isinstance(pics, list):
+        return assets
+    for pic in pics:
+        url = _weibo_pic_url(pic)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        pid = ""
+        if isinstance(pic, dict):
+            pid = str(pic.get("pid") or pic.get("picture_id") or "").strip()
+        assets.append(
+            {
+                "pid": pid,
+                "url": url,
+                "source_index": len(assets),
+            }
+        )
+    return assets
+
+
 class WeibostoreFactory:
     STORES = {
         "csv": WeiboCsvStoreImplement,
@@ -122,7 +148,8 @@ async def update_weibo_note(note_item: Dict):
     note_id = mblog.get("id")
     content_text = mblog.get("text")
     clean_text = re.sub(r"<.*?>", "", content_text)
-    image_list = _weibo_pic_urls(mblog)
+    image_assets = _weibo_pic_assets(mblog)
+    image_list = [asset["url"] for asset in image_assets]
     followers_count = _first_present(
         user_info.get("followers_count"),
         user_info.get("followers_count_str"),
@@ -148,6 +175,8 @@ async def update_weibo_note(note_item: Dict):
         "note_url": f"https://m.weibo.cn/detail/{note_id}",
         "image_list": image_list,
         "image_count": len(image_list),
+        "image_list_source": "mblog.pics",
+        "image_assets": image_assets,
 
         # 创作者信息（匿名化/脱敏，不含原始 user_id/avatar/gender/profile_url/ip_location）
         "creator_hash": anonymize_user_id(user_info.get("id")),
@@ -215,18 +244,24 @@ async def update_weibo_note_comment(note_id: str, comment_item: Dict):
     await WeibostoreFactory.create_store().store_comment(comment_item=save_comment_item)
 
 
-async def update_weibo_note_image(picid: str, pic_content, extension_file_name):
+async def update_weibo_note_images(note_id: str, image_content_items: List[Dict]):
     """
-    Save weibo note image to local
+    Atomically save all body images for one Weibo note and write its manifest rows.
+
     Args:
-        picid:
-        pic_content:
-        extension_file_name:
+        note_id: stable Weibo post identity
+        image_content_items: ordered pid/url/content mappings
 
     Returns:
-
+        Downloaded schema-v1 manifest rows.
     """
-    await WeiboStoreImage().store_image({"pic_id": picid, "pic_content": pic_content, "extension_file_name": extension_file_name})
+    return await WeiboStoreImage().store_post_images(note_id, image_content_items)
+
+
+async def record_weibo_note_image_failure(note_id: str, image_content_item: Dict):
+    """Write one failed manifest row without creating a success image file."""
+
+    return await WeiboStoreImage().record_failure(note_id, image_content_item)
 
 
 async def save_creator(user_id: str, user_info: Dict):
