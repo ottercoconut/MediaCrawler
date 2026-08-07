@@ -35,6 +35,7 @@ def decode_douyin_json_body(body: bytes) -> Dict[str, Any]:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
         payload_bytes = bytearray()
+        raw_chunks: list[bytes] = []
         cursor = 0
         while True:
             line_end = body.find(b"\r\n", cursor)
@@ -51,12 +52,53 @@ def decode_douyin_json_body(body: bytes) -> Dict[str, Any]:
             chunk_end = cursor + chunk_size
             if chunk_end > len(body) or body[chunk_end:chunk_end + 2] != b"\r\n":
                 raise SearchResponseError("truncated_stream_chunk")
-            payload_bytes.extend(body[cursor:chunk_end])
+            chunk = body[cursor:chunk_end]
+            raw_chunks.append(chunk)
+            payload_bytes.extend(chunk)
             cursor = chunk_end + 2
         try:
             payload = json.loads(payload_bytes)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise SearchResponseError("invalid_stream_json") from exc
+            documents = []
+            try:
+                for chunk in raw_chunks:
+                    document = json.loads(chunk)
+                    if not isinstance(document, dict):
+                        raise TypeError("stream document is not an object")
+                    documents.append(document)
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as chunk_exc:
+                raise SearchResponseError("invalid_stream_json") from chunk_exc
+            if not documents:
+                raise SearchResponseError("invalid_stream_json") from exc
+            payload = dict(documents[-1])
+            merged_data = []
+            verify_search_nil_info = None
+            for document in documents:
+                document_data = document.get("data")
+                if document_data is None:
+                    continue
+                if not isinstance(document_data, list):
+                    raise SearchResponseError("invalid_stream_json") from exc
+                merged_data.extend(document_data)
+                if document.get("status_code") not in (None, 0, "0"):
+                    payload["status_code"] = document["status_code"]
+                search_nil_info = document.get("search_nil_info")
+                if (
+                    isinstance(search_nil_info, dict)
+                    and search_nil_info.get("search_nil_type") == "verify_check"
+                ):
+                    verify_search_nil_info = search_nil_info
+            payload["data"] = merged_data
+            if verify_search_nil_info is not None:
+                payload["search_nil_info"] = verify_search_nil_info
+            for document in reversed(documents):
+                if "has_more" in document:
+                    payload["has_more"] = document["has_more"]
+                    break
+            for document in reversed(documents):
+                if isinstance(document.get("extra"), dict):
+                    payload["extra"] = document["extra"]
+                    break
     if not isinstance(payload, dict):
         raise SearchResponseError("search_response_not_object")
     return payload

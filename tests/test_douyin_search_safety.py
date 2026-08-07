@@ -217,6 +217,78 @@ def test_raw_chunk_framed_stream_response_is_decoded() -> None:
     }
 
 
+def test_multi_document_chunked_stream_is_merged_in_source_order() -> None:
+    first = json.dumps(
+        {
+            "status_code": 0,
+            "data": [{"aweme_info": {"aweme_id": "first"}}],
+            "has_more": 1,
+            "extra": {"logid": "first-log"},
+        },
+        separators=(",", ":"),
+    ).encode()
+    second = json.dumps(
+        {
+            "status_code": 0,
+            "data": [{"aweme_info": {"aweme_id": "second"}}],
+            "has_more": 1,
+            "extra": {"logid": "stable-search-id"},
+        },
+        separators=(",", ":"),
+    ).encode()
+    framed = (
+        f"{len(first):x}\r\n".encode()
+        + first
+        + b"\r\n"
+        + f"{len(second):x}\r\n".encode()
+        + second
+        + b"\r\n0\r\n\r\n"
+    )
+
+    assert decode_douyin_json_body(framed) == {
+        "status_code": 0,
+        "data": [
+            {"aweme_info": {"aweme_id": "first"}},
+            {"aweme_info": {"aweme_id": "second"}},
+        ],
+        "has_more": 1,
+        "extra": {"logid": "stable-search-id"},
+    }
+
+
+def test_multi_document_chunked_stream_preserves_verify_check() -> None:
+    first = json.dumps(
+        {
+            "status_code": 0,
+            "data": [],
+            "has_more": 0,
+            "search_nil_info": {"search_nil_type": "verify_check"},
+        },
+        separators=(",", ":"),
+    ).encode()
+    second = json.dumps(
+        {
+            "status_code": 0,
+            "data": [],
+            "has_more": 0,
+            "search_nil_info": {"search_nil_type": "normal_empty"},
+        },
+        separators=(",", ":"),
+    ).encode()
+    framed = (
+        f"{len(first):x}\r\n".encode()
+        + first
+        + b"\r\n"
+        + f"{len(second):x}\r\n".encode()
+        + second
+        + b"\r\n0\r\n\r\n"
+    )
+
+    with pytest.raises(SearchResponseError) as raised:
+        validate_douyin_search_response(decode_douyin_json_body(framed))
+    assert raised.value.reason == "search_verify_check"
+
+
 @pytest.mark.asyncio
 async def test_direct_request_preserves_search_decode_failure(monkeypatch) -> None:
     client = DouYinClient(

@@ -396,7 +396,12 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                 utils.logger.error(f"request params incrr, response.text: {response.text}")
                 raise Exception("account blocked")
             return decode_douyin_json_body(response.content)
-        except SearchResponseError:
+        except SearchResponseError as exc:
+            utils.logger.error(
+                "[DouYinClient.request] search response decode failed, "
+                f"reason: {exc.reason}, bytes: {len(response.content)}, "
+                f"prefix_hex: {response.content[:48].hex()}"
+            )
             raise
         except Exception as e:
             raise DataFetchError(f"{e}, {response.text}")
