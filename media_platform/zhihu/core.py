@@ -41,6 +41,7 @@ from model.m_zhihu import ZhihuContent, ZhihuCreator
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import zhihu as zhihu_store
 from tools import utils
+from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
 from tools.cdp_browser import CDPBrowserManager
@@ -50,6 +51,19 @@ from .client import ZhiHuClient
 from .exception import DataFetchError
 from .help import ZhihuExtractor, judge_zhihu_url, merge_search_content_detail
 from .login import ZhiHuLogin
+
+
+class ZhihuImageDownloadError(RuntimeError):
+    """A Zhihu body image failed before its content crossed the safe frontier."""
+
+    def __init__(self, content_id: str, source_index: int, code: str):
+        super().__init__(
+            f"Zhihu image download failed: content_id={content_id}, "
+            f"source_index={source_index}, code={code}"
+        )
+        self.content_id = content_id
+        self.source_index = source_index
+        self.code = code
 
 
 class ZhihuCrawler(AbstractCrawler):
@@ -131,7 +145,10 @@ class ZhihuCrawler(AbstractCrawler):
         content: ZhihuContent,
     ) -> ZhihuContent:
         """Fetch the full answer/article when search HTML has no content image."""
-        if content.image_list or content.content_type not in {
+        if content.image_list:
+            content.content_detail_status = "detail_observed"
+            return content
+        if content.content_type not in {
             constant.ANSWER_NAME,
             constant.ARTICLE_NAME,
         }:
@@ -355,22 +372,32 @@ class ZhihuCrawler(AbstractCrawler):
                         stored_contents: List[ZhihuContent] = []
                         for content in content_list:
                             content = await self.enrich_search_content_detail(content)
+                            image_ready = bool(
+                                content.content_detail_status == "detail_observed"
+                                and zhihu_store.zhihu_content_image_assets(content)
+                            )
                             valid = bool(
                                 content.content_id
+                                and content.content_type in {
+                                    constant.ANSWER_NAME,
+                                    constant.ARTICLE_NAME,
+                                }
                                 and (content.content_text or content.title)
                                 and content.created_time
                                 and content.creator_hash
                                 and content.user_nickname
-                                and content.image_list
+                                and image_ready
                                 and content.followers_observed
                             )
+                            if valid:
+                                await self.get_content_images(content)
+                            processed_count += 1
+                            stored_contents.append(content)
+                            await zhihu_store.update_zhihu_content(content)
                             should_stop = accumulator.consider(
                                 str(content.content_id or ""),
                                 valid=valid,
                             )
-                            processed_count += 1
-                            stored_contents.append(content)
-                            await zhihu_store.update_zhihu_content(content)
                             if should_stop:
                                 break
 
@@ -385,6 +412,18 @@ class ZhihuCrawler(AbstractCrawler):
                             count_stagnation=discovery_phase == "frontier",
                         ):
                             break
+                    except ZhihuImageDownloadError as exc:
+                        utils.logger.error(
+                            "[ZhihuCrawler.search] Image materialization failed "
+                            f"on page {requested_page}: {exc!r}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            "image_download_failed",
+                            source_page=requested_page,
+                            resume_page=requested_page,
+                            discovery_phase=discovery_phase,
+                        )
+                        return
                     except DataFetchError:
                         utils.logger.error("[ZhihuCrawler.search] Search content error")
                         accumulator.mark_runtime_failed(
@@ -637,9 +676,67 @@ class ZhihuCrawler(AbstractCrawler):
 
             note_detail = cast(ZhihuContent, note_detail)  # only for type check
             need_get_comment_notes.append(note_detail)
+            if zhihu_store.zhihu_content_image_assets(note_detail):
+                await self.get_content_images(note_detail)
             await zhihu_store.update_zhihu_content(note_detail)
 
         await self.batch_get_content_comments(need_get_comment_notes)
+
+    async def get_content_images(self, content: ZhihuContent) -> None:
+        """Download only observed answer/article body images."""
+
+        if not config.ENABLE_GET_MEIDAS:
+            return
+        content_id = str(content.content_id or "")
+        image_assets = zhihu_store.zhihu_content_image_assets(content)
+        if not image_assets:
+            return
+        fetched_assets: List[Dict] = []
+        for asset in image_assets:
+            payload = await self.zhihu_client.get_content_image(
+                asset["url"], referer=content.content_url
+            )
+            await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+            if payload is None:
+                await zhihu_store.record_zhihu_content_image_failure(
+                    content_id,
+                    {
+                        **asset,
+                        "attempts": 1,
+                        "http_status": None,
+                        "error_code": "image_download_retryable",
+                    },
+                )
+                raise ZhihuImageDownloadError(
+                    content_id,
+                    int(asset["source_index"]),
+                    "image_download_retryable",
+                )
+            fetched_assets.append(
+                {**asset, "content": payload, "attempts": 1, "http_status": 200}
+            )
+        try:
+            await zhihu_store.update_zhihu_content_images(content_id, fetched_assets)
+        except ImageStagingError as exc:
+            source_index = int(exc.source_index or 0)
+            failed_asset = next(
+                (
+                    asset
+                    for asset in image_assets
+                    if int(asset["source_index"]) == source_index
+                ),
+                image_assets[0],
+            )
+            await zhihu_store.record_zhihu_content_image_failure(
+                content_id,
+                {
+                    **failed_asset,
+                    "attempts": 1,
+                    "http_status": 200,
+                    "error_code": exc.code,
+                },
+            )
+            raise ZhihuImageDownloadError(content_id, source_index, exc.code) from exc
 
     async def create_zhihu_client(self, httpx_proxy: Optional[str]) -> ZhiHuClient:
         """Create zhihu client"""

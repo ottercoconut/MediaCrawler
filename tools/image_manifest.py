@@ -27,6 +27,12 @@ FORMAT_METADATA = {
     "AVIF": ("avif", "image/avif"),
 }
 XHS_STABLE_PATH_MARKERS = ("/notes_pre_post/", "/notes_post/", "/notes/")
+ZHIMG_TRANSFORM_SUFFIX_RE = re.compile(
+    r"_(?:b|r|qhd|hd|xs|s|m|l|xl|xxl|original|watermark)"
+    r"\.(?:avif|gif|jpe?g|png|webp)$",
+    re.IGNORECASE,
+)
+RASTER_SUFFIX_RE = re.compile(r"\.(?:avif|gif|jpe?g|png|webp)$", re.IGNORECASE)
 
 
 class ImageStagingError(ValueError):
@@ -96,6 +102,17 @@ def xhs_source_asset_key(source_url: str) -> str:
             identity = f"{marker}{parsed.path.split(marker, 1)[1]}"
             break
     return f"xhs:path:{identity}"
+
+
+def zhihu_source_asset_key(source_url: str) -> str:
+    normalized = normalize_image_url(source_url)
+    parsed = urlsplit(normalized)
+    logical_path = ZHIMG_TRANSFORM_SUFFIX_RE.sub("", parsed.path)
+    if parsed.hostname.lower().endswith("zhimg.com"):
+        identity = RASTER_SUFFIX_RE.sub("", logical_path)
+    else:
+        identity = f"{parsed.hostname.lower()}{logical_path}"
+    return f"zhihu:urlsha256:{sha256(identity.encode('utf-8')).hexdigest()}"
 
 
 def inspect_image_bytes(content: bytes) -> InspectedImage:

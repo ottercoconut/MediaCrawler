@@ -20,6 +20,7 @@
 
 # -*- coding: utf-8 -*-
 from typing import List
+from urllib.parse import urlsplit
 
 import config
 from base.base_crawler import AbstractStore
@@ -32,7 +33,42 @@ from ._store_impl import (ZhihuCsvStoreImplement,
                                           ZhihuMongoStoreImplement,
                                           ZhihuExcelStoreImplement)
 from tools import utils
+from tools.image_manifest import ImageStagingError, normalize_image_url, zhihu_source_asset_key
 from var import source_keyword_var
+from .zhihu_store_media import ZhihuStoreImage
+
+
+def zhihu_content_image_assets(content_item: ZhihuContent) -> List[dict]:
+    """Project only answer/article body images from an observed content body."""
+
+    if content_item.content_type not in {"answer", "article"}:
+        return []
+    if content_item.content_detail_status != "detail_observed":
+        return []
+    excluded_urls = set()
+    for value in (content_item.avatar_url, content_item.author_profile_url):
+        try:
+            excluded_urls.add(normalize_image_url(value))
+        except ImageStagingError:
+            continue
+    assets: List[dict] = []
+    seen = set()
+    for value in content_item.image_list:
+        try:
+            url = normalize_image_url(value)
+        except ImageStagingError:
+            continue
+        path = urlsplit(url).path.lower().rstrip("/")
+        if url in excluded_urls or path.endswith("/equation") or "/equation/" in f"{path}/":
+            continue
+        asset_key = zhihu_source_asset_key(url)
+        if asset_key in seen:
+            continue
+        seen.add(asset_key)
+        assets.append(
+            {"url": url, "source_index": len(assets), "source_asset_key": asset_key}
+        )
+    return assets
 
 
 class ZhihuStoreFactory:
@@ -79,10 +115,27 @@ async def update_zhihu_content(content_item: ZhihuContent):
 
     """
     content_item.source_keyword = source_keyword_var.get()
+    content_item.image_assets = zhihu_content_image_assets(content_item)
+    content_item.image_list = [asset["url"] for asset in content_item.image_assets]
+    content_item.image_count = len(content_item.image_list)
+    if content_item.image_assets:
+        content_item.image_list_source = "content_html"
     local_db_item = content_item.model_dump()
     local_db_item.update({"last_modify_ts": utils.get_current_timestamp()})
     utils.logger.info(f"[store.zhihu.update_zhihu_content] zhihu content: {local_db_item}")
     await ZhihuStoreFactory.create_store().store_content(local_db_item)
+
+
+async def update_zhihu_content_images(content_id: str, image_content_items: List[dict]):
+    """Atomically save all body images for one Zhihu answer/article."""
+
+    return await ZhihuStoreImage().store_post_images(content_id, image_content_items)
+
+
+async def record_zhihu_content_image_failure(content_id: str, image_content_item: dict):
+    """Write one failed image manifest row without success metadata."""
+
+    return await ZhihuStoreImage().record_failure(content_id, image_content_item)
 
 
 

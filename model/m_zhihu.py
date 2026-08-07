@@ -39,6 +39,8 @@ class ZhihuContent(BaseModel):
     comment_count: int = Field(default=0, description="Comment count")
     image_list: list[str] = Field(default_factory=list, description="Content image URLs")
     image_count: int = Field(default=0, description="Content image count")
+    image_list_source: str = Field(default="", description="Authoritative body image source")
+    image_assets: list[dict] = Field(default_factory=list, description="Ordered body image assets")
     content_detail_status: str = Field(
         default="search_payload",
         description="Detail enrichment status for search results",

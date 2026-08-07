@@ -186,6 +186,35 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
         params = {"include": "email,is_active,is_bind_phone"}
         return await self.get("/api/v4/me", params)
 
+    async def get_content_image(self, image_url: str, *, referer: str) -> bytes | None:
+        """Fetch one body image with the active proxy, Cookie and User-Agent session."""
+
+        headers = self.default_headers.copy()
+        headers["referer"] = referer or "https://www.zhihu.com/"
+        headers["accept"] = "image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.8"
+        try:
+            async with make_async_client(proxy=self.proxy) as client:
+                async with client.stream(
+                    "GET", image_url, timeout=self.timeout, headers=headers
+                ) as response:
+                    response.raise_for_status()
+                    chunks = []
+                    size = 0
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > 20 * 1024 * 1024:
+                            utils.logger.error(
+                                "[ZhiHuClient.get_content_image] image exceeded byte limit"
+                            )
+                            return None
+                        chunks.append(chunk)
+                    return b"".join(chunks) or None
+        except httpx.HTTPError as exc:
+            utils.logger.error(
+                f"[ZhiHuClient.get_content_image] {exc.__class__.__name__}: {exc}"
+            )
+            return None
+
     async def get_note_by_keyword(
         self,
         keyword: str,
