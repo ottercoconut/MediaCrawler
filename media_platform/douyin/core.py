@@ -21,7 +21,7 @@ import asyncio
 import os
 import random
 from asyncio import Task
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from playwright.async_api import (
@@ -37,6 +37,7 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
+from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import (
     AdaptiveAccumulator,
@@ -53,6 +54,19 @@ from .field import PublishTimeType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
 from .search_safety import inspect_empty_first_page
+
+
+class DouyinImageDownloadError(RuntimeError):
+    """A Douyin note image failed before the candidate safe frontier."""
+
+    def __init__(self, aweme_id: str, source_index: int, code: str):
+        super().__init__(
+            f"Douyin image download failed: aweme_id={aweme_id}, "
+            f"source_index={source_index}, code={code}"
+        )
+        self.aweme_id = aweme_id
+        self.source_index = source_index
+        self.code = code
 
 
 class DouYinCrawler(AbstractCrawler):
@@ -433,12 +447,30 @@ class DouYinCrawler(AbstractCrawler):
                                 )
                             )
                         )
-                        should_stop = accumulator.consider(aweme_id, valid=valid)
+                        if valid:
+                            try:
+                                await self.get_aweme_images(aweme_item=aweme_info)
+                            except DouyinImageDownloadError as exc:
+                                utils.logger.error(
+                                    "[DouYinCrawler.search] Image materialization failed: "
+                                    f"{exc!r}"
+                                )
+                                accumulator.mark_runtime_failed(
+                                    "image_download_failed",
+                                    source_page=requested_page,
+                                    source_offset=requested_offset,
+                                    source_cursor=requested_search_id,
+                                    resume_page=requested_page,
+                                    resume_offset=requested_offset,
+                                    resume_cursor=requested_search_id,
+                                    discovery_phase=discovery_phase,
+                                )
+                                return
+                        await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                         processed_count += 1
                         aweme_list.append(aweme_id)
                         page_aweme_list.append(aweme_id)
-                        await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
-                        await self.get_aweme_media(aweme_item=aweme_info)
+                        should_stop = accumulator.consider(aweme_id, valid=valid)
                         if should_stop:
                             break
 
@@ -804,7 +836,7 @@ class DouYinCrawler(AbstractCrawler):
 
     async def get_aweme_media(self, aweme_item: Dict):
         """
-        获取抖音媒体，自动判断媒体类型是短视频还是帖子图片并下载
+        Compatibility entrypoint for strict note-image-only downloads.
 
         Args:
             aweme_item (Dict): 抖音作品详情
@@ -812,15 +844,7 @@ class DouYinCrawler(AbstractCrawler):
         if not config.ENABLE_GET_MEIDAS:
             utils.logger.info(f"[DouYinCrawler.get_aweme_media] Crawling image mode is not enabled")
             return
-        # List of note urls. If it is a short video type, an empty list will be returned.
-        note_download_url: List[str] = douyin_store._extract_note_image_list(aweme_item)
-        # The video URL will always exist, but when it is a short video type, the file is actually an audio file.
-        video_download_url: str = douyin_store._extract_video_download_url(aweme_item)
-        # TODO: Douyin does not adopt the audio and video separation strategy, so the audio can be separated from the original video and will not be extracted for the time being.
-        if note_download_url:
-            await self.get_aweme_images(aweme_item)
-        else:
-            await self.get_aweme_video(aweme_item)
+        await self.get_aweme_images(aweme_item)
 
     async def get_aweme_images(self, aweme_item: Dict):
         """
@@ -831,23 +855,54 @@ class DouYinCrawler(AbstractCrawler):
         """
         if not config.ENABLE_GET_MEIDAS:
             return
-        aweme_id = aweme_item.get("aweme_id")
-        # List of note urls. If it is a short video type, an empty list will be returned.
-        note_download_url: List[str] = douyin_store._extract_note_image_list(aweme_item)
-
-        if not note_download_url:
+        aweme_id = str(aweme_item.get("aweme_id") or "")
+        image_assets = douyin_store._extract_note_image_assets(aweme_item)
+        if not image_assets:
             return
-        picNum = 0
-        for url in note_download_url:
-            if not url:
-                continue
-            content = await self.dy_client.get_aweme_media(url)
+        fetched_assets: List[Dict] = []
+        for asset in image_assets:
+            content = await self.dy_client.get_aweme_media(asset["url"])
             await asyncio.sleep(random.random())
             if content is None:
-                continue
-            extension_file_name = f"{picNum:>03d}.jpeg"
-            picNum += 1
-            await douyin_store.update_dy_aweme_image(aweme_id, content, extension_file_name)
+                await douyin_store.record_dy_aweme_image_failure(
+                    aweme_id,
+                    {
+                        **asset,
+                        "attempts": 1,
+                        "http_status": None,
+                        "error_code": "image_download_retryable",
+                    },
+                )
+                raise DouyinImageDownloadError(
+                    aweme_id,
+                    int(asset["source_index"]),
+                    "image_download_retryable",
+                )
+            fetched_assets.append(
+                {**asset, "content": content, "attempts": 1, "http_status": 200}
+            )
+        try:
+            await douyin_store.update_dy_aweme_images(aweme_id, fetched_assets)
+        except ImageStagingError as exc:
+            source_index = int(exc.source_index or 0)
+            failed_asset = next(
+                (
+                    asset
+                    for asset in image_assets
+                    if int(asset["source_index"]) == source_index
+                ),
+                image_assets[0],
+            )
+            await douyin_store.record_dy_aweme_image_failure(
+                aweme_id,
+                {
+                    **failed_asset,
+                    "attempts": 1,
+                    "http_status": 200,
+                    "error_code": exc.code,
+                },
+            )
+            raise DouyinImageDownloadError(aweme_id, source_index, exc.code) from exc
 
     async def get_aweme_video(self, aweme_item: Dict):
         """

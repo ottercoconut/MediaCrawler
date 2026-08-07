@@ -18,64 +18,77 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 import pathlib
-from typing import Dict
+from pathlib import Path
+from typing import Dict, List
 
 import aiofiles
 
 from base.base_crawler import AbstractStoreImage, AbstractStoreVideo
 from tools import utils
+from tools.image_manifest import (
+    ImageAsset,
+    douyin_source_asset_key,
+    failed_manifest_row,
+    stage_post_images,
+    upsert_manifest_rows_atomic,
+)
 import config
 
 
 class DouYinImage(AbstractStoreImage):
     def __init__(self):
         if config.SAVE_DATA_PATH:
-            self.image_store_path = f"{config.SAVE_DATA_PATH}/douyin/images"
+            self.save_data_root = Path(config.SAVE_DATA_PATH)
         else:
-            self.image_store_path = "data/douyin/images"
+            self.save_data_root = Path("data")
+        self.platform_root = self.save_data_root / "douyin"
+        self.image_store_path = self.platform_root / "images"
+        self.manifest_path = self.platform_root / "image_manifest.jsonl"
 
-    async def store_image(self, image_content_item: Dict):
-        """
-        store content
+    async def store_post_images(self, aweme_id: str, image_content_items: List[Dict]):
+        assets = [
+            ImageAsset(
+                source_index=int(item["source_index"]),
+                source_asset_key=douyin_source_asset_key(item.get("uri"), item["url"]),
+                source_url=item["url"],
+                content=item["content"],
+                attempts=int(item.get("attempts") or 1),
+                http_status=int(item.get("http_status") or 200),
+            )
+            for item in image_content_items
+        ]
+        rows = stage_post_images(
+            save_data_root=self.save_data_root,
+            platform_storage_key="douyin",
+            platform_key="douyin",
+            platform_post_id=aweme_id,
+            source_key="note_download_url",
+            assets=assets,
+        )
+        utils.logger.info(
+            f"[DouYinImage.store_post_images] saved {len(rows)} "
+            f"body images for aweme {aweme_id}"
+        )
+        return rows
 
-        Args:
-            image_content_item:
-
-        Returns:
-
-        """
-        await self.save_image(image_content_item.get("aweme_id"), image_content_item.get("pic_content"), image_content_item.get("extension_file_name"))
-
-    def make_save_file_name(self, aweme_id: str, extension_file_name: str) -> str:
-        """
-        make save file name by store type
-
-        Args:
-            aweme_id: aweme id
-            extension_file_name: image filename with extension
-
-        Returns:
-
-        """
-        return f"{self.image_store_path}/{aweme_id}/{extension_file_name}"
-
-    async def save_image(self, aweme_id: str, pic_content: str, extension_file_name):
-        """
-        save image to local
-
-        Args:
-            aweme_id: aweme id
-            pic_content: image content
-            extension_file_name: image filename with extension
-
-        Returns:
-
-        """
-        pathlib.Path(self.image_store_path + "/" + aweme_id).mkdir(parents=True, exist_ok=True)
-        save_file_name = self.make_save_file_name(aweme_id, extension_file_name)
-        async with aiofiles.open(save_file_name, 'wb') as f:
-            await f.write(pic_content)
-            utils.logger.info(f"[DouYinImageStoreImplement.save_image] save image {save_file_name} success ...")
+    async def record_failure(self, aweme_id: str, image_content_item: Dict):
+        row = failed_manifest_row(
+            platform_key="douyin",
+            platform_post_id=aweme_id,
+            source_key="note_download_url",
+            source_index=int(image_content_item["source_index"]),
+            source_asset_key=douyin_source_asset_key(
+                image_content_item.get("uri"), image_content_item["url"]
+            ),
+            source_url=image_content_item["url"],
+            attempts=int(image_content_item.get("attempts") or 1),
+            error_code=str(
+                image_content_item.get("error_code") or "image_download_retryable"
+            ),
+            http_status=image_content_item.get("http_status"),
+        )
+        upsert_manifest_rows_atomic(self.manifest_path, [row])
+        return row
 
 
 class DouYinVideo(AbstractStoreVideo):

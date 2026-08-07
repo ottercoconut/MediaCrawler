@@ -25,6 +25,7 @@ from typing import Any, List
 
 import config
 from var import source_keyword_var
+from tools.image_manifest import ImageStagingError, douyin_source_asset_key, normalize_image_url
 from tools.user_hash import anonymize_user_id, mask_nickname
 
 from ._store_impl import *
@@ -161,18 +162,46 @@ def _extract_note_image_list(aweme_detail: Dict) -> List[str]:
     Returns:
         List[str]: Note image list
     """
-    images_res: List[str] = []
+    return [asset["url"] for asset in _extract_note_image_assets(aweme_detail)]
+
+
+def _extract_note_image_assets(aweme_detail: Dict) -> List[Dict]:
+    """Choose one fresh signed URL per note image and preserve its stable URI."""
+
+    assets: List[Dict] = []
+    seen = set()
     images: List[Dict] = aweme_detail.get("images", [])
-
-    if not images:
+    if not isinstance(images, list):
         return []
-
     for image in images:
-        image_url_list = image.get("url_list", [])  # download_url_list has watermarked images, url_list has non-watermarked images
-        if image_url_list:
-            images_res.append(image_url_list[-1])
-
-    return images_res
+        if not isinstance(image, dict):
+            continue
+        image_url_list = image.get("url_list") or []
+        if not isinstance(image_url_list, list):
+            continue
+        url = next((str(value).strip() for value in reversed(image_url_list) if value), "")
+        try:
+            url = normalize_image_url(url)
+        except ImageStagingError:
+            continue
+        uri = _first_nonempty(
+            image.get("uri"),
+            image.get("image_uri"),
+            _nested_value(image, ("display_image", "uri"), ("origin_image", "uri")),
+        )
+        asset_key = douyin_source_asset_key(uri, url)
+        if asset_key in seen:
+            continue
+        seen.add(asset_key)
+        assets.append(
+            {
+                "uri": str(uri or ""),
+                "url": url,
+                "source_index": len(assets),
+                "source_asset_key": asset_key,
+            }
+        )
+    return assets
 
 
 def _extract_comment_image_list(comment_item: Dict) -> List[str]:
@@ -261,6 +290,7 @@ async def update_douyin_aweme(aweme_item: Dict):
     creator_profile = aweme_item.get("creator_profile") or {}
     author_stats = _normalized_author_stats(user_info, creator_profile)
     interact_info = aweme_item.get("statistics", {})
+    image_assets = _extract_note_image_assets(aweme_item)
     save_content_item = {
         "aweme_id": aweme_id,
         "aweme_type": str(aweme_item.get("aweme_type")),
@@ -286,9 +316,12 @@ async def update_douyin_aweme(aweme_item: Dict):
         "cover_url": _extract_content_cover_url(aweme_item),
         "video_download_url": _extract_video_download_url(aweme_item),
         "music_download_url": _extract_music_download_url(aweme_item),
-        "note_download_url": ",".join(_extract_note_image_list(aweme_item)),
+        "note_download_url": ",".join(asset["url"] for asset in image_assets),
         "source_keyword": source_keyword_var.get(),
     }
+    if config.SAVE_DATA_OPTION == "jsonl" and config.ENABLE_GET_MEIDAS:
+        save_content_item["image_assets"] = image_assets
+        save_content_item["image_list_source"] = "aweme.images"
     utils.logger.info(f"[store.douyin.update_douyin_aweme] douyin aweme id:{aweme_id}, title:{save_content_item.get('title')}")
     await DouyinStoreFactory.create_store().store_content(content_item=save_content_item)
 
@@ -331,19 +364,16 @@ async def save_creator(user_id: str, creator: Dict):
     return
 
 
-async def update_dy_aweme_image(aweme_id, pic_content, extension_file_name):
-    """
-    Update Douyin note image
-    Args:
-        aweme_id:
-        pic_content:
-        extension_file_name:
+async def update_dy_aweme_images(aweme_id: str, image_content_items: List[Dict]):
+    """Atomically save all body images for one Douyin note."""
 
-    Returns:
+    return await DouYinImage().store_post_images(aweme_id, image_content_items)
 
-    """
 
-    await DouYinImage().store_image({"aweme_id": aweme_id, "pic_content": pic_content, "extension_file_name": extension_file_name})
+async def record_dy_aweme_image_failure(aweme_id: str, image_content_item: Dict):
+    """Write one failed image manifest row without success metadata."""
+
+    return await DouYinImage().record_failure(aweme_id, image_content_item)
 
 
 async def update_dy_aweme_video(aweme_id, video_content, extension_file_name):

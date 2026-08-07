@@ -115,6 +115,14 @@ def zhihu_source_asset_key(source_url: str) -> str:
     return f"zhihu:urlsha256:{sha256(identity.encode('utf-8')).hexdigest()}"
 
 
+def douyin_source_asset_key(uri: str | None, source_url: str) -> str:
+    if uri not in (None, ""):
+        return f"douyin:uri:{str(uri).strip()}"
+    normalized = normalize_image_url(source_url)
+    digest = sha256(urlsplit(normalized).path.encode("utf-8")).hexdigest()
+    return f"douyin:urlsha256:{digest}"
+
+
 def inspect_image_bytes(content: bytes) -> InspectedImage:
     if not isinstance(content, bytes) or not content:
         raise ImageStagingError("image_non_raster_response", "image response is empty")
