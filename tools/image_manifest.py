@@ -26,6 +26,7 @@ FORMAT_METADATA = {
     "GIF": ("gif", "image/gif"),
     "AVIF": ("avif", "image/avif"),
 }
+XHS_STABLE_PATH_MARKERS = ("/notes_pre_post/", "/notes_post/", "/notes/")
 
 
 class ImageStagingError(ValueError):
@@ -84,6 +85,17 @@ def weibo_source_asset_key(pid: str | None, source_url: str) -> str:
     parsed = urlsplit(normalized)
     digest = sha256(f"{parsed.hostname.lower()}{parsed.path}".encode("utf-8")).hexdigest()
     return f"weibo:urlsha256:{digest}"
+
+
+def xhs_source_asset_key(source_url: str) -> str:
+    normalized = normalize_image_url(source_url)
+    parsed = urlsplit(normalized)
+    identity = f"{parsed.netloc.lower()}{parsed.path}"
+    for marker in XHS_STABLE_PATH_MARKERS:
+        if marker in parsed.path:
+            identity = f"{marker}{parsed.path.split(marker, 1)[1]}"
+            break
+    return f"xhs:path:{identity}"
 
 
 def inspect_image_bytes(content: bytes) -> InspectedImage:

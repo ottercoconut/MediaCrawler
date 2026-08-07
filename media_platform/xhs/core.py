@@ -44,6 +44,7 @@ from model.m_xiaohongshu import NoteUrlInfo, CreatorUrlInfo
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
+from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import (
     inspect_visible_page_state,
     install_project_runtime_hints,
@@ -65,6 +66,19 @@ from .login import XiaoHongShuLogin
 
 
 XHS_NEW_PAGE_MIN_HOLD_SECONDS = 30.0
+
+
+class XHSImageDownloadError(RuntimeError):
+    """An XHS post image failed before the candidate safe frontier."""
+
+    def __init__(self, note_id: str, source_index: int, code: str):
+        super().__init__(
+            f"XHS image download failed: note_id={note_id}, "
+            f"source_index={source_index}, code={code}"
+        )
+        self.note_id = note_id
+        self.source_index = source_index
+        self.code = code
 
 
 class XiaoHongShuCrawler(AbstractCrawler):
@@ -1111,11 +1125,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                         )
                                     )
                                 )
-                                should_stop = accumulator.consider(identity, valid=valid)
+                                if valid:
+                                    await self.get_notice_media(note_detail)
                                 await xhs_store.update_xhs_note(note_detail)
-                                await self.get_notice_media(note_detail)
                                 note_ids.append(note_detail.get("note_id"))
                                 xsec_tokens.append(note_detail.get("xsec_token"))
+                                should_stop = accumulator.consider(identity, valid=valid)
                                 if should_stop:
                                     break
                             elif accumulator.consider(identity, valid=False):
@@ -1159,6 +1174,20 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         page = requested_page + 1
                         phase_batches += 1
                         await self._guarded_pause("search_page", 12.0, 30.0)
+                    except XHSImageDownloadError as exc:
+                        utils.logger.error(
+                            "[XiaoHongShuCrawler.search] Image materialization failed "
+                            f"on page {requested_page}: {exc!r}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            "image_download_failed",
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            resume_page=requested_page,
+                            resume_cursor=search_id,
+                            discovery_phase=discovery_phase,
+                        )
+                        break
                     except (DataFetchError, RetryError) as exc:
                         if self._is_login_expired_failure(exc):
                             if await self._wait_for_midrun_login_recovery(keyword):
@@ -1706,27 +1735,54 @@ class XiaoHongShuCrawler(AbstractCrawler):
         """
         if not config.ENABLE_GET_MEIDAS:
             return
-        note_id = note_item.get("note_id")
-        image_list: List[Dict] = note_item.get("image_list", [])
-
-        for img in image_list:
-            if img.get("url_default") != "":
-                img.update({"url": img.get("url_default")})
-
-        if not image_list:
+        note_id = str(note_item.get("note_id") or "")
+        image_assets = xhs_store._xhs_image_assets(note_item)
+        if not image_assets:
             return
-        picNum = 0
-        for pic in image_list:
-            url = pic.get("url")
-            if not url:
-                continue
-            content = await self.xhs_client.get_note_media(url)
+        fetched_assets: List[Dict] = []
+        for asset in image_assets:
+            content = await self.xhs_client.get_note_media(asset["url"])
             await asyncio.sleep(random.random())
             if content is None:
-                continue
-            extension_file_name = f"{picNum}.jpg"
-            picNum += 1
-            await xhs_store.update_xhs_note_image(note_id, content, extension_file_name)
+                await xhs_store.record_xhs_note_image_failure(
+                    note_id,
+                    {
+                        **asset,
+                        "attempts": 1,
+                        "http_status": None,
+                        "error_code": "image_download_retryable",
+                    },
+                )
+                raise XHSImageDownloadError(
+                    note_id,
+                    int(asset["source_index"]),
+                    "image_download_retryable",
+                )
+            fetched_assets.append(
+                {**asset, "content": content, "attempts": 1, "http_status": 200}
+            )
+        try:
+            await xhs_store.update_xhs_note_images(note_id, fetched_assets)
+        except ImageStagingError as exc:
+            source_index = int(exc.source_index or 0)
+            failed_asset = next(
+                (
+                    asset
+                    for asset in image_assets
+                    if int(asset["source_index"]) == source_index
+                ),
+                image_assets[0],
+            )
+            await xhs_store.record_xhs_note_image_failure(
+                note_id,
+                {
+                    **failed_asset,
+                    "attempts": 1,
+                    "http_status": 200,
+                    "error_code": exc.code,
+                },
+            )
+            raise XHSImageDownloadError(note_id, source_index, exc.code) from exc
 
     async def get_notice_video(self, note_item: Dict):
         """Get note videos. Please use get_notice_media
