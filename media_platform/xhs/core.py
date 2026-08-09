@@ -81,6 +81,17 @@ class XHSImageDownloadError(RuntimeError):
         self.code = code
 
 
+class XHSNoteDetailUnavailable(RuntimeError):
+    """An XHS note detail is recoverably unavailable and must not become seen."""
+
+    def __init__(self, note_id: str, code: str):
+        super().__init__(
+            f"XHS note detail unavailable: note_id={note_id or '<missing>'}, code={code}"
+        )
+        self.note_id = note_id
+        self.code = code
+
+
 class XiaoHongShuCrawler(AbstractCrawler):
     context_page: Page
     xhs_client: XiaoHongShuClient
@@ -1109,7 +1120,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                 interact_info = note_detail.get("interact_info") or {}
                                 valid = bool(
                                     identity
-                                    and (note_detail.get("title") or note_detail.get("desc"))
+                                    and note_detail.get("desc")
+                                    and note_detail.get("content_detail_status") == "detail_observed"
+                                    and note_detail.get("content_detail_source") == "note_detail"
                                     and note_detail.get("time")
                                     and (note_detail.get("user") or {}).get("user_id")
                                     and (note_detail.get("user") or {}).get("nickname")
@@ -1181,6 +1194,20 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         )
                         accumulator.mark_runtime_failed(
                             "image_download_failed",
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            resume_page=requested_page,
+                            resume_cursor=search_id,
+                            discovery_phase=discovery_phase,
+                        )
+                        break
+                    except XHSNoteDetailUnavailable as exc:
+                        utils.logger.error(
+                            "[XiaoHongShuCrawler.search] Note detail remained unavailable "
+                            f"on page {requested_page}: {exc!r}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            "note_detail_unavailable",
                             source_page=requested_page,
                             source_cursor=search_id,
                             resume_page=requested_page,
@@ -1562,10 +1589,19 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     note_detail = await self.xhs_client.get_note_by_id_from_html(note_id, xsec_source, xsec_token,
                                                                                  enable_cookie=True)
                     if not note_detail:
-                        utils.logger.warning(f"[skip] Failed to get note detail, Id: {note_id}, 跳过继续")
-                        return None
+                        utils.logger.warning(
+                            "[XiaoHongShuCrawler.get_note_detail_async_task] "
+                            f"Detail remained unavailable after API and HTML fallback: {note_id}"
+                        )
+                        raise XHSNoteDetailUnavailable(note_id, "api_and_html_empty")
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
+                note_detail.update(
+                    {
+                        "content_detail_status": "detail_observed",
+                        "content_detail_source": "note_detail",
+                    }
+                )
 
                 await self._guarded_pause("note_detail", 4.0, 10.0)
 
@@ -1576,10 +1612,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 return None
             except DataFetchError as ex:
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] Get note detail error: {ex}")
-                return None
+                raise
             except KeyError as ex:
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}")
-                return None
+                raise XHSNoteDetailUnavailable(note_id, "detail_parse_failed") from ex
 
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""

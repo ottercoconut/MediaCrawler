@@ -187,6 +187,15 @@ async def update_weibo_note(note_item: Dict):
         "author_followers_source": "search_author" if followers_observed else "missing",
         "source_keyword": source_keyword_var.get(),
     }
+    if config.SAVE_DATA_OPTION == "jsonl":
+        save_content_item.update(
+            {
+                "content_detail_status": mblog.get(
+                    "content_detail_status", "unobserved"
+                ),
+                "content_detail_source": mblog.get("content_detail_source", ""),
+            }
+        )
     utils.logger.info(f"[store.weibo.update_weibo_note] weibo note id:{note_id}, title:{save_content_item.get('content')[:24]} ...")
     await WeibostoreFactory.create_store().store_content(content_item=save_content_item)
 

@@ -10,7 +10,7 @@ import config
 from playwright.async_api import Error as PlaywrightError
 from tenacity import Future, RetryError
 from media_platform.xhs import core as xhs_core
-from media_platform.xhs.core import XiaoHongShuCrawler
+from media_platform.xhs.core import XiaoHongShuCrawler, XHSNoteDetailUnavailable
 from media_platform.xhs.exception import DataFetchError
 
 
@@ -42,6 +42,8 @@ def valid_note(note_id: str) -> dict:
         "note_id": note_id,
         "title": f"note {note_id}",
         "desc": "body",
+        "content_detail_status": "detail_observed",
+        "content_detail_source": "note_detail",
         "time": 1_700_000_000_000,
         "user": {"user_id": f"author-{note_id}", "nickname": "author"},
         "image_list": [{"url_default": "https://example.test/image.jpg"}],
@@ -195,6 +197,33 @@ async def test_browser_context_close_is_recorded_as_resumable_runtime_failure(
     assert stopped["details"]["resume_page"] == 3
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["batch_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_recoverable_detail_failure_keeps_xhs_candidate_unseen(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[{"id": "retry-detail"}],
+    )
+    crawler.get_note_detail_async_task = AsyncMock(
+        side_effect=XHSNoteDetailUnavailable("retry-detail", "api_and_html_empty")
+    )
+
+    await crawler.search()
+
+    xhs_core.xhs_store.update_xhs_note.assert_not_awaited()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == "note_detail_unavailable"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["candidate_identities"] == []
 
 
 @pytest.mark.asyncio

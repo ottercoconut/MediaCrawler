@@ -74,6 +74,8 @@ def test_jsonl_record_keeps_only_body_assets_in_image_metadata(monkeypatch):
     asyncio.run(douyin_store.update_douyin_aweme(aweme))
 
     assert captured["image_list_source"] == "aweme.images"
+    assert captured["content_detail_status"] == "detail_observed"
+    assert captured["content_detail_source"] == "aweme_detail"
     assert captured["image_assets"] == [
         {
             "uri": "body-uri",

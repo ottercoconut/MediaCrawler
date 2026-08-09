@@ -66,6 +66,17 @@ class ZhihuImageDownloadError(RuntimeError):
         self.code = code
 
 
+class ZhihuDetailFetchError(RuntimeError):
+    """A search candidate detail failed before it could cross the safe frontier."""
+
+    def __init__(self, content_id: str, code: str):
+        super().__init__(
+            f"Zhihu detail fetch failed: content_id={content_id or '<missing>'}, code={code}"
+        )
+        self.content_id = content_id
+        self.code = code
+
+
 class ZhihuCrawler(AbstractCrawler):
     context_page: Page
     zhihu_client: ZhiHuClient
@@ -145,8 +156,9 @@ class ZhihuCrawler(AbstractCrawler):
         content: ZhihuContent,
     ) -> ZhihuContent:
         """Fetch the full answer/article when search HTML has no content image."""
-        if content.image_list:
+        if content.image_list and content.content_text:
             content.content_detail_status = "detail_observed"
+            content.content_detail_source = "search_content"
             return content
         if content.content_type not in {
             constant.ANSWER_NAME,
@@ -163,17 +175,23 @@ class ZhihuCrawler(AbstractCrawler):
             else:
                 detail = await self.zhihu_client.get_article_info(content.content_id)
         except DataFetchError as exc:
-            content.content_detail_status = "request_failed"
             utils.logger.warning(
                 "[ZhihuCrawler.enrich_search_content_detail] Detail request failed "
                 f"for {content.content_type}:{content.content_id}: {exc}"
             )
+            raise ZhihuDetailFetchError(
+                content.content_id,
+                "detail_request_failed",
+            ) from exc
         else:
             if detail is None:
-                content.content_detail_status = "parse_failed"
                 utils.logger.warning(
                     "[ZhihuCrawler.enrich_search_content_detail] Detail parse failed "
                     f"for {content.content_type}:{content.content_id}"
+                )
+                raise ZhihuDetailFetchError(
+                    content.content_id,
+                    "detail_parse_failed",
                 )
             else:
                 merge_search_content_detail(content, detail)
@@ -374,6 +392,12 @@ class ZhihuCrawler(AbstractCrawler):
                             content = await self.enrich_search_content_detail(content)
                             image_ready = bool(
                                 content.content_detail_status == "detail_observed"
+                                and content.content_detail_source
+                                in {
+                                    "search_content",
+                                    "answer_detail",
+                                    "article_detail",
+                                }
                                 and zhihu_store.zhihu_content_image_assets(content)
                             )
                             valid = bool(
@@ -382,7 +406,7 @@ class ZhihuCrawler(AbstractCrawler):
                                     constant.ANSWER_NAME,
                                     constant.ARTICLE_NAME,
                                 }
-                                and (content.content_text or content.title)
+                                and content.content_text
                                 and content.created_time
                                 and content.creator_hash
                                 and content.user_nickname
@@ -419,6 +443,18 @@ class ZhihuCrawler(AbstractCrawler):
                         )
                         accumulator.mark_runtime_failed(
                             "image_download_failed",
+                            source_page=requested_page,
+                            resume_page=requested_page,
+                            discovery_phase=discovery_phase,
+                        )
+                        return
+                    except ZhihuDetailFetchError as exc:
+                        utils.logger.error(
+                            "[ZhihuCrawler.search] Full content detail failed "
+                            f"on page {requested_page}: {exc!r}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            "content_detail_failed",
                             source_page=requested_page,
                             resume_page=requested_page,
                             discovery_phase=discovery_phase,
@@ -600,6 +636,7 @@ class ZhihuCrawler(AbstractCrawler):
                         content_detail_status="parse_failed",
                     )
                 result.content_detail_status = "detail_observed"
+                result.content_detail_source = "answer_detail"
                 return result
 
             elif note_type == constant.ARTICLE_NAME:
@@ -633,6 +670,7 @@ class ZhihuCrawler(AbstractCrawler):
                         content_detail_status="parse_failed",
                     )
                 result.content_detail_status = "detail_observed"
+                result.content_detail_source = "article_detail"
                 return result
 
             elif note_type == constant.VIDEO_NAME:

@@ -97,6 +97,8 @@ async def test_note_store_keeps_pid_order_and_ignores_avatar(monkeypatch):
             "mblog": {
                 "id": "note-asset-order",
                 "text": "body",
+                "content_detail_status": "detail_observed",
+                "content_detail_source": "mobile_detail",
                 "created_at": "Sat Jun 14 12:00:00 +0800 2025",
                 "attitudes_count": 1,
                 "comments_count": 2,
@@ -125,4 +127,6 @@ async def test_note_store_keeps_pid_order_and_ignores_avatar(monkeypatch):
         {"pid": "pid-2", "url": "https://wx.test/2.jpg", "source_index": 1},
     ]
     assert captured["image_list_source"] == "mblog.pics"
+    assert captured["content_detail_status"] == "detail_observed"
+    assert captured["content_detail_source"] == "mobile_detail"
     assert "avatar" not in json.dumps(captured["image_assets"]).lower()

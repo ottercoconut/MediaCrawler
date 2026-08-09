@@ -37,6 +37,7 @@ def test_merge_search_detail_keeps_search_author_evidence() -> None:
     assert merged.image_list == ["https://example.test/content.jpg"]
     assert merged.image_count == 1
     assert merged.content_detail_status == "detail_observed"
+    assert merged.content_detail_source == "answer_detail"
     assert merged.creator_hash == "search-author"
     assert merged.followers_count == 123
     assert merged.followers_observed is True
@@ -76,6 +77,7 @@ async def test_detail_mode_marks_success_and_parse_failure(monkeypatch) -> None:
 
     assert observed is not None
     assert observed.content_detail_status == "detail_observed"
+    assert observed.content_detail_source == "answer_detail"
     assert failed is not None
     assert failed.content_detail_status == "parse_failed"
 

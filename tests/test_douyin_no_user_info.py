@@ -274,6 +274,7 @@ def test_douyin_comment_masks_user_info():
 
 
 def test_douyin_store_end_to_end_sqlite(monkeypatch):
+    monkeypatch.setattr(config, "SAVE_DATA_OPTION", "db")
     aweme = _build_aweme_item()
     raw_uid = aweme["author"]["uid"]
     raw_nick = aweme["author"]["nickname"]

@@ -282,6 +282,15 @@ async def update_xhs_note(note_item: Dict):
         "xsec_token": note_item.get("xsec_token"),  # xsec_token
         "creator_profile_json": creator_item.get("creator_profile_json", ""),
     }
+    if config.SAVE_DATA_OPTION == "jsonl":
+        local_db_item.update(
+            {
+                "content_detail_status": note_item.get(
+                    "content_detail_status", "unobserved"
+                ),
+                "content_detail_source": note_item.get("content_detail_source", ""),
+            }
+        )
     utils.logger.info(f"[store.xhs.update_xhs_note] xhs note: {local_db_item}")
     await XhsStoreFactory.create_store().store_content(local_db_item)
 

@@ -68,6 +68,17 @@ class WeiboImageDownloadError(RuntimeError):
         self.code = code
 
 
+class WeiboFullTextFetchError(RuntimeError):
+    """A long Weibo post could not be proven complete at its detail endpoint."""
+
+    def __init__(self, note_id: str, code: str):
+        super().__init__(
+            f"Weibo full-text fetch failed: note_id={note_id or '<missing>'}, code={code}"
+        )
+        self.note_id = note_id
+        self.code = code
+
+
 class WeiboCrawler(AbstractCrawler):
     context_page: Page
     wb_client: WeiboClient
@@ -248,7 +259,20 @@ class WeiboCrawler(AbstractCrawler):
                             pending_note_ids.add(note_id)
                         unknown_notes.append(note_item)
                     note_list = unknown_notes
-                    note_list = await self.batch_get_notes_full_text(note_list)
+                    try:
+                        note_list = await self.batch_get_notes_full_text(note_list)
+                    except WeiboFullTextFetchError as exc:
+                        utils.logger.error(
+                            "[WeiboCrawler.search] Full-text observation failed "
+                            f"on page {requested_page}: {exc!r}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            "full_text_request_failed",
+                            source_page=requested_page,
+                            resume_page=requested_page,
+                            discovery_phase=discovery_phase,
+                        )
+                        raise
                     accumulator.begin_batch()
                     processed_count = 0
                     for note_item in note_list:
@@ -272,6 +296,9 @@ class WeiboCrawler(AbstractCrawler):
                         valid = bool(
                             note_id
                             and mblog.get("text")
+                            and mblog.get("content_detail_status") == "detail_observed"
+                            and mblog.get("content_detail_source")
+                            in {"search_mblog_complete", "mobile_detail"}
                             and mblog.get("created_at")
                             and user.get("id")
                             and user.get("screen_name")
@@ -601,9 +628,6 @@ class WeiboCrawler(AbstractCrawler):
         :param note_item: Post data, contains mblog field
         :return: Updated post data
         """
-        if not config.ENABLE_WEIBO_FULL_TEXT:
-            return note_item
-
         mblog = note_item.get("mblog", {})
         if not mblog:
             return note_item
@@ -611,11 +635,15 @@ class WeiboCrawler(AbstractCrawler):
         # Check if it's a long text
         is_long_text = mblog.get("isLongText", False)
         if not is_long_text:
+            mblog["content_detail_status"] = "detail_observed"
+            mblog["content_detail_source"] = "search_mblog_complete"
             return note_item
 
-        note_id = mblog.get("id")
+        note_id = str(mblog.get("id") or "")
         if not note_id:
-            return note_item
+            raise WeiboFullTextFetchError(note_id, "missing_note_id")
+        if not config.ENABLE_WEIBO_FULL_TEXT:
+            raise WeiboFullTextFetchError(note_id, "full_text_disabled")
 
         try:
             utils.logger.info(f"[WeiboCrawler.get_note_full_text] Fetching full text for note: {note_id}")
@@ -623,14 +651,22 @@ class WeiboCrawler(AbstractCrawler):
             if full_note and full_note.get("mblog"):
                 # Replace original content with complete content
                 note_item["mblog"] = full_note["mblog"]
+                note_item["mblog"]["content_detail_status"] = "detail_observed"
+                note_item["mblog"]["content_detail_source"] = "mobile_detail"
                 utils.logger.info(f"[WeiboCrawler.get_note_full_text] Successfully fetched full text for note: {note_id}")
+            else:
+                raise WeiboFullTextFetchError(note_id, "empty_detail_payload")
 
             # Sleep after request to avoid rate limiting
             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
         except DataFetchError as ex:
             utils.logger.error(f"[WeiboCrawler.get_note_full_text] Failed to fetch full text for note {note_id}: {ex}")
+            raise WeiboFullTextFetchError(note_id, "detail_request_failed") from ex
+        except WeiboFullTextFetchError:
+            raise
         except Exception as ex:
             utils.logger.error(f"[WeiboCrawler.get_note_full_text] Unexpected error for note {note_id}: {ex}")
+            raise WeiboFullTextFetchError(note_id, "unexpected_detail_failure") from ex
 
         return note_item
 
@@ -640,9 +676,6 @@ class WeiboCrawler(AbstractCrawler):
         :param note_list: List of posts
         :return: Updated list of posts
         """
-        if not config.ENABLE_WEIBO_FULL_TEXT:
-            return note_list
-
         result = []
         for note_item in note_list:
             updated_note = await self.get_note_full_text(note_item)

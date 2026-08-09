@@ -322,6 +322,9 @@ async def update_douyin_aweme(aweme_item: Dict):
     if config.SAVE_DATA_OPTION == "jsonl" and config.ENABLE_GET_MEIDAS:
         save_content_item["image_assets"] = image_assets
         save_content_item["image_list_source"] = "aweme.images"
+    if config.SAVE_DATA_OPTION == "jsonl":
+        save_content_item["content_detail_status"] = "detail_observed"
+        save_content_item["content_detail_source"] = "aweme_detail"
     utils.logger.info(f"[store.douyin.update_douyin_aweme] douyin aweme id:{aweme_id}, title:{save_content_item.get('title')}")
     await DouyinStoreFactory.create_store().store_content(content_item=save_content_item)
 

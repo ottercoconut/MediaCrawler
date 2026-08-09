@@ -21,6 +21,7 @@
 import asyncio
 
 import pytest
+import config
 
 # 原始(明文)测试数据
 RAW_USER_ID = 7654321
@@ -200,13 +201,14 @@ def test_weibo_comment_masks_user_info():
     assert captured["parent_comment_id"] == "parent_abc"
 
 
-def test_weibo_store_end_to_end_sqlite():
+def test_weibo_store_end_to_end_sqlite(monkeypatch):
     """端到端:捕获 note/comment 的真实 dict,用 SQLite 内存库走完整 ORM 写入+查询。
 
     关键点:WeiboNote(**captured_dict) / WeiboNoteComment(**captured_dict) 会触发
     SQLAlchemy 声明式构造器的关键字校验——若 dict 含已删列(如 avatar/gender)会直接
     抛 TypeError。此处不抛异常即证明 dict 的 key 与删列后的 ORM 列完全对得上。
     """
+    monkeypatch.setattr(config, "SAVE_DATA_OPTION", "db")
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 

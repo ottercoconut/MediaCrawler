@@ -92,6 +92,11 @@ def merge_search_content_detail(
     search_content.image_list = list(detail_content.image_list)
     search_content.image_count = len(search_content.image_list)
     search_content.content_detail_status = "detail_observed"
+    search_content.content_detail_source = (
+        "answer_detail"
+        if detail_content.content_type == zhihu_constant.ANSWER_NAME
+        else "article_detail"
+    )
     return search_content
 
 

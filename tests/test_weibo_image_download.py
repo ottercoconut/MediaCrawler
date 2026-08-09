@@ -10,7 +10,12 @@ import pytest
 
 import config
 from media_platform.weibo import core as weibo_core
-from media_platform.weibo.core import WeiboCrawler, WeiboImageDownloadError
+from media_platform.weibo.core import (
+    WeiboCrawler,
+    WeiboFullTextFetchError,
+    WeiboImageDownloadError,
+)
+from media_platform.weibo.exception import DataFetchError
 
 
 def png_bytes() -> bytes:
@@ -23,6 +28,8 @@ def valid_mblog(note_id: str) -> dict:
     return {
         "id": note_id,
         "text": "valid body",
+        "content_detail_status": "detail_observed",
+        "content_detail_source": "search_mblog_complete",
         "created_at": "Sat Jun 14 12:00:00 +0800 2025",
         "attitudes_count": 1,
         "comments_count": 2,
@@ -175,3 +182,68 @@ async def test_image_failure_keeps_current_page_and_candidate_unseen(monkeypatch
     assert stopped["details"]["stop_detail"] == "image_download_failed"
     assert stopped["details"]["resume_page"] == 1
     assert stopped["details"]["candidate_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_short_and_long_posts_record_authoritative_full_text_sources(monkeypatch):
+    monkeypatch.setattr(config, "ENABLE_WEIBO_FULL_TEXT", True)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    crawler = WeiboCrawler()
+    crawler.wb_client = AsyncMock()
+    short = {"mblog": {"id": "short", "text": "complete", "isLongText": False}}
+    long = {"mblog": {"id": "long", "text": "truncated", "isLongText": True}}
+    crawler.wb_client.get_note_info_by_id.return_value = {
+        "mblog": {"id": "long", "text": "complete long body", "isLongText": True}
+    }
+
+    short_result = await crawler.get_note_full_text(short)
+    long_result = await crawler.get_note_full_text(long)
+
+    assert short_result["mblog"]["content_detail_status"] == "detail_observed"
+    assert short_result["mblog"]["content_detail_source"] == "search_mblog_complete"
+    assert long_result["mblog"]["text"] == "complete long body"
+    assert long_result["mblog"]["content_detail_status"] == "detail_observed"
+    assert long_result["mblog"]["content_detail_source"] == "mobile_detail"
+
+
+@pytest.mark.asyncio
+async def test_long_text_detail_failure_blocks_batch_and_keeps_candidate_unseen(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    long_mblog = valid_mblog("long-retry")
+    long_mblog.update({"isLongText": True, "text": "truncated...全文"})
+    crawler, state_path = prepare_search(
+        monkeypatch,
+        tmp_path,
+        [{"card_type": 9, "mblog": long_mblog}],
+    )
+    crawler.batch_get_notes_full_text = AsyncMock(
+        side_effect=WeiboFullTextFetchError("long-retry", "detail_request_failed")
+    )
+
+    with pytest.raises(WeiboFullTextFetchError):
+        await crawler.search()
+
+    weibo_core.weibo_store.update_weibo_note.assert_not_awaited()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_detail"] == "full_text_request_failed"
+    assert stopped["details"]["resume_page"] == 1
+    assert stopped["details"]["candidate_identities"] == []
+
+
+@pytest.mark.asyncio
+async def test_long_text_detail_request_error_never_returns_search_excerpt(monkeypatch):
+    monkeypatch.setattr(config, "ENABLE_WEIBO_FULL_TEXT", True)
+    crawler = WeiboCrawler()
+    crawler.wb_client = AsyncMock()
+    crawler.wb_client.get_note_info_by_id.side_effect = DataFetchError("temporary")
+    note = {"mblog": {"id": "long", "text": "truncated...全文", "isLongText": True}}
+
+    with pytest.raises(WeiboFullTextFetchError) as exc_info:
+        await crawler.get_note_full_text(note)
+
+    assert exc_info.value.code == "detail_request_failed"
+    assert "content_detail_status" not in note["mblog"]

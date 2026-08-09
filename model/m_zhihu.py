@@ -45,6 +45,10 @@ class ZhihuContent(BaseModel):
         default="search_payload",
         description="Detail enrichment status for search results",
     )
+    content_detail_source: str = Field(
+        default="",
+        description="Authoritative source that proved the persisted body complete",
+    )
     source_keyword: str = Field(default="", description="Source keyword")
     creator_hash: str = Field(default="", description="Creator anonymized hash")
     creator_url_token: str = Field(default="", description="Creator URL token")
