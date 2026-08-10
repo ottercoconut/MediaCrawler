@@ -12,6 +12,7 @@ from media_platform.zhihu import client as zhihu_client_module
 from media_platform.zhihu.client import ZhiHuClient
 from media_platform.zhihu.core import ZhihuCrawler, ZhihuImageDownloadError
 from model.m_zhihu import ZhihuContent
+from tools.image_download_retry import ImageDownloadFetchError
 
 
 def png_bytes() -> bytes:
@@ -205,3 +206,28 @@ async def test_failed_zhihu_image_has_only_failed_manifest(monkeypatch, tmp_path
     assert rows[0]["staging_path"] is None
     assert crawler.zhihu_client.get_content_image.await_count == 3
     assert not (tmp_path / "zhihu" / "images" / "failed-answer").exists()
+
+
+@pytest.mark.asyncio
+async def test_terminal_http_fetch_error_preserves_manifest_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    crawler = ZhihuCrawler()
+    crawler.zhihu_client = AsyncMock()
+    crawler.zhihu_client.get_content_image.side_effect = ImageDownloadFetchError(
+        "HTTP 404",
+        code="image_source_unavailable",
+        retryable=False,
+        http_status=404,
+    )
+
+    with pytest.raises(ZhihuImageDownloadError):
+        await crawler.get_content_images(observed_content("missing-answer"))
+
+    row = json.loads(
+        (tmp_path / "zhihu" / "image_manifest.jsonl").read_text().splitlines()[0]
+    )
+    assert row["error_code"] == "image_source_unavailable"
+    assert row["http_status"] == 404
+    assert row["attempts"] == 1

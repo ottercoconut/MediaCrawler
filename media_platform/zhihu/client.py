@@ -35,6 +35,11 @@ from constant import zhihu as zhihu_constant
 from model.m_zhihu import ZhihuComment, ZhihuContent, ZhihuCreator
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
+from tools.image_download_retry import (
+    IMAGE_DOWNLOAD_MAX_BYTES,
+    ImageDownloadFetchError,
+    classified_http_image_error,
+)
 
 if TYPE_CHECKING:
     from proxy.proxy_ip_pool import ProxyIpPool
@@ -202,18 +207,33 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
                     size = 0
                     async for chunk in response.aiter_bytes():
                         size += len(chunk)
-                        if size > 20 * 1024 * 1024:
+                        if size > IMAGE_DOWNLOAD_MAX_BYTES:
                             utils.logger.error(
                                 "[ZhiHuClient.get_content_image] image exceeded byte limit"
                             )
-                            return None
+                            raise ImageDownloadFetchError(
+                                "image exceeded byte limit",
+                                code="image_too_large",
+                                retryable=False,
+                                http_status=response.status_code,
+                            )
                         chunks.append(chunk)
-                    return b"".join(chunks) or None
+                    return b"".join(chunks)
+        except ImageDownloadFetchError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            utils.logger.error(
+                f"[ZhiHuClient.get_content_image] HTTP {status}: {exc}"
+            )
+            raise classified_http_image_error(status, f"HTTP {status}") from exc
         except httpx.HTTPError as exc:
             utils.logger.error(
                 f"[ZhiHuClient.get_content_image] {exc.__class__.__name__}: {exc}"
             )
-            return None
+            raise ImageDownloadFetchError(
+                str(exc), code="image_download_retryable", retryable=True
+            ) from exc
 
     async def get_note_by_keyword(
         self,

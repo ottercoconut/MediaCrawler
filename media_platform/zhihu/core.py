@@ -42,6 +42,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import zhihu as zhihu_store
 from tools import utils
 from tools.image_download_retry import (
+    ImageDownloadFetchError,
     fetch_image_bytes_with_retry,
     is_retryable_image_error,
 )
@@ -748,16 +749,30 @@ class ZhihuCrawler(AbstractCrawler):
         fetched_assets: List[Dict] = []
         for asset in image_assets:
             source_index = int(asset["source_index"])
-            payload, attempts = await fetch_image_bytes_with_retry(
-                lambda: self.zhihu_client.get_content_image(
-                    asset["url"], referer=content.content_url
-                ),
-                logger=utils.logger,
-                label=(
-                    f"platform=zhihu content_id={content_id} "
-                    f"source_index={source_index}"
-                ),
-            )
+            try:
+                payload, attempts = await fetch_image_bytes_with_retry(
+                    lambda: self.zhihu_client.get_content_image(
+                        asset["url"], referer=content.content_url
+                    ),
+                    logger=utils.logger,
+                    label=(
+                        f"platform=zhihu content_id={content_id} "
+                        f"source_index={source_index}"
+                    ),
+                )
+            except ImageDownloadFetchError as exc:
+                await zhihu_store.record_zhihu_content_image_failure(
+                    content_id,
+                    {
+                        **asset,
+                        "attempts": exc.attempts,
+                        "http_status": exc.http_status,
+                        "error_code": exc.code,
+                    },
+                )
+                raise ZhihuImageDownloadError(
+                    content_id, source_index, exc.code, exc.attempts
+                ) from exc
             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
             if payload is None:
                 await zhihu_store.record_zhihu_content_image_failure(

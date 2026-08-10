@@ -9,6 +9,7 @@ import pytest
 
 import config
 from media_platform.xhs.core import XiaoHongShuCrawler, XHSImageDownloadError
+from tools.image_download_retry import ImageDownloadFetchError
 
 
 def png_bytes() -> bytes:
@@ -123,6 +124,31 @@ async def test_xhs_failed_image_writes_no_success_file_or_manifest(monkeypatch, 
     assert rows[0]["staging_path"] is None
     assert crawler.xhs_client.get_note_media.await_count == 3
     assert not (tmp_path / "xhs" / "images" / "xhs-failed").exists()
+
+
+@pytest.mark.asyncio
+async def test_terminal_http_fetch_error_preserves_manifest_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr("media_platform.xhs.core.random.random", lambda: 0)
+    crawler = XiaoHongShuCrawler()
+    crawler.xhs_client = AsyncMock()
+    crawler.xhs_client.get_note_media.side_effect = ImageDownloadFetchError(
+        "HTTP 404",
+        code="image_source_unavailable",
+        retryable=False,
+        http_status=404,
+    )
+
+    with pytest.raises(XHSImageDownloadError):
+        await crawler.get_note_images(image_note("missing-note"))
+
+    row = json.loads(
+        (tmp_path / "xhs" / "image_manifest.jsonl").read_text().splitlines()[0]
+    )
+    assert row["error_code"] == "image_source_unavailable"
+    assert row["http_status"] == 404
+    assert row["attempts"] == 1
 
 
 @pytest.mark.asyncio

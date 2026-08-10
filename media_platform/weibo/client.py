@@ -38,6 +38,10 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 import config
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
+from tools.image_download_retry import (
+    ImageDownloadFetchError,
+    classified_http_image_error,
+)
 
 if TYPE_CHECKING:
     from proxy.proxy_ip_pool import ProxyIpPool
@@ -304,14 +308,21 @@ class WeiboClient(ProxyRefreshMixin):
             try:
                 response = await client.request("GET", final_uri, timeout=self.timeout)
                 response.raise_for_status()
-                if not response.reason_phrase == "OK":
-                    utils.logger.error(f"[WeiboClient.get_note_image] request {final_uri} err, res:{response.text}")
-                    return None
-                else:
-                    return response.content
-            except httpx.HTTPError as exc:  # some wrong when call httpx.request method, such as connection error, client error, server error or response status code is not 2xx
-                utils.logger.error(f"[DouYinClient.get_aweme_media] {exc.__class__.__name__} for {exc.request.url} - {exc}")    # Keep original exception type name for developer debugging
-                return None
+                return response.content
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                utils.logger.error(
+                    f"[WeiboClient.get_note_image] HTTP {status} for {exc.request.url}"
+                )
+                raise classified_http_image_error(status, f"HTTP {status}") from exc
+            except httpx.HTTPError as exc:  # transport error without an HTTP response
+                utils.logger.error(
+                    f"[WeiboClient.get_note_image] {exc.__class__.__name__} "
+                    f"for {exc.request.url} - {exc}"
+                )
+                raise ImageDownloadFetchError(
+                    str(exc), code="image_download_retryable", retryable=True
+                ) from exc
 
     async def get_creator_container_info(self, creator_id: str) -> Dict:
         """

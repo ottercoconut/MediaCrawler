@@ -10,6 +10,7 @@ import pytest
 import config
 from media_platform.douyin import core as douyin_core
 from media_platform.douyin.core import DouYinCrawler, DouyinImageDownloadError
+from tools.image_download_retry import ImageDownloadFetchError
 from store import douyin as douyin_store
 
 
@@ -158,6 +159,31 @@ async def test_failed_note_image_writes_failed_manifest_only(monkeypatch, tmp_pa
     assert rows[0]["staging_path"] is None
     assert crawler.dy_client.get_aweme_media.await_count == 3
     assert not (tmp_path / "douyin" / "images" / "dy-failed").exists()
+
+
+@pytest.mark.asyncio
+async def test_terminal_http_fetch_error_preserves_manifest_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr("media_platform.douyin.core.random.random", lambda: 0)
+    crawler = DouYinCrawler()
+    crawler.dy_client = AsyncMock()
+    crawler.dy_client.get_aweme_media.side_effect = ImageDownloadFetchError(
+        "HTTP 404",
+        code="image_source_unavailable",
+        retryable=False,
+        http_status=404,
+    )
+
+    with pytest.raises(DouyinImageDownloadError):
+        await crawler.get_aweme_images(image_aweme("missing-aweme"))
+
+    row = json.loads(
+        (tmp_path / "douyin" / "image_manifest.jsonl").read_text().splitlines()[0]
+    )
+    assert row["error_code"] == "image_source_unavailable"
+    assert row["http_status"] == 404
+    assert row["attempts"] == 1
 
 
 class SearchClient:

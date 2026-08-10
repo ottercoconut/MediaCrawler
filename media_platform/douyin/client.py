@@ -32,6 +32,10 @@ from base.base_crawler import AbstractApiClient
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
 from tools.httpx_util import make_async_client
+from tools.image_download_retry import (
+    ImageDownloadFetchError,
+    classified_http_image_error,
+)
 from var import request_keyword_var
 
 if TYPE_CHECKING:
@@ -672,14 +676,18 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             try:
                 response = await client.request("GET", url, timeout=self.timeout, follow_redirects=True)
                 response.raise_for_status()
-                if not response.reason_phrase == "OK":
-                    utils.logger.error(f"[DouYinClient.get_aweme_media] request {url} err, res:{response.text}")
-                    return None
-                else:
-                    return response.content
-            except httpx.HTTPError as exc:  # some wrong when call httpx.request method, such as connection error, client error, server error or response status code is not 2xx
+                return response.content
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                utils.logger.error(
+                    f"[DouYinClient.get_aweme_media] HTTP {status} for {exc.request.url}"
+                )
+                raise classified_http_image_error(status, f"HTTP {status}") from exc
+            except httpx.HTTPError as exc:  # transport error without an HTTP response
                 utils.logger.error(f"[DouYinClient.get_aweme_media] {exc.__class__.__name__} for {exc.request.url} - {exc}")  # Keep the original exception type name for developers to debug
-                return None
+                raise ImageDownloadFetchError(
+                    str(exc), code="image_download_retryable", retryable=True
+                ) from exc
 
     async def resolve_short_url(self, short_url: str) -> str:
         """

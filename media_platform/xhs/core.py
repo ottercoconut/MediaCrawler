@@ -45,6 +45,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
 from tools.image_download_retry import (
+    ImageDownloadFetchError,
     fetch_image_bytes_with_retry,
     is_retryable_image_error,
 )
@@ -1795,11 +1796,28 @@ class XiaoHongShuCrawler(AbstractCrawler):
         fetched_assets: List[Dict] = []
         for asset in image_assets:
             source_index = int(asset["source_index"])
-            content, attempts = await fetch_image_bytes_with_retry(
-                lambda: self.xhs_client.get_note_media(asset["url"]),
-                logger=utils.logger,
-                label=f"platform=xhs note_id={note_id} source_index={source_index}",
-            )
+            try:
+                content, attempts = await fetch_image_bytes_with_retry(
+                    lambda: self.xhs_client.get_note_media(asset["url"]),
+                    logger=utils.logger,
+                    label=(
+                        f"platform=xhs note_id={note_id} "
+                        f"source_index={source_index}"
+                    ),
+                )
+            except ImageDownloadFetchError as exc:
+                await xhs_store.record_xhs_note_image_failure(
+                    note_id,
+                    {
+                        **asset,
+                        "attempts": exc.attempts,
+                        "http_status": exc.http_status,
+                        "error_code": exc.code,
+                    },
+                )
+                raise XHSImageDownloadError(
+                    note_id, source_index, exc.code, exc.attempts
+                ) from exc
             await asyncio.sleep(random.random())
             if content is None:
                 await xhs_store.record_xhs_note_image_failure(

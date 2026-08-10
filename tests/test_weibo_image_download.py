@@ -16,6 +16,7 @@ from media_platform.weibo.core import (
     WeiboImageDownloadError,
 )
 from media_platform.weibo.exception import DataFetchError
+from tools.image_download_retry import ImageDownloadFetchError
 
 
 def png_bytes() -> bytes:
@@ -128,6 +129,31 @@ async def test_failed_fetch_writes_only_failed_manifest(monkeypatch, tmp_path):
     assert rows[0]["staging_path"] is None
     assert crawler.wb_client.get_note_image.await_count == 3
     assert not list((tmp_path / "weibo").rglob("*.png"))
+
+
+@pytest.mark.asyncio
+async def test_terminal_http_fetch_error_preserves_manifest_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    crawler = WeiboCrawler()
+    crawler.wb_client = AsyncMock()
+    crawler.wb_client.get_note_image.side_effect = ImageDownloadFetchError(
+        "HTTP 404",
+        code="image_source_unavailable",
+        retryable=False,
+        http_status=404,
+    )
+
+    with pytest.raises(WeiboImageDownloadError):
+        await crawler.get_note_images(valid_mblog("missing-note"))
+
+    row = json.loads(
+        (tmp_path / "weibo" / "image_manifest.jsonl").read_text().splitlines()[0]
+    )
+    assert row["error_code"] == "image_source_unavailable"
+    assert row["http_status"] == 404
+    assert row["attempts"] == 1
 
 
 class SearchClient:

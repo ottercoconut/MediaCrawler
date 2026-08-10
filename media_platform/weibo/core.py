@@ -43,6 +43,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import weibo as weibo_store
 from tools import utils
 from tools.image_download_retry import (
+    ImageDownloadFetchError,
     fetch_image_bytes_with_retry,
     is_retryable_image_error,
 )
@@ -472,11 +473,28 @@ class WeiboCrawler(AbstractCrawler):
         fetched_assets: List[Dict] = []
         for asset in image_assets:
             source_index = int(asset["source_index"])
-            content, attempts = await fetch_image_bytes_with_retry(
-                lambda: self.wb_client.get_note_image(asset["url"]),
-                logger=utils.logger,
-                label=f"platform=weibo note_id={note_id} source_index={source_index}",
-            )
+            try:
+                content, attempts = await fetch_image_bytes_with_retry(
+                    lambda: self.wb_client.get_note_image(asset["url"]),
+                    logger=utils.logger,
+                    label=(
+                        f"platform=weibo note_id={note_id} "
+                        f"source_index={source_index}"
+                    ),
+                )
+            except ImageDownloadFetchError as exc:
+                await weibo_store.record_weibo_note_image_failure(
+                    note_id,
+                    {
+                        **asset,
+                        "attempts": exc.attempts,
+                        "http_status": exc.http_status,
+                        "error_code": exc.code,
+                    },
+                )
+                raise WeiboImageDownloadError(
+                    note_id, source_index, exc.code, exc.attempts
+                ) from exc
             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
             utils.logger.info(
                 f"[WeiboCrawler.get_note_images] Sleeping for "
