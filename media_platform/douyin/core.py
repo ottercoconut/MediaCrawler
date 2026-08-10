@@ -37,6 +37,7 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
+from tools.image_download_retry import fetch_image_bytes_with_retry
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import (
@@ -670,7 +671,7 @@ class DouYinCrawler(AbstractCrawler):
         Batch get note comments
         """
         if not config.ENABLE_GET_COMMENTS:
-            utils.logger.info(f"[DouYinCrawler.batch_get_note_comments] Crawling comment mode is not enabled")
+            utils.logger.info("[DouYinCrawler.batch_get_note_comments] Crawling comment mode is not enabled")
             return
 
         task_list: List[Task] = []
@@ -842,7 +843,7 @@ class DouYinCrawler(AbstractCrawler):
             aweme_item (Dict): 抖音作品详情
         """
         if not config.ENABLE_GET_MEIDAS:
-            utils.logger.info(f"[DouYinCrawler.get_aweme_media] Crawling image mode is not enabled")
+            utils.logger.info("[DouYinCrawler.get_aweme_media] Crawling image mode is not enabled")
             return
         await self.get_aweme_images(aweme_item)
 
@@ -861,25 +862,30 @@ class DouYinCrawler(AbstractCrawler):
             return
         fetched_assets: List[Dict] = []
         for asset in image_assets:
-            content = await self.dy_client.get_aweme_media(asset["url"])
+            source_index = int(asset["source_index"])
+            content, attempts = await fetch_image_bytes_with_retry(
+                lambda: self.dy_client.get_aweme_media(asset["url"]),
+                logger=utils.logger,
+                label=f"platform=douyin aweme_id={aweme_id} source_index={source_index}",
+            )
             await asyncio.sleep(random.random())
             if content is None:
                 await douyin_store.record_dy_aweme_image_failure(
                     aweme_id,
                     {
                         **asset,
-                        "attempts": 1,
+                        "attempts": attempts,
                         "http_status": None,
                         "error_code": "image_download_retryable",
                     },
                 )
                 raise DouyinImageDownloadError(
                     aweme_id,
-                    int(asset["source_index"]),
+                    source_index,
                     "image_download_retryable",
                 )
             fetched_assets.append(
-                {**asset, "content": content, "attempts": 1, "http_status": 200}
+                {**asset, "content": content, "attempts": attempts, "http_status": 200}
             )
         try:
             await douyin_store.update_dy_aweme_images(aweme_id, fetched_assets)
@@ -888,7 +894,7 @@ class DouYinCrawler(AbstractCrawler):
             failed_asset = next(
                 (
                     asset
-                    for asset in image_assets
+                    for asset in fetched_assets
                     if int(asset["source_index"]) == source_index
                 ),
                 image_assets[0],
@@ -897,7 +903,7 @@ class DouYinCrawler(AbstractCrawler):
                 aweme_id,
                 {
                     **failed_asset,
-                    "attempts": 1,
+                    "attempts": int(failed_asset.get("attempts") or 1),
                     "http_status": 200,
                     "error_code": exc.code,
                 },
@@ -924,5 +930,5 @@ class DouYinCrawler(AbstractCrawler):
         await asyncio.sleep(random.random())
         if content is None:
             return
-        extension_file_name = f"video.mp4"
+        extension_file_name = "video.mp4"
         await douyin_store.update_dy_aweme_video(aweme_id, content, extension_file_name)

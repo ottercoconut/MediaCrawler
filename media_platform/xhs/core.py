@@ -44,6 +44,7 @@ from model.m_xiaohongshu import NoteUrlInfo, CreatorUrlInfo
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
+from tools.image_download_retry import fetch_image_bytes_with_retry
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import (
     inspect_visible_page_state,
@@ -1778,25 +1779,30 @@ class XiaoHongShuCrawler(AbstractCrawler):
             return
         fetched_assets: List[Dict] = []
         for asset in image_assets:
-            content = await self.xhs_client.get_note_media(asset["url"])
+            source_index = int(asset["source_index"])
+            content, attempts = await fetch_image_bytes_with_retry(
+                lambda: self.xhs_client.get_note_media(asset["url"]),
+                logger=utils.logger,
+                label=f"platform=xhs note_id={note_id} source_index={source_index}",
+            )
             await asyncio.sleep(random.random())
             if content is None:
                 await xhs_store.record_xhs_note_image_failure(
                     note_id,
                     {
                         **asset,
-                        "attempts": 1,
+                        "attempts": attempts,
                         "http_status": None,
                         "error_code": "image_download_retryable",
                     },
                 )
                 raise XHSImageDownloadError(
                     note_id,
-                    int(asset["source_index"]),
+                    source_index,
                     "image_download_retryable",
                 )
             fetched_assets.append(
-                {**asset, "content": content, "attempts": 1, "http_status": 200}
+                {**asset, "content": content, "attempts": attempts, "http_status": 200}
             )
         try:
             await xhs_store.update_xhs_note_images(note_id, fetched_assets)
@@ -1805,7 +1811,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             failed_asset = next(
                 (
                     asset
-                    for asset in image_assets
+                    for asset in fetched_assets
                     if int(asset["source_index"]) == source_index
                 ),
                 image_assets[0],
@@ -1814,7 +1820,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 note_id,
                 {
                     **failed_asset,
-                    "attempts": 1,
+                    "attempts": int(failed_asset.get("attempts") or 1),
                     "http_status": 200,
                     "error_code": exc.code,
                 },

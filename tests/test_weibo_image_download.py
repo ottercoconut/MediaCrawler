@@ -74,10 +74,41 @@ async def test_get_note_images_passes_note_pid_order_and_url(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_transient_fetch_recovers_and_records_attempts(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        (0.0, 0.0),
+    )
+    crawler = WeiboCrawler()
+    crawler.wb_client = AsyncMock()
+    crawler.wb_client.get_note_image.side_effect = [None, png_bytes()]
+
+    await crawler.get_note_images(valid_mblog("recovered-note"))
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "weibo" / "image_manifest.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [(row["fetch_status"], row["attempts"]) for row in rows] == [
+        ("downloaded", 2)
+    ]
+    assert crawler.wb_client.get_note_image.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_failed_fetch_writes_only_failed_manifest(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
     monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
     monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        (0.0, 0.0),
+    )
     crawler = WeiboCrawler()
     crawler.wb_client = AsyncMock()
     crawler.wb_client.get_note_image.return_value = None
@@ -93,7 +124,9 @@ async def test_failed_fetch_writes_only_failed_manifest(monkeypatch, tmp_path):
     ]
     assert len(rows) == 1
     assert rows[0]["fetch_status"] == "failed"
+    assert rows[0]["attempts"] == 3
     assert rows[0]["staging_path"] is None
+    assert crawler.wb_client.get_note_image.await_count == 3
     assert not list((tmp_path / "weibo").rglob("*.png"))
 
 

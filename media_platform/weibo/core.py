@@ -42,6 +42,7 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import weibo as weibo_store
 from tools import utils
+from tools.image_download_retry import fetch_image_bytes_with_retry
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
@@ -400,7 +401,7 @@ class WeiboCrawler(AbstractCrawler):
         :return:
         """
         if not config.ENABLE_GET_COMMENTS:
-            utils.logger.info(f"[WeiboCrawler.batch_get_note_comments] Crawling comment mode is not enabled")
+            utils.logger.info("[WeiboCrawler.batch_get_note_comments] Crawling comment mode is not enabled")
             return
 
         utils.logger.info(f"[WeiboCrawler.batch_get_notes_comments] note ids:{note_id_list}")
@@ -453,7 +454,12 @@ class WeiboCrawler(AbstractCrawler):
             return
         fetched_assets: List[Dict] = []
         for asset in image_assets:
-            content = await self.wb_client.get_note_image(asset["url"])
+            source_index = int(asset["source_index"])
+            content, attempts = await fetch_image_bytes_with_retry(
+                lambda: self.wb_client.get_note_image(asset["url"]),
+                logger=utils.logger,
+                label=f"platform=weibo note_id={note_id} source_index={source_index}",
+            )
             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
             utils.logger.info(
                 f"[WeiboCrawler.get_note_images] Sleeping for "
@@ -462,21 +468,21 @@ class WeiboCrawler(AbstractCrawler):
             if content is None:
                 failure = {
                     **asset,
-                    "attempts": 1,
+                    "attempts": attempts,
                     "http_status": None,
                     "error_code": "image_download_retryable",
                 }
                 await weibo_store.record_weibo_note_image_failure(note_id, failure)
                 raise WeiboImageDownloadError(
                     note_id,
-                    int(asset["source_index"]),
+                    source_index,
                     "image_download_retryable",
                 )
             fetched_assets.append(
                 {
                     **asset,
                     "content": content,
-                    "attempts": 1,
+                    "attempts": attempts,
                     "http_status": 200,
                 }
             )
@@ -487,7 +493,7 @@ class WeiboCrawler(AbstractCrawler):
             failed_asset = next(
                 (
                     asset
-                    for asset in image_assets
+                    for asset in fetched_assets
                     if int(asset["source_index"]) == source_index
                 ),
                 image_assets[0],
@@ -496,7 +502,7 @@ class WeiboCrawler(AbstractCrawler):
                 note_id,
                 {
                     **failed_asset,
-                    "attempts": 1,
+                    "attempts": int(failed_asset.get("attempts") or 1),
                     "http_status": 200,
                     "error_code": exc.code,
                 },

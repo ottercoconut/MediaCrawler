@@ -41,6 +41,7 @@ from model.m_zhihu import ZhihuContent, ZhihuCreator
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import zhihu as zhihu_store
 from tools import utils
+from tools.image_download_retry import fetch_image_bytes_with_retry
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
@@ -731,8 +732,16 @@ class ZhihuCrawler(AbstractCrawler):
             return
         fetched_assets: List[Dict] = []
         for asset in image_assets:
-            payload = await self.zhihu_client.get_content_image(
-                asset["url"], referer=content.content_url
+            source_index = int(asset["source_index"])
+            payload, attempts = await fetch_image_bytes_with_retry(
+                lambda: self.zhihu_client.get_content_image(
+                    asset["url"], referer=content.content_url
+                ),
+                logger=utils.logger,
+                label=(
+                    f"platform=zhihu content_id={content_id} "
+                    f"source_index={source_index}"
+                ),
             )
             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
             if payload is None:
@@ -740,18 +749,18 @@ class ZhihuCrawler(AbstractCrawler):
                     content_id,
                     {
                         **asset,
-                        "attempts": 1,
+                        "attempts": attempts,
                         "http_status": None,
                         "error_code": "image_download_retryable",
                     },
                 )
                 raise ZhihuImageDownloadError(
                     content_id,
-                    int(asset["source_index"]),
+                    source_index,
                     "image_download_retryable",
                 )
             fetched_assets.append(
-                {**asset, "content": payload, "attempts": 1, "http_status": 200}
+                {**asset, "content": payload, "attempts": attempts, "http_status": 200}
             )
         try:
             await zhihu_store.update_zhihu_content_images(content_id, fetched_assets)
@@ -760,7 +769,7 @@ class ZhihuCrawler(AbstractCrawler):
             failed_asset = next(
                 (
                     asset
-                    for asset in image_assets
+                    for asset in fetched_assets
                     if int(asset["source_index"]) == source_index
                 ),
                 image_assets[0],
@@ -769,7 +778,7 @@ class ZhihuCrawler(AbstractCrawler):
                 content_id,
                 {
                     **failed_asset,
-                    "attempts": 1,
+                    "attempts": int(failed_asset.get("attempts") or 1),
                     "http_status": 200,
                     "error_code": exc.code,
                 },

@@ -67,10 +67,43 @@ async def test_one_image_object_downloads_one_authoritative_url_with_true_format
 
 
 @pytest.mark.asyncio
+async def test_transient_xhs_image_failure_recovers_and_records_attempts(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr("media_platform.xhs.core.random.random", lambda: 0)
+    monkeypatch.setattr(
+        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        (0.0, 0.0),
+    )
+    crawler = XiaoHongShuCrawler()
+    crawler.xhs_client = AsyncMock()
+    crawler.xhs_client.get_note_media.side_effect = [None, png_bytes()]
+
+    await crawler.get_note_images(image_note("xhs-recovered"))
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "xhs" / "image_manifest.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [(row["fetch_status"], row["attempts"]) for row in rows] == [
+        ("downloaded", 2)
+    ]
+    assert crawler.xhs_client.get_note_media.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_xhs_failed_image_writes_no_success_file_or_manifest(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
     monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
     monkeypatch.setattr("media_platform.xhs.core.random.random", lambda: 0)
+    monkeypatch.setattr(
+        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        (0.0, 0.0),
+    )
     crawler = XiaoHongShuCrawler()
     crawler.xhs_client = AsyncMock()
     crawler.xhs_client.get_note_media.return_value = None
@@ -86,7 +119,9 @@ async def test_xhs_failed_image_writes_no_success_file_or_manifest(monkeypatch, 
     ]
     assert len(rows) == 1
     assert rows[0]["fetch_status"] == "failed"
+    assert rows[0]["attempts"] == 3
     assert rows[0]["staging_path"] is None
+    assert crawler.xhs_client.get_note_media.await_count == 3
     assert not (tmp_path / "xhs" / "images" / "xhs-failed").exists()
 
 

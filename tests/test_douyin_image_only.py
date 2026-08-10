@@ -103,10 +103,43 @@ async def test_empty_or_video_candidate_reaches_no_image_or_video_bytes(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_transient_note_image_failure_recovers_and_records_attempts(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr("media_platform.douyin.core.random.random", lambda: 0)
+    monkeypatch.setattr(
+        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        (0.0, 0.0),
+    )
+    crawler = DouYinCrawler()
+    crawler.dy_client = AsyncMock()
+    crawler.dy_client.get_aweme_media.side_effect = [None, png_bytes()]
+
+    await crawler.get_aweme_images(image_aweme("dy-recovered"))
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "douyin" / "image_manifest.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [(row["fetch_status"], row["attempts"]) for row in rows] == [
+        ("downloaded", 2)
+    ]
+    assert crawler.dy_client.get_aweme_media.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_failed_note_image_writes_failed_manifest_only(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
     monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
     monkeypatch.setattr("media_platform.douyin.core.random.random", lambda: 0)
+    monkeypatch.setattr(
+        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        (0.0, 0.0),
+    )
     crawler = DouYinCrawler()
     crawler.dy_client = AsyncMock()
     crawler.dy_client.get_aweme_media.return_value = None
@@ -121,7 +154,9 @@ async def test_failed_note_image_writes_failed_manifest_only(monkeypatch, tmp_pa
         .splitlines()
     ]
     assert rows[0]["fetch_status"] == "failed"
+    assert rows[0]["attempts"] == 3
     assert rows[0]["staging_path"] is None
+    assert crawler.dy_client.get_aweme_media.await_count == 3
     assert not (tmp_path / "douyin" / "images" / "dy-failed").exists()
 
 

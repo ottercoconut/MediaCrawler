@@ -149,10 +149,43 @@ async def test_formula_avatar_profile_and_zvideo_never_request_image_bytes(
 
 
 @pytest.mark.asyncio
+async def test_transient_zhihu_image_failure_recovers_and_records_attempts(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        (0.0, 0.0),
+    )
+    crawler = ZhihuCrawler()
+    crawler.zhihu_client = AsyncMock()
+    crawler.zhihu_client.get_content_image.side_effect = [None, png_bytes()]
+
+    await crawler.get_content_images(observed_content("recovered-answer"))
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "zhihu" / "image_manifest.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [(row["fetch_status"], row["attempts"]) for row in rows] == [
+        ("downloaded", 2)
+    ]
+    assert crawler.zhihu_client.get_content_image.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_failed_zhihu_image_has_only_failed_manifest(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", True)
     monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
     monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        (0.0, 0.0),
+    )
     crawler = ZhihuCrawler()
     crawler.zhihu_client = AsyncMock()
     crawler.zhihu_client.get_content_image.return_value = None
@@ -168,5 +201,7 @@ async def test_failed_zhihu_image_has_only_failed_manifest(monkeypatch, tmp_path
     ]
     assert len(rows) == 1
     assert rows[0]["fetch_status"] == "failed"
+    assert rows[0]["attempts"] == 3
     assert rows[0]["staging_path"] is None
+    assert crawler.zhihu_client.get_content_image.await_count == 3
     assert not (tmp_path / "zhihu" / "images" / "failed-answer").exists()
