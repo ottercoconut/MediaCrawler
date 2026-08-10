@@ -194,27 +194,36 @@ async def test_known_id_and_invalid_note_are_skipped_before_media(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_image_failure_keeps_current_page_and_candidate_unseen(monkeypatch, tmp_path):
+async def test_image_failure_is_deferred_and_later_candidate_continues(monkeypatch, tmp_path):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
     crawler, state_path = prepare_search(
         monkeypatch,
         tmp_path,
-        [{"card_type": 9, "mblog": valid_mblog("retry-note")}],
+        [
+            {"card_type": 9, "mblog": valid_mblog("retry-note")},
+            {"card_type": 9, "mblog": valid_mblog("success-note")},
+        ],
     )
-    crawler.get_note_images.side_effect = WeiboImageDownloadError(
-        "retry-note", 0, "image_download_retryable"
-    )
+    crawler.get_note_images.side_effect = [
+        WeiboImageDownloadError(
+            "retry-note", 0, "image_download_retryable", attempts=3
+        ),
+        None,
+    ]
 
-    with pytest.raises(WeiboImageDownloadError):
-        await crawler.search()
+    await crawler.search()
 
-    weibo_core.weibo_store.update_weibo_note.assert_not_awaited()
+    weibo_core.weibo_store.update_weibo_note.assert_awaited_once()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "runtime_failed"
-    assert stopped["details"]["stop_detail"] == "image_download_failed"
+    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    assert deferred[0]["details"]["identity"] == "retry-note"
+    assert deferred[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "deferred_retry_pending"
+    assert stopped["details"]["stop_detail"] == "retryable_candidate_failures"
     assert stopped["details"]["resume_page"] == 1
-    assert stopped["details"]["candidate_count"] == 0
+    assert stopped["details"]["candidate_count"] == 2
+    assert stopped["details"]["candidate_identities"] == ["success-note"]
 
 
 @pytest.mark.asyncio

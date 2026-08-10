@@ -7,7 +7,11 @@ import pytest
 
 import config
 from media_platform.zhihu import core as zhihu_core
-from media_platform.zhihu.core import ZhihuCrawler, ZhihuDetailFetchError
+from media_platform.zhihu.core import (
+    ZhihuCrawler,
+    ZhihuDetailFetchError,
+    ZhihuImageDownloadError,
+)
 from media_platform.zhihu.exception import DataFetchError
 from model.m_zhihu import ZhihuContent
 from store import zhihu as zhihu_store
@@ -135,3 +139,69 @@ async def test_recoverable_detail_failure_keeps_zhihu_candidate_unseen(
     assert stopped["details"]["stop_detail"] == "content_detail_failed"
     assert stopped["details"]["resume_page"] == 4
     assert stopped["details"]["candidate_identities"] == []
+
+
+@pytest.mark.asyncio
+async def test_image_failure_is_deferred_and_later_zhihu_candidate_continues(
+    monkeypatch,
+    tmp_path,
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text('{"events": []}', encoding="utf-8")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
+    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setattr(config, "START_PAGE", 4)
+    monkeypatch.setattr(config, "KEYWORDS", "test")
+    monkeypatch.setattr(config, "CRAWLER_MAX_NOTES_COUNT", 20)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+
+    def content(content_id: str) -> ZhihuContent:
+        return ZhihuContent(
+            content_id=content_id,
+            question_id="question-1",
+            content_type="answer",
+            content_text="full body",
+            content_url=f"https://www.zhihu.com/question/1/answer/{content_id}",
+            created_time=1_700_000_000,
+            creator_hash=f"author-{content_id}",
+            user_nickname="author",
+            followers_observed=True,
+            image_list=[f"https://pic1.zhimg.com/{content_id}_r.jpg"],
+            content_detail_status="detail_observed",
+            content_detail_source="search_content",
+        )
+
+    crawler = ZhihuCrawler()
+    crawler.zhihu_client = AsyncMock()
+    crawler.zhihu_client.get_note_by_keyword.return_value = [
+        content("retry-image"),
+        content("success-image"),
+    ]
+    crawler.enrich_search_content_detail = AsyncMock(side_effect=lambda item: item)
+    crawler.get_content_images = AsyncMock(
+        side_effect=[
+            ZhihuImageDownloadError(
+                "retry-image", 0, "image_download_retryable", attempts=3
+            ),
+            None,
+        ]
+    )
+    crawler.batch_get_content_comments = AsyncMock(return_value=None)
+    store = AsyncMock(return_value=None)
+    monkeypatch.setattr(zhihu_core.zhihu_store, "update_zhihu_content", store)
+
+    await crawler.search()
+
+    store.assert_awaited_once()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert deferred[0]["details"]["identity"] == "retry-image"
+    assert deferred[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["resume_page"] == 4
+    assert stopped["details"]["candidate_identities"] == ["success-image"]

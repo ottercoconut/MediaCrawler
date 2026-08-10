@@ -164,7 +164,10 @@ class SearchClient:
     async def search_info_by_keyword(self, **kwargs):
         return {
             "status_code": 0,
-            "data": [{"aweme_info": image_aweme("retry-aweme")}],
+            "data": [
+                {"aweme_info": image_aweme("retry-aweme")},
+                {"aweme_info": image_aweme("success-aweme")},
+            ],
             "has_more": 1,
             "extra": {"logid": "fresh-search-id"},
         }
@@ -192,9 +195,12 @@ async def test_image_failure_keeps_page_offset_cursor_and_candidate_unseen(
     crawler.dy_client = SearchClient()
     crawler.enrich_aweme_creator = AsyncMock(side_effect=lambda aweme: aweme)
     crawler.get_aweme_images = AsyncMock(
-        side_effect=DouyinImageDownloadError(
-            "retry-aweme", 0, "image_download_retryable"
-        )
+        side_effect=[
+            DouyinImageDownloadError(
+                "retry-aweme", 0, "image_download_retryable", attempts=3
+            ),
+            None,
+        ]
     )
     crawler.batch_get_note_comments = AsyncMock(return_value=None)
     store = AsyncMock(return_value=None)
@@ -202,12 +208,15 @@ async def test_image_failure_keeps_page_offset_cursor_and_candidate_unseen(
 
     await crawler.search()
 
-    store.assert_not_awaited()
+    store.assert_awaited_once()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "runtime_failed"
-    assert stopped["details"]["stop_detail"] == "image_download_failed"
+    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    assert deferred[0]["details"]["identity"] == "retry-aweme"
+    assert deferred[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "target_new_met"
     assert stopped["details"]["resume_page"] == 1
     assert stopped["details"]["resume_offset"] == 0
     assert stopped["details"]["resume_cursor"] == ""
-    assert stopped["details"]["candidate_count"] == 0
+    assert stopped["details"]["candidate_count"] == 2
+    assert stopped["details"]["candidate_identities"] == ["success-aweme"]

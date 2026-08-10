@@ -72,7 +72,7 @@ XHS_NEW_PAGE_MIN_HOLD_SECONDS = 30.0
 class XHSImageDownloadError(RuntimeError):
     """An XHS post image failed before the candidate safe frontier."""
 
-    def __init__(self, note_id: str, source_index: int, code: str):
+    def __init__(self, note_id: str, source_index: int, code: str, attempts: int = 1):
         super().__init__(
             f"XHS image download failed: note_id={note_id}, "
             f"source_index={source_index}, code={code}"
@@ -80,6 +80,7 @@ class XHSImageDownloadError(RuntimeError):
         self.note_id = note_id
         self.source_index = source_index
         self.code = code
+        self.attempts = max(1, int(attempts))
 
 
 class XHSNoteDetailUnavailable(RuntimeError):
@@ -1140,7 +1141,22 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                     )
                                 )
                                 if valid:
-                                    await self.get_notice_media(note_detail)
+                                    try:
+                                        await self.get_notice_media(note_detail)
+                                    except XHSImageDownloadError as exc:
+                                        should_stop = accumulator.defer_retryable(
+                                            identity,
+                                            detail="image_download_failed",
+                                            error_code=exc.code,
+                                            attempts=exc.attempts,
+                                            source_index=exc.source_index,
+                                            source_page=requested_page,
+                                            source_cursor=search_id,
+                                            discovery_phase=discovery_phase,
+                                        )
+                                        if should_stop:
+                                            break
+                                        continue
                                 await xhs_store.update_xhs_note(note_detail)
                                 note_ids.append(note_detail.get("note_id"))
                                 xsec_tokens.append(note_detail.get("xsec_token"))
@@ -1188,20 +1204,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         page = requested_page + 1
                         phase_batches += 1
                         await self._guarded_pause("search_page", 12.0, 30.0)
-                    except XHSImageDownloadError as exc:
-                        utils.logger.error(
-                            "[XiaoHongShuCrawler.search] Image materialization failed "
-                            f"on page {requested_page}: {exc!r}"
-                        )
-                        accumulator.mark_runtime_failed(
-                            "image_download_failed",
-                            source_page=requested_page,
-                            source_cursor=search_id,
-                            resume_page=requested_page,
-                            resume_cursor=search_id,
-                            discovery_phase=discovery_phase,
-                        )
-                        break
                     except XHSNoteDetailUnavailable as exc:
                         utils.logger.error(
                             "[XiaoHongShuCrawler.search] Note detail remained unavailable "
@@ -1800,6 +1802,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     note_id,
                     source_index,
                     "image_download_retryable",
+                    attempts,
                 )
             fetched_assets.append(
                 {**asset, "content": content, "attempts": attempts, "http_status": 200}
@@ -1825,7 +1828,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     "error_code": exc.code,
                 },
             )
-            raise XHSImageDownloadError(note_id, source_index, exc.code) from exc
+            raise XHSImageDownloadError(
+                note_id,
+                source_index,
+                exc.code,
+                int(failed_asset.get("attempts") or 1),
+            ) from exc
 
     async def get_notice_video(self, note_item: Dict):
         """Get note videos. Please use get_notice_media

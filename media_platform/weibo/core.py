@@ -59,7 +59,7 @@ from .login import WeiboLogin
 class WeiboImageDownloadError(RuntimeError):
     """A post image failed before the candidate could cross the safe frontier."""
 
-    def __init__(self, note_id: str, source_index: int, code: str):
+    def __init__(self, note_id: str, source_index: int, code: str, attempts: int = 1):
         super().__init__(
             f"Weibo image download failed: note_id={note_id}, "
             f"source_index={source_index}, code={code}"
@@ -67,6 +67,7 @@ class WeiboImageDownloadError(RuntimeError):
         self.note_id = note_id
         self.source_index = source_index
         self.code = code
+        self.attempts = max(1, int(attempts))
 
 
 class WeiboFullTextFetchError(RuntimeError):
@@ -317,14 +318,19 @@ class WeiboCrawler(AbstractCrawler):
                         if valid:
                             try:
                                 await self.get_note_images(mblog)
-                            except WeiboImageDownloadError:
-                                accumulator.mark_runtime_failed(
-                                    "image_download_failed",
+                            except WeiboImageDownloadError as exc:
+                                should_stop = accumulator.defer_retryable(
+                                    note_id,
+                                    detail="image_download_failed",
+                                    error_code=exc.code,
+                                    attempts=exc.attempts,
+                                    source_index=exc.source_index,
                                     source_page=requested_page,
-                                    resume_page=requested_page,
                                     discovery_phase=discovery_phase,
                                 )
-                                raise
+                                if should_stop:
+                                    break
+                                continue
                         await weibo_store.update_weibo_note(note_item)
                         note_id_list.append(note_id)
                         should_stop = accumulator.consider(note_id, valid=valid)
@@ -477,6 +483,7 @@ class WeiboCrawler(AbstractCrawler):
                     note_id,
                     source_index,
                     "image_download_retryable",
+                    attempts,
                 )
             fetched_assets.append(
                 {
@@ -507,7 +514,12 @@ class WeiboCrawler(AbstractCrawler):
                     "error_code": exc.code,
                 },
             )
-            raise WeiboImageDownloadError(note_id, source_index, exc.code) from exc
+            raise WeiboImageDownloadError(
+                note_id,
+                source_index,
+                exc.code,
+                int(failed_asset.get("attempts") or 1),
+            ) from exc
 
     async def get_creators_and_notes(self) -> None:
         """

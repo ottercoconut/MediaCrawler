@@ -60,7 +60,7 @@ from .search_safety import inspect_empty_first_page
 class DouyinImageDownloadError(RuntimeError):
     """A Douyin note image failed before the candidate safe frontier."""
 
-    def __init__(self, aweme_id: str, source_index: int, code: str):
+    def __init__(self, aweme_id: str, source_index: int, code: str, attempts: int = 1):
         super().__init__(
             f"Douyin image download failed: aweme_id={aweme_id}, "
             f"source_index={source_index}, code={code}"
@@ -68,6 +68,7 @@ class DouyinImageDownloadError(RuntimeError):
         self.aweme_id = aweme_id
         self.source_index = source_index
         self.code = code
+        self.attempts = max(1, int(attempts))
 
 
 class DouYinCrawler(AbstractCrawler):
@@ -456,17 +457,21 @@ class DouYinCrawler(AbstractCrawler):
                                     "[DouYinCrawler.search] Image materialization failed: "
                                     f"{exc!r}"
                                 )
-                                accumulator.mark_runtime_failed(
-                                    "image_download_failed",
+                                should_stop = accumulator.defer_retryable(
+                                    aweme_id,
+                                    detail="image_download_failed",
+                                    error_code=exc.code,
+                                    attempts=exc.attempts,
+                                    source_index=exc.source_index,
                                     source_page=requested_page,
                                     source_offset=requested_offset,
                                     source_cursor=requested_search_id,
-                                    resume_page=requested_page,
-                                    resume_offset=requested_offset,
-                                    resume_cursor=requested_search_id,
                                     discovery_phase=discovery_phase,
                                 )
-                                return
+                                processed_count += 1
+                                if should_stop:
+                                    break
+                                continue
                         await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                         processed_count += 1
                         aweme_list.append(aweme_id)
@@ -883,6 +888,7 @@ class DouYinCrawler(AbstractCrawler):
                     aweme_id,
                     source_index,
                     "image_download_retryable",
+                    attempts,
                 )
             fetched_assets.append(
                 {**asset, "content": content, "attempts": attempts, "http_status": 200}
@@ -908,7 +914,12 @@ class DouYinCrawler(AbstractCrawler):
                     "error_code": exc.code,
                 },
             )
-            raise DouyinImageDownloadError(aweme_id, source_index, exc.code) from exc
+            raise DouyinImageDownloadError(
+                aweme_id,
+                source_index,
+                exc.code,
+                int(failed_asset.get("attempts") or 1),
+            ) from exc
 
     async def get_aweme_video(self, aweme_item: Dict):
         """

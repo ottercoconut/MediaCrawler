@@ -57,7 +57,7 @@ from .login import ZhiHuLogin
 class ZhihuImageDownloadError(RuntimeError):
     """A Zhihu body image failed before its content crossed the safe frontier."""
 
-    def __init__(self, content_id: str, source_index: int, code: str):
+    def __init__(self, content_id: str, source_index: int, code: str, attempts: int = 1):
         super().__init__(
             f"Zhihu image download failed: content_id={content_id}, "
             f"source_index={source_index}, code={code}"
@@ -65,6 +65,7 @@ class ZhihuImageDownloadError(RuntimeError):
         self.content_id = content_id
         self.source_index = source_index
         self.code = code
+        self.attempts = max(1, int(attempts))
 
 
 class ZhihuDetailFetchError(RuntimeError):
@@ -415,7 +416,22 @@ class ZhihuCrawler(AbstractCrawler):
                                 and content.followers_observed
                             )
                             if valid:
-                                await self.get_content_images(content)
+                                try:
+                                    await self.get_content_images(content)
+                                except ZhihuImageDownloadError as exc:
+                                    should_stop = accumulator.defer_retryable(
+                                        str(content.content_id or ""),
+                                        detail="image_download_failed",
+                                        error_code=exc.code,
+                                        attempts=exc.attempts,
+                                        source_index=exc.source_index,
+                                        source_page=requested_page,
+                                        discovery_phase=discovery_phase,
+                                    )
+                                    processed_count += 1
+                                    if should_stop:
+                                        break
+                                    continue
                             processed_count += 1
                             stored_contents.append(content)
                             await zhihu_store.update_zhihu_content(content)
@@ -437,18 +453,6 @@ class ZhihuCrawler(AbstractCrawler):
                             count_stagnation=discovery_phase == "frontier",
                         ):
                             break
-                    except ZhihuImageDownloadError as exc:
-                        utils.logger.error(
-                            "[ZhihuCrawler.search] Image materialization failed "
-                            f"on page {requested_page}: {exc!r}"
-                        )
-                        accumulator.mark_runtime_failed(
-                            "image_download_failed",
-                            source_page=requested_page,
-                            resume_page=requested_page,
-                            discovery_phase=discovery_phase,
-                        )
-                        return
                     except ZhihuDetailFetchError as exc:
                         utils.logger.error(
                             "[ZhihuCrawler.search] Full content detail failed "
@@ -758,6 +762,7 @@ class ZhihuCrawler(AbstractCrawler):
                     content_id,
                     source_index,
                     "image_download_retryable",
+                    attempts,
                 )
             fetched_assets.append(
                 {**asset, "content": payload, "attempts": attempts, "http_status": 200}
@@ -783,7 +788,12 @@ class ZhihuCrawler(AbstractCrawler):
                     "error_code": exc.code,
                 },
             )
-            raise ZhihuImageDownloadError(content_id, source_index, exc.code) from exc
+            raise ZhihuImageDownloadError(
+                content_id,
+                source_index,
+                exc.code,
+                int(failed_asset.get("attempts") or 1),
+            ) from exc
 
     async def create_zhihu_client(self, httpx_proxy: Optional[str]) -> ZhiHuClient:
         """Create zhihu client"""

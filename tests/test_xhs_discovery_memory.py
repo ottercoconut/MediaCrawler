@@ -10,7 +10,11 @@ import config
 from playwright.async_api import Error as PlaywrightError
 from tenacity import Future, RetryError
 from media_platform.xhs import core as xhs_core
-from media_platform.xhs.core import XiaoHongShuCrawler, XHSNoteDetailUnavailable
+from media_platform.xhs.core import (
+    XiaoHongShuCrawler,
+    XHSImageDownloadError,
+    XHSNoteDetailUnavailable,
+)
 from media_platform.xhs.exception import DataFetchError
 
 
@@ -224,6 +228,41 @@ async def test_recoverable_detail_failure_keeps_xhs_candidate_unseen(
     assert stopped["details"]["resume_page"] == 3
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["candidate_identities"] == []
+
+
+@pytest.mark.asyncio
+async def test_image_failure_is_deferred_and_later_xhs_candidate_continues(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[{"id": "retry-image"}, {"id": "success-image"}],
+    )
+    crawler.get_notice_media = AsyncMock(
+        side_effect=[
+            XHSImageDownloadError(
+                "retry-image", 0, "image_download_retryable", attempts=3
+            ),
+            None,
+        ]
+    )
+
+    await crawler.search()
+
+    xhs_core.xhs_store.update_xhs_note.assert_awaited_once()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert deferred[0]["details"]["identity"] == "retry-image"
+    assert deferred[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["candidate_identities"] == ["success-image"]
 
 
 @pytest.mark.asyncio

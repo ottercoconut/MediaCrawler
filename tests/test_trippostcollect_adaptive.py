@@ -67,6 +67,81 @@ def test_runtime_failure_has_distinct_stop_reason(monkeypatch, tmp_path) -> None
     assert event["details"]["source_page"] == 3
 
 
+def test_retryable_candidate_is_deferred_without_becoming_seen(
+    monkeypatch, tmp_path
+) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"events": []}), encoding="utf-8")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
+    accumulator = AdaptiveAccumulator(
+        platform="zhihu",
+        hard_limit=10,
+        target_new=2,
+        max_stagnant_batches=1,
+    )
+    accumulator.begin_batch()
+
+    assert accumulator.defer_retryable(
+        "answer-1",
+        detail="image_download_failed",
+        error_code="image_download_retryable",
+        attempts=3,
+        source_index=2,
+        source_page=4,
+    ) is False
+    assert accumulator.is_known("answer-1") is True
+    assert "answer-1" not in accumulator.seen_candidate_identities
+    assert accumulator.finish_batch(source_page=5, resume_page=6) is True
+
+    summary = accumulator.summary()
+    assert summary["stop_reason"] == "deferred_retry_pending"
+    assert summary["resume_page"] == 4
+    assert summary["batch_complete"] is False
+    assert summary["candidate_count"] == 1
+    assert summary["candidate_identities"] == []
+    assert summary["deferred_retryable_failures"][0]["attempts"] == 3
+
+
+def test_source_exhaustion_is_not_claimed_while_deferred_candidate_remains(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tools.trippostcollect_adaptive.append_execution_event",
+        lambda *args, **kwargs: None,
+    )
+    accumulator = AdaptiveAccumulator(
+        platform="xhs",
+        hard_limit=10,
+        target_new=5,
+        max_stagnant_batches=3,
+        completion_mode="source-exhausted",
+    )
+    accumulator.defer_retryable(
+        "note-1",
+        detail="image_download_failed",
+        error_code="image_download_retryable",
+        attempts=3,
+        source_page=2,
+        source_cursor="search-id",
+    )
+
+    accumulator.mark_source_exhausted(
+        "has_more_false",
+        source_page=4,
+        source_cursor="search-id",
+        source_has_more=False,
+        resume_page=5,
+        resume_cursor="search-id",
+    )
+
+    summary = accumulator.summary()
+    assert summary["stop_reason"] == "deferred_retry_pending"
+    assert summary["stop_detail"] == "retryable_candidate_failures"
+    assert summary["resume_page"] == 2
+    assert summary["resume_cursor"] == "search-id"
+    assert summary["source_has_more"] is True
+
+
 def test_existing_database_identity_does_not_advance_new_target(monkeypatch, tmp_path) -> None:
     db_path = tmp_path / "posts.sqlite"
     with sqlite3.connect(db_path) as conn:
