@@ -259,7 +259,7 @@ async def test_image_failure_is_deferred_and_later_zhihu_candidate_continues(
 
 
 @pytest.mark.asyncio
-async def test_terminal_image_failure_stops_zhihu_page_without_deferral(
+async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
     monkeypatch, tmp_path
 ):
     state_path = tmp_path / "state.json"
@@ -288,14 +288,31 @@ async def test_terminal_image_failure_stops_zhihu_page_without_deferral(
         content_detail_status="detail_observed",
         content_detail_source="search_content",
     )
+    success = ZhihuContent(
+        content_id="success-image",
+        question_id="question-2",
+        content_type="answer",
+        content_text="full body",
+        content_url="https://www.zhihu.com/question/2/answer/success-image",
+        created_time=1_700_000_000,
+        creator_hash="author-success",
+        user_nickname="author",
+        followers_observed=True,
+        image_list=["https://pic1.zhimg.com/success_r.jpg"],
+        content_detail_status="detail_observed",
+        content_detail_source="search_content",
+    )
     crawler = ZhihuCrawler()
     crawler.zhihu_client = AsyncMock()
-    crawler.zhihu_client.get_note_by_keyword.return_value = [terminal]
+    crawler.zhihu_client.get_note_by_keyword.return_value = [terminal, success]
     crawler.enrich_search_content_detail = AsyncMock(side_effect=lambda item: item)
     crawler.get_content_images = AsyncMock(
-        side_effect=ZhihuImageDownloadError(
-            "terminal-image", 0, "image_non_raster_response", attempts=1
-        )
+        side_effect=[
+            ZhihuImageDownloadError(
+                "terminal-image", 0, "image_non_raster_response", attempts=1
+            ),
+            None,
+        ]
     )
     crawler.batch_get_content_comments = AsyncMock(return_value=None)
     store = AsyncMock(return_value=None)
@@ -303,13 +320,12 @@ async def test_terminal_image_failure_stops_zhihu_page_without_deferral(
 
     await crawler.search()
 
-    store.assert_not_awaited()
+    store.assert_awaited_once()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    assert not [event for event in events if event["type"] == "candidate_deferred"]
+    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    assert deferred[0]["details"]["identity"] == "terminal-image"
+    assert deferred[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "runtime_failed"
-    assert stopped["details"]["stop_detail"] == (
-        "image_materialization_terminal:image_non_raster_response"
-    )
+    assert stopped["details"]["stop_reason"] == "target_new_met"
     assert stopped["details"]["resume_page"] == 4
-    assert stopped["details"]["candidate_identities"] == []
+    assert stopped["details"]["candidate_identities"] == ["success-image"]

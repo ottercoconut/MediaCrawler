@@ -266,7 +266,7 @@ async def test_image_failure_is_deferred_and_later_xhs_candidate_continues(
 
 
 @pytest.mark.asyncio
-async def test_terminal_image_failure_stops_xhs_cursor_without_deferral(
+async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
     monkeypatch,
     tmp_path,
 ):
@@ -278,25 +278,27 @@ async def test_terminal_image_failure_stops_xhs_cursor_without_deferral(
         items=[{"id": "terminal-image"}, {"id": "must-not-store"}],
     )
     crawler.get_notice_media = AsyncMock(
-        side_effect=XHSImageDownloadError(
-            "terminal-image", 0, "image_decode_failed", attempts=1
-        )
+        side_effect=[
+            XHSImageDownloadError(
+                "terminal-image", 0, "image_decode_failed", attempts=1
+            ),
+            None,
+        ]
     )
 
     await crawler.search()
 
-    xhs_core.xhs_store.update_xhs_note.assert_not_awaited()
-    assert crawler.get_notice_media.await_count == 1
+    xhs_core.xhs_store.update_xhs_note.assert_awaited_once()
+    assert crawler.get_notice_media.await_count == 2
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    assert not [event for event in events if event["type"] == "candidate_deferred"]
+    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    assert deferred[0]["details"]["identity"] == "terminal-image"
+    assert deferred[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "runtime_failed"
-    assert stopped["details"]["stop_detail"] == (
-        "image_materialization_terminal:image_decode_failed"
-    )
+    assert stopped["details"]["stop_reason"] == "target_new_met"
     assert stopped["details"]["resume_page"] == 3
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
-    assert stopped["details"]["candidate_identities"] == []
+    assert stopped["details"]["candidate_identities"] == ["must-not-store"]
 
 
 @pytest.mark.asyncio

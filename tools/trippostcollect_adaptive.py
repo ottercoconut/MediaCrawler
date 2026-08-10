@@ -155,8 +155,8 @@ class AdaptiveAccumulator:
     last_batch_complete: bool = False
     last_discovery_phase: str = "frontier"
     stop_detail: str = ""
-    deferred_retryable_failures: list[dict[str, Any]] = field(default_factory=list)
-    deferred_retryable_identities: set[str] = field(default_factory=set)
+    deferred_image_failures: list[dict[str, Any]] = field(default_factory=list)
+    deferred_image_identities: set[str] = field(default_factory=set)
     _deferred_resume: dict[str, Any] | None = None
     _batch_new_before: int = 0
     _batch_candidate_before: int = 0
@@ -203,7 +203,7 @@ class AdaptiveAccumulator:
             and (
                 identity in self.existing_identities
                 or identity in self.seen_candidate_identities
-                or identity in self.deferred_retryable_identities
+                or identity in self.deferred_image_identities
             )
         )
 
@@ -211,7 +211,7 @@ class AdaptiveAccumulator:
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
             self.stop_reason = (
                 "deferred_retry_pending"
-                if self.deferred_retryable_failures
+                if self.deferred_image_failures
                 else "candidate_hard_limit_reached"
             )
             return True
@@ -229,13 +229,13 @@ class AdaptiveAccumulator:
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
             self.stop_reason = (
                 "deferred_retry_pending"
-                if self.deferred_retryable_failures
+                if self.deferred_image_failures
                 else "candidate_hard_limit_reached"
             )
             return True
         return False
 
-    def defer_retryable(
+    def defer_image_failure(
         self,
         identity: str,
         *,
@@ -248,12 +248,12 @@ class AdaptiveAccumulator:
         source_cursor: int | str | None = None,
         discovery_phase: str = "frontier",
     ) -> bool:
-        """Record a retryable candidate without crossing its safe frontier."""
+        """Record an image-failed candidate without crossing its safe frontier."""
 
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
             self.stop_reason = (
                 "deferred_retry_pending"
-                if self.deferred_retryable_failures
+                if self.deferred_image_failures
                 else "candidate_hard_limit_reached"
             )
             return True
@@ -270,9 +270,10 @@ class AdaptiveAccumulator:
             "source_cursor": source_cursor,
             "discovery_phase": discovery_phase,
         }
-        self.deferred_retryable_failures.append(failure)
+        failure["retryable"] = error_code == "image_download_retryable"
+        self.deferred_image_failures.append(failure)
         if identity:
-            self.deferred_retryable_identities.add(identity)
+            self.deferred_image_identities.add(identity)
         if self._deferred_resume is None:
             self._deferred_resume = {
                 "resume_page": source_page,
@@ -362,7 +363,7 @@ class AdaptiveAccumulator:
         ):
             self.stop_reason = (
                 "deferred_retry_pending"
-                if self.deferred_retryable_failures
+                if self.deferred_image_failures
                 else "stagnated"
             )
         details = {
@@ -429,16 +430,16 @@ class AdaptiveAccumulator:
             discovery_phase=discovery_phase,
         )
         if not self.stop_reason or (
-            self.stop_reason == "stagnated" and self.deferred_retryable_failures
+            self.stop_reason == "stagnated" and self.deferred_image_failures
         ):
             self.stop_reason = (
                 "deferred_retry_pending"
-                if self.deferred_retryable_failures
+                if self.deferred_image_failures
                 else "source_exhausted"
             )
         self.stop_detail = (
-            "retryable_candidate_failures"
-            if self.deferred_retryable_failures
+            "image_candidate_failures"
+            if self.deferred_image_failures
             else detail
         )
         append_execution_event("adaptive_search_stopped", self.summary())
@@ -501,11 +502,11 @@ class AdaptiveAccumulator:
             result.update(self._deferred_resume)
             result["batch_complete"] = False
             result["source_has_more"] = True
-        result["deferred_retryable_count"] = len(
-            self.deferred_retryable_failures
+        result["deferred_image_count"] = len(
+            self.deferred_image_failures
         )
-        result["deferred_retryable_failures"] = list(
-            self.deferred_retryable_failures
+        result["deferred_image_failures"] = list(
+            self.deferred_image_failures
         )
         result["candidate_identities"] = sorted(self.seen_candidate_identities)
         return result

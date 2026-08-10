@@ -249,7 +249,7 @@ async def test_image_failure_keeps_page_offset_cursor_and_candidate_unseen(
 
 
 @pytest.mark.asyncio
-async def test_terminal_image_failure_stops_cursor_without_deferral(
+async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
     monkeypatch, tmp_path
 ):
     state_path = tmp_path / "state.json"
@@ -270,9 +270,12 @@ async def test_terminal_image_failure_stops_cursor_without_deferral(
     crawler.dy_client = SearchClient()
     crawler.enrich_aweme_creator = AsyncMock(side_effect=lambda aweme: aweme)
     crawler.get_aweme_images = AsyncMock(
-        side_effect=DouyinImageDownloadError(
-            "retry-aweme", 0, "image_too_large", attempts=1
-        )
+        side_effect=[
+            DouyinImageDownloadError(
+                "retry-aweme", 0, "image_too_large", attempts=1
+            ),
+            None,
+        ]
     )
     crawler.batch_get_note_comments = AsyncMock(return_value=None)
     store = AsyncMock(return_value=None)
@@ -280,15 +283,14 @@ async def test_terminal_image_failure_stops_cursor_without_deferral(
 
     await crawler.search()
 
-    store.assert_not_awaited()
-    assert crawler.get_aweme_images.await_count == 1
+    store.assert_awaited_once()
+    assert crawler.get_aweme_images.await_count == 2
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    assert not [event for event in events if event["type"] == "candidate_deferred"]
+    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    assert deferred[0]["details"]["identity"] == "retry-aweme"
+    assert deferred[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "runtime_failed"
-    assert stopped["details"]["stop_detail"] == (
-        "image_materialization_terminal:image_too_large"
-    )
+    assert stopped["details"]["stop_reason"] == "target_new_met"
     assert stopped["details"]["resume_page"] == 1
     assert stopped["details"]["resume_offset"] == 0
-    assert stopped["details"]["candidate_identities"] == []
+    assert stopped["details"]["candidate_identities"] == ["success-aweme"]

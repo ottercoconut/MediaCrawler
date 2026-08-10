@@ -246,14 +246,16 @@ async def test_image_failure_is_deferred_and_later_candidate_continues(monkeypat
     assert deferred[0]["details"]["identity"] == "retry-note"
     assert deferred[0]["details"]["attempts"] == 3
     assert stopped["details"]["stop_reason"] == "deferred_retry_pending"
-    assert stopped["details"]["stop_detail"] == "retryable_candidate_failures"
+    assert stopped["details"]["stop_detail"] == "image_candidate_failures"
     assert stopped["details"]["resume_page"] == 1
     assert stopped["details"]["candidate_count"] == 2
     assert stopped["details"]["candidate_identities"] == ["success-note"]
 
 
 @pytest.mark.asyncio
-async def test_terminal_image_failure_stops_page_without_deferral(monkeypatch, tmp_path):
+async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
+    monkeypatch, tmp_path
+):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
     crawler, state_path = prepare_search(
         monkeypatch,
@@ -263,24 +265,26 @@ async def test_terminal_image_failure_stops_page_without_deferral(monkeypatch, t
             {"card_type": 9, "mblog": valid_mblog("must-not-store")},
         ],
     )
-    crawler.get_note_images.side_effect = WeiboImageDownloadError(
-        "terminal-note", 0, "image_decode_failed", attempts=1
-    )
+    crawler.get_note_images.side_effect = [
+        WeiboImageDownloadError(
+            "terminal-note", 0, "image_decode_failed", attempts=1
+        ),
+        None,
+    ]
 
-    with pytest.raises(WeiboImageDownloadError):
-        await crawler.search()
+    await crawler.search()
 
-    weibo_core.weibo_store.update_weibo_note.assert_not_awaited()
-    assert crawler.get_note_images.await_count == 1
+    weibo_core.weibo_store.update_weibo_note.assert_awaited_once()
+    assert crawler.get_note_images.await_count == 2
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    assert not [event for event in events if event["type"] == "candidate_deferred"]
+    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    assert deferred[0]["details"]["identity"] == "terminal-note"
+    assert deferred[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "runtime_failed"
-    assert stopped["details"]["stop_detail"] == (
-        "image_materialization_terminal:image_decode_failed"
-    )
+    assert stopped["details"]["stop_reason"] == "deferred_retry_pending"
+    assert stopped["details"]["stop_detail"] == "image_candidate_failures"
     assert stopped["details"]["resume_page"] == 1
-    assert stopped["details"]["candidate_identities"] == []
+    assert stopped["details"]["candidate_identities"] == ["must-not-store"]
 
 
 @pytest.mark.asyncio

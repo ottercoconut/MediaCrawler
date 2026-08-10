@@ -47,7 +47,6 @@ from tools import utils
 from tools.image_download_retry import (
     ImageDownloadFetchError,
     fetch_image_bytes_with_retry,
-    is_retryable_image_error,
 )
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import (
@@ -1148,17 +1147,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                     try:
                                         await self.get_notice_media(note_detail)
                                     except XHSImageDownloadError as exc:
-                                        if not is_retryable_image_error(exc.code):
-                                            accumulator.mark_runtime_failed(
-                                                f"image_materialization_terminal:{exc.code}",
-                                                source_page=requested_page,
-                                                source_cursor=search_id,
-                                                resume_page=requested_page,
-                                                resume_cursor=search_id,
-                                                discovery_phase=discovery_phase,
-                                            )
-                                            return
-                                        should_stop = accumulator.defer_retryable(
+                                        should_stop = accumulator.defer_image_failure(
                                             identity,
                                             detail="image_download_failed",
                                             error_code=exc.code,

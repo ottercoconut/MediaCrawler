@@ -67,7 +67,7 @@ def test_runtime_failure_has_distinct_stop_reason(monkeypatch, tmp_path) -> None
     assert event["details"]["source_page"] == 3
 
 
-def test_retryable_candidate_is_deferred_without_becoming_seen(
+def test_image_failed_candidate_is_deferred_without_becoming_seen(
     monkeypatch, tmp_path
 ) -> None:
     state_path = tmp_path / "state.json"
@@ -81,7 +81,7 @@ def test_retryable_candidate_is_deferred_without_becoming_seen(
     )
     accumulator.begin_batch()
 
-    assert accumulator.defer_retryable(
+    assert accumulator.defer_image_failure(
         "answer-1",
         detail="image_download_failed",
         error_code="image_download_retryable",
@@ -99,7 +99,8 @@ def test_retryable_candidate_is_deferred_without_becoming_seen(
     assert summary["batch_complete"] is False
     assert summary["candidate_count"] == 1
     assert summary["candidate_identities"] == []
-    assert summary["deferred_retryable_failures"][0]["attempts"] == 3
+    assert summary["deferred_image_failures"][0]["attempts"] == 3
+    assert summary["deferred_image_failures"][0]["retryable"] is True
 
 
 def test_source_exhaustion_is_not_claimed_while_deferred_candidate_remains(
@@ -116,7 +117,7 @@ def test_source_exhaustion_is_not_claimed_while_deferred_candidate_remains(
         max_stagnant_batches=3,
         completion_mode="source-exhausted",
     )
-    accumulator.defer_retryable(
+    accumulator.defer_image_failure(
         "note-1",
         detail="image_download_failed",
         error_code="image_download_retryable",
@@ -136,7 +137,7 @@ def test_source_exhaustion_is_not_claimed_while_deferred_candidate_remains(
 
     summary = accumulator.summary()
     assert summary["stop_reason"] == "deferred_retry_pending"
-    assert summary["stop_detail"] == "retryable_candidate_failures"
+    assert summary["stop_detail"] == "image_candidate_failures"
     assert summary["resume_page"] == 2
     assert summary["resume_cursor"] == "search-id"
     assert summary["source_has_more"] is True
@@ -156,7 +157,7 @@ def test_deferred_candidate_exactly_at_hard_limit_stays_retry_pending(
         max_stagnant_batches=3,
     )
 
-    stopped = accumulator.defer_retryable(
+    stopped = accumulator.defer_image_failure(
         "mblog-1",
         detail="image_download_failed",
         error_code="image_download_retryable",
