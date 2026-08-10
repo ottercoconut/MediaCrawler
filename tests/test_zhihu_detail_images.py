@@ -17,6 +17,24 @@ from model.m_zhihu import ZhihuContent
 from store import zhihu as zhihu_store
 
 
+def test_zhihu_numeric_width_variants_share_one_logical_asset() -> None:
+    content = ZhihuContent(
+        content_id="numeric-width-variants",
+        content_type="answer",
+        content_detail_status="detail_observed",
+        image_list=[
+            "https://pic1.zhimg.com/v2-same-asset_r.jpg",
+            "https://pic2.zhimg.com/v2-same-asset_720w.jpg",
+            "https://pic3.zhimg.com/v2-same-asset_1440w.webp",
+        ],
+    )
+
+    assets = zhihu_store.zhihu_content_image_assets(content)
+
+    assert len(assets) == 1
+    assert assets[0]["url"] == "https://pic1.zhimg.com/v2-same-asset_r.jpg"
+
+
 @pytest.mark.asyncio
 async def test_search_payload_with_body_images_becomes_observed_without_detail_request(
     monkeypatch,

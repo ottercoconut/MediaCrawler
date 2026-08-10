@@ -28,7 +28,7 @@ FORMAT_METADATA = {
 }
 XHS_STABLE_PATH_MARKERS = ("/notes_pre_post/", "/notes_post/", "/notes/")
 ZHIMG_TRANSFORM_SUFFIX_RE = re.compile(
-    r"_(?:b|r|qhd|hd|xs|s|m|l|xl|xxl|original|watermark)"
+    r"_(?:[1-9]\d{1,4}w|b|r|qhd|hd|xs|s|m|l|xl|xxl|original|watermark)"
     r"\.(?:avif|gif|jpe?g|png|webp)$",
     re.IGNORECASE,
 )
