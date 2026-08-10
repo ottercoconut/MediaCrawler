@@ -35,6 +35,39 @@ def test_zhihu_numeric_width_variants_share_one_logical_asset() -> None:
     assert assets[0]["url"] == "https://pic1.zhimg.com/v2-same-asset_r.jpg"
 
 
+@pytest.mark.parametrize("hostname", ["cdn.example", "evilzhimg.com"])
+def test_zhihu_transform_suffixes_do_not_merge_non_zhimg_assets(hostname: str) -> None:
+    content = ZhihuContent(
+        content_id=f"external-{hostname}",
+        content_type="answer",
+        content_detail_status="detail_observed",
+        image_list=[
+            f"https://{hostname}/v2-same-asset_r.jpg",
+            f"https://{hostname}/v2-same-asset_720w.jpg",
+        ],
+    )
+
+    assets = zhihu_store.zhihu_content_image_assets(content)
+
+    assert len(assets) == 2
+
+
+def test_zhihu_encoded_transform_suffix_uses_real_zhimg_asset_identity() -> None:
+    content = ZhihuContent(
+        content_id="encoded-width-variant",
+        content_type="answer",
+        content_detail_status="detail_observed",
+        image_list=[
+            "https://pic1.zhimg.com/v2-same-asset_r.jpg",
+            "https://pic2.zhimg.com/v2-same-asset%5F720w.jpg",
+        ],
+    )
+
+    assets = zhihu_store.zhihu_content_image_assets(content)
+
+    assert len(assets) == 1
+
+
 @pytest.mark.asyncio
 async def test_search_payload_with_body_images_becomes_observed_without_detail_request(
     monkeypatch,

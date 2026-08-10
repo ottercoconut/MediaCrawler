@@ -12,7 +12,7 @@ import re
 import secrets
 import shutil
 from typing import Iterable, Sequence
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from PIL import Image, UnidentifiedImageError
 
@@ -117,11 +117,14 @@ def xhs_source_asset_key(source_url: str) -> str:
 def zhihu_source_asset_key(source_url: str) -> str:
     normalized = normalize_image_url(source_url)
     parsed = urlsplit(normalized)
-    logical_path = ZHIMG_TRANSFORM_SUFFIX_RE.sub("", parsed.path)
-    if parsed.hostname.lower().endswith("zhimg.com"):
+    hostname = parsed.hostname.lower()
+    path = unquote(parsed.path)
+    is_zhimg = hostname == "zhimg.com" or hostname.endswith(".zhimg.com")
+    if is_zhimg:
+        logical_path = ZHIMG_TRANSFORM_SUFFIX_RE.sub("", path)
         identity = RASTER_SUFFIX_RE.sub("", logical_path)
     else:
-        identity = f"{parsed.hostname.lower()}{logical_path}"
+        identity = f"{hostname}{path}"
     return f"zhihu:urlsha256:{sha256(identity.encode('utf-8')).hexdigest()}"
 
 
