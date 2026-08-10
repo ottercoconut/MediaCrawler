@@ -266,6 +266,40 @@ async def test_image_failure_is_deferred_and_later_xhs_candidate_continues(
 
 
 @pytest.mark.asyncio
+async def test_terminal_image_failure_stops_xhs_cursor_without_deferral(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[{"id": "terminal-image"}, {"id": "must-not-store"}],
+    )
+    crawler.get_notice_media = AsyncMock(
+        side_effect=XHSImageDownloadError(
+            "terminal-image", 0, "image_decode_failed", attempts=1
+        )
+    )
+
+    await crawler.search()
+
+    xhs_core.xhs_store.update_xhs_note.assert_not_awaited()
+    assert crawler.get_notice_media.await_count == 1
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not [event for event in events if event["type"] == "candidate_deferred"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == (
+        "image_materialization_terminal:image_decode_failed"
+    )
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["candidate_identities"] == []
+
+
+@pytest.mark.asyncio
 async def test_wrapped_login_expiry_waits_and_retries_same_search_page(
     monkeypatch,
     tmp_path,

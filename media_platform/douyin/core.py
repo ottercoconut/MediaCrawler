@@ -37,7 +37,10 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
-from tools.image_download_retry import fetch_image_bytes_with_retry
+from tools.image_download_retry import (
+    fetch_image_bytes_with_retry,
+    is_retryable_image_error,
+)
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import (
@@ -457,6 +460,18 @@ class DouYinCrawler(AbstractCrawler):
                                     "[DouYinCrawler.search] Image materialization failed: "
                                     f"{exc!r}"
                                 )
+                                if not is_retryable_image_error(exc.code):
+                                    accumulator.mark_runtime_failed(
+                                        f"image_materialization_terminal:{exc.code}",
+                                        source_page=requested_page,
+                                        source_offset=requested_offset,
+                                        source_cursor=requested_search_id,
+                                        resume_page=requested_page,
+                                        resume_offset=requested_offset,
+                                        resume_cursor=requested_search_id,
+                                        discovery_phase=discovery_phase,
+                                    )
+                                    return
                                 should_stop = accumulator.defer_retryable(
                                     aweme_id,
                                     detail="image_download_failed",

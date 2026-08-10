@@ -44,7 +44,10 @@ from model.m_xiaohongshu import NoteUrlInfo, CreatorUrlInfo
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
-from tools.image_download_retry import fetch_image_bytes_with_retry
+from tools.image_download_retry import (
+    fetch_image_bytes_with_retry,
+    is_retryable_image_error,
+)
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import (
     inspect_visible_page_state,
@@ -1144,6 +1147,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                     try:
                                         await self.get_notice_media(note_detail)
                                     except XHSImageDownloadError as exc:
+                                        if not is_retryable_image_error(exc.code):
+                                            accumulator.mark_runtime_failed(
+                                                f"image_materialization_terminal:{exc.code}",
+                                                source_page=requested_page,
+                                                source_cursor=search_id,
+                                                resume_page=requested_page,
+                                                resume_cursor=search_id,
+                                                discovery_phase=discovery_phase,
+                                            )
+                                            return
                                         should_stop = accumulator.defer_retryable(
                                             identity,
                                             detail="image_download_failed",

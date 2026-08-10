@@ -14,7 +14,7 @@ import shutil
 from typing import Iterable, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -62,6 +62,16 @@ class InspectedImage:
     height: int
     size_bytes: int
     sha256: str
+
+
+def looks_like_supported_raster(content: bytes) -> bool:
+    return bool(
+        content.startswith(b"\xff\xd8\xff")
+        or content.startswith(b"\x89PNG\r\n\x1a\n")
+        or content.startswith((b"GIF87a", b"GIF89a"))
+        or (content.startswith(b"RIFF") and content[8:12] == b"WEBP")
+        or (len(content) >= 12 and content[4:12] in {b"ftypavif", b"ftypavis"})
+    )
 
 
 def normalize_image_url(value: str) -> str:
@@ -127,23 +137,37 @@ def inspect_image_bytes(content: bytes) -> InspectedImage:
     if not isinstance(content, bytes) or not content:
         raise ImageStagingError("image_non_raster_response", "image response is empty")
     if len(content) > MAX_IMAGE_BYTES:
-        raise ImageStagingError("image_size_limit", "image exceeds the byte limit")
+        raise ImageStagingError("image_too_large", "image exceeds the byte limit")
     try:
-        with Image.open(BytesIO(content)) as image:
+        image = Image.open(BytesIO(content))
+    except UnidentifiedImageError as exc:
+        if looks_like_supported_raster(content):
+            raise ImageStagingError(
+                "image_decode_failed", "recognized raster image could not be decoded"
+            ) from exc
+        raise ImageStagingError(
+            "image_non_raster_response", "response is not a recognized raster image"
+        ) from exc
+    except (OSError, SyntaxError, ValueError) as exc:
+        raise ImageStagingError(
+            "image_decode_failed", "raster image header could not be decoded"
+        ) from exc
+    try:
+        with image:
             image_format = str(image.format or "").upper()
             width, height = image.size
             if image_format not in FORMAT_METADATA:
                 raise ImageStagingError(
                     "image_non_raster_response", "unsupported raster image format"
-                )
+            )
             if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
-                raise ImageStagingError("image_pixel_limit", "image exceeds the pixel limit")
+                raise ImageStagingError("image_too_large", "image exceeds the pixel limit")
             image.verify()
     except ImageStagingError:
         raise
-    except Exception as exc:
+    except (OSError, SyntaxError, ValueError) as exc:
         raise ImageStagingError(
-            "image_non_raster_response", "response is not a valid raster image"
+            "image_decode_failed", "raster image payload could not be decoded"
         ) from exc
     extension, mime_type = FORMAT_METADATA[image_format]
     return InspectedImage(

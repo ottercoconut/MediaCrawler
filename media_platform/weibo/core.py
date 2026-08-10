@@ -42,7 +42,10 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import weibo as weibo_store
 from tools import utils
-from tools.image_download_retry import fetch_image_bytes_with_retry
+from tools.image_download_retry import (
+    fetch_image_bytes_with_retry,
+    is_retryable_image_error,
+)
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
@@ -319,6 +322,14 @@ class WeiboCrawler(AbstractCrawler):
                             try:
                                 await self.get_note_images(mblog)
                             except WeiboImageDownloadError as exc:
+                                if not is_retryable_image_error(exc.code):
+                                    accumulator.mark_runtime_failed(
+                                        f"image_materialization_terminal:{exc.code}",
+                                        source_page=requested_page,
+                                        resume_page=requested_page,
+                                        discovery_phase=discovery_phase,
+                                    )
+                                    raise
                                 should_stop = accumulator.defer_retryable(
                                     note_id,
                                     detail="image_download_failed",

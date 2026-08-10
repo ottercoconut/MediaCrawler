@@ -220,3 +220,49 @@ async def test_image_failure_keeps_page_offset_cursor_and_candidate_unseen(
     assert stopped["details"]["resume_cursor"] == ""
     assert stopped["details"]["candidate_count"] == 2
     assert stopped["details"]["candidate_identities"] == ["success-aweme"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_image_failure_stops_cursor_without_deferral(
+    monkeypatch, tmp_path
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text('{"events": []}', encoding="utf-8")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
+    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_OFFSET", "0")
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_CURSOR", raising=False)
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setattr(config, "CRAWLER_MAX_NOTES_COUNT", 10)
+    monkeypatch.setattr(config, "START_PAGE", 1)
+    monkeypatch.setattr(config, "KEYWORDS", "test")
+    monkeypatch.setattr(config, "PUBLISH_TIME_TYPE", 0)
+    crawler = DouYinCrawler()
+    crawler.dy_client = SearchClient()
+    crawler.enrich_aweme_creator = AsyncMock(side_effect=lambda aweme: aweme)
+    crawler.get_aweme_images = AsyncMock(
+        side_effect=DouyinImageDownloadError(
+            "retry-aweme", 0, "image_too_large", attempts=1
+        )
+    )
+    crawler.batch_get_note_comments = AsyncMock(return_value=None)
+    store = AsyncMock(return_value=None)
+    monkeypatch.setattr(douyin_core.douyin_store, "update_douyin_aweme", store)
+
+    await crawler.search()
+
+    store.assert_not_awaited()
+    assert crawler.get_aweme_images.await_count == 1
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not [event for event in events if event["type"] == "candidate_deferred"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == (
+        "image_materialization_terminal:image_too_large"
+    )
+    assert stopped["details"]["resume_page"] == 1
+    assert stopped["details"]["resume_offset"] == 0
+    assert stopped["details"]["candidate_identities"] == []

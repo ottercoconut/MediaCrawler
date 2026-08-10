@@ -209,7 +209,11 @@ class AdaptiveAccumulator:
 
     def consider(self, identity: str, *, valid: bool) -> bool:
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
-            self.stop_reason = "candidate_hard_limit_reached"
+            self.stop_reason = (
+                "deferred_retry_pending"
+                if self.deferred_retryable_failures
+                else "candidate_hard_limit_reached"
+            )
             return True
         self.candidate_count += 1
         if identity:
@@ -223,7 +227,11 @@ class AdaptiveAccumulator:
             self.stop_reason = "target_new_met"
             return True
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
-            self.stop_reason = "candidate_hard_limit_reached"
+            self.stop_reason = (
+                "deferred_retry_pending"
+                if self.deferred_retryable_failures
+                else "candidate_hard_limit_reached"
+            )
             return True
         return False
 
@@ -243,7 +251,11 @@ class AdaptiveAccumulator:
         """Record a retryable candidate without crossing its safe frontier."""
 
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
-            self.stop_reason = "candidate_hard_limit_reached"
+            self.stop_reason = (
+                "deferred_retry_pending"
+                if self.deferred_retryable_failures
+                else "candidate_hard_limit_reached"
+            )
             return True
         self.candidate_count += 1
         failure = {
@@ -270,7 +282,7 @@ class AdaptiveAccumulator:
             }
         append_execution_event("candidate_deferred", failure)
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
-            self.stop_reason = "candidate_hard_limit_reached"
+            self.stop_reason = "deferred_retry_pending"
             return True
         return False
 
@@ -342,6 +354,8 @@ class AdaptiveAccumulator:
                 self.stagnant_batches + 1 if stagnation_progress == 0 else 0
             )
         if (
+            not self.stop_reason
+            and
             count_stagnation
             and not self.exhaustion_mode
             and self.stagnant_batches >= self.max_stagnant_batches

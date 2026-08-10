@@ -227,6 +227,37 @@ async def test_image_failure_is_deferred_and_later_candidate_continues(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_terminal_image_failure_stops_page_without_deferral(monkeypatch, tmp_path):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, state_path = prepare_search(
+        monkeypatch,
+        tmp_path,
+        [
+            {"card_type": 9, "mblog": valid_mblog("terminal-note")},
+            {"card_type": 9, "mblog": valid_mblog("must-not-store")},
+        ],
+    )
+    crawler.get_note_images.side_effect = WeiboImageDownloadError(
+        "terminal-note", 0, "image_decode_failed", attempts=1
+    )
+
+    with pytest.raises(WeiboImageDownloadError):
+        await crawler.search()
+
+    weibo_core.weibo_store.update_weibo_note.assert_not_awaited()
+    assert crawler.get_note_images.await_count == 1
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not [event for event in events if event["type"] == "candidate_deferred"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == (
+        "image_materialization_terminal:image_decode_failed"
+    )
+    assert stopped["details"]["resume_page"] == 1
+    assert stopped["details"]["candidate_identities"] == []
+
+
+@pytest.mark.asyncio
 async def test_short_and_long_posts_record_authoritative_full_text_sources(monkeypatch):
     monkeypatch.setattr(config, "ENABLE_WEIBO_FULL_TEXT", True)
     monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)

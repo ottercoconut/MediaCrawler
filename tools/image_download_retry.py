@@ -10,6 +10,13 @@ from typing import Any
 
 IMAGE_DOWNLOAD_MAX_ATTEMPTS = 3
 IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS = (1.0, 2.0)
+RETRYABLE_IMAGE_ERROR_CODES = frozenset({"image_download_retryable"})
+
+
+def is_retryable_image_error(code: str | None) -> bool:
+    """Return whether a recorded image failure may cross the deferred branch."""
+
+    return str(code or "") in RETRYABLE_IMAGE_ERROR_CODES
 
 
 async def fetch_image_bytes_with_retry(

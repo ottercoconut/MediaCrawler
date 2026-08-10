@@ -142,6 +142,33 @@ def test_source_exhaustion_is_not_claimed_while_deferred_candidate_remains(
     assert summary["source_has_more"] is True
 
 
+def test_deferred_candidate_exactly_at_hard_limit_stays_retry_pending(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tools.trippostcollect_adaptive.append_execution_event",
+        lambda *args, **kwargs: None,
+    )
+    accumulator = AdaptiveAccumulator(
+        platform="weibo",
+        hard_limit=1,
+        target_new=1,
+        max_stagnant_batches=3,
+    )
+
+    stopped = accumulator.defer_retryable(
+        "mblog-1",
+        detail="image_download_failed",
+        error_code="image_download_retryable",
+        attempts=3,
+        source_page=7,
+    )
+
+    assert stopped is True
+    assert accumulator.summary()["stop_reason"] == "deferred_retry_pending"
+    assert accumulator.summary()["candidate_identities"] == []
+
+
 def test_existing_database_identity_does_not_advance_new_target(monkeypatch, tmp_path) -> None:
     db_path = tmp_path / "posts.sqlite"
     with sqlite3.connect(db_path) as conn:
