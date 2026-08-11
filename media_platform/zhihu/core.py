@@ -33,6 +33,7 @@ from playwright.async_api import (
     Playwright,
     async_playwright,
 )
+from tenacity import RetryError
 
 import config
 from constant import zhihu as constant
@@ -58,7 +59,7 @@ from .login import ZhiHuLogin
 
 
 class ZhihuImageDownloadError(RuntimeError):
-    """A Zhihu body image failed before its content crossed the safe frontier."""
+    """A Zhihu body image exhausted its applicable fetch attempts."""
 
     def __init__(self, content_id: str, source_index: int, code: str, attempts: int = 1):
         super().__init__(
@@ -72,14 +73,15 @@ class ZhihuImageDownloadError(RuntimeError):
 
 
 class ZhihuDetailFetchError(RuntimeError):
-    """A search candidate detail failed before it could cross the safe frontier."""
+    """A search candidate detail remained unavailable after retries."""
 
-    def __init__(self, content_id: str, code: str):
+    def __init__(self, content_id: str, code: str, attempts: int = 3):
         super().__init__(
             f"Zhihu detail fetch failed: content_id={content_id or '<missing>'}, code={code}"
         )
         self.content_id = content_id
         self.code = code
+        self.attempts = max(1, int(attempts))
 
 
 class ZhihuCrawler(AbstractCrawler):
@@ -179,7 +181,7 @@ class ZhihuCrawler(AbstractCrawler):
                 )
             else:
                 detail = await self.zhihu_client.get_article_info(content.content_id)
-        except DataFetchError as exc:
+        except (DataFetchError, RetryError) as exc:
             utils.logger.warning(
                 "[ZhihuCrawler.enrich_search_content_detail] Detail request failed "
                 f"for {content.content_type}:{content.content_id}: {exc}"
@@ -394,7 +396,28 @@ class ZhihuCrawler(AbstractCrawler):
                         processed_count = 0
                         stored_contents: List[ZhihuContent] = []
                         for content in content_list:
-                            content = await self.enrich_search_content_detail(content)
+                            content_id = str(content.content_id or "")
+                            try:
+                                content = await self.enrich_search_content_detail(content)
+                            except ZhihuDetailFetchError as exc:
+                                utils.logger.error(
+                                    "[ZhihuCrawler.search] Skip content after detail "
+                                    f"attempts failed: {exc!r}"
+                                )
+                                processed_count += 1
+                                should_stop = accumulator.skip_candidate_failure(
+                                    content_id or str(exc.content_id or ""),
+                                    failure_scope="post",
+                                    detail="content_detail_failed",
+                                    error_code=exc.code,
+                                    attempts=exc.attempts,
+                                    retryable=True,
+                                    source_page=requested_page,
+                                    discovery_phase=discovery_phase,
+                                )
+                                if should_stop:
+                                    break
+                                continue
                             image_ready = bool(
                                 content.content_detail_status == "detail_observed"
                                 and content.content_detail_source
@@ -422,8 +445,9 @@ class ZhihuCrawler(AbstractCrawler):
                                 try:
                                     await self.get_content_images(content)
                                 except ZhihuImageDownloadError as exc:
-                                    should_stop = accumulator.defer_image_failure(
+                                    should_stop = accumulator.skip_candidate_failure(
                                         str(content.content_id or ""),
+                                        failure_scope="image",
                                         detail="image_download_failed",
                                         error_code=exc.code,
                                         attempts=exc.attempts,
@@ -456,18 +480,6 @@ class ZhihuCrawler(AbstractCrawler):
                             count_stagnation=discovery_phase == "frontier",
                         ):
                             break
-                    except ZhihuDetailFetchError as exc:
-                        utils.logger.error(
-                            "[ZhihuCrawler.search] Full content detail failed "
-                            f"on page {requested_page}: {exc!r}"
-                        )
-                        accumulator.mark_runtime_failed(
-                            "content_detail_failed",
-                            source_page=requested_page,
-                            resume_page=requested_page,
-                            discovery_phase=discovery_phase,
-                        )
-                        return
                     except DataFetchError:
                         utils.logger.error("[ZhihuCrawler.search] Search content error")
                         accumulator.mark_runtime_failed(

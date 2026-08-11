@@ -58,7 +58,7 @@ def classified_http_image_error(status_code: int, message: str) -> ImageDownload
 
 
 def is_retryable_image_error(code: str | None) -> bool:
-    """Return whether a recorded image failure may cross the deferred branch."""
+    """Return whether a recorded image failure is eligible for finite retry."""
 
     return str(code or "") in RETRYABLE_IMAGE_ERROR_CODES
 

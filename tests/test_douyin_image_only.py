@@ -200,7 +200,57 @@ class SearchClient:
 
 
 @pytest.mark.asyncio
-async def test_image_failure_keeps_page_offset_cursor_and_candidate_unseen(
+async def test_creator_profile_failure_is_recorded_and_later_candidate_continues(
+    monkeypatch, tmp_path
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text('{"events": []}', encoding="utf-8")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
+    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_OFFSET", "0")
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_CURSOR", raising=False)
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setattr(config, "CRAWLER_MAX_NOTES_COUNT", 10)
+    monkeypatch.setattr(config, "START_PAGE", 1)
+    monkeypatch.setattr(config, "KEYWORDS", "test")
+    monkeypatch.setattr(config, "PUBLISH_TIME_TYPE", 0)
+    crawler = DouYinCrawler()
+    crawler.dy_client = SearchClient()
+
+    async def enrich(aweme):
+        if aweme["aweme_id"] == "retry-aweme":
+            return {**aweme, "creator_profile_error": "detail_request_failed"}
+        return aweme
+
+    crawler.enrich_aweme_creator = enrich
+    crawler.get_aweme_images = AsyncMock(return_value=None)
+    crawler.batch_get_note_comments = AsyncMock(return_value=None)
+    store = AsyncMock(return_value=None)
+    monkeypatch.setattr(douyin_core.douyin_store, "update_douyin_aweme", store)
+
+    await crawler.search()
+
+    store.assert_awaited_once()
+    crawler.get_aweme_images.assert_awaited_once()
+    assert crawler.get_aweme_images.await_args.kwargs["aweme_item"]["aweme_id"] == "success-aweme"
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert skipped[0]["details"]["identity"] == "retry-aweme"
+    assert skipped[0]["details"]["failure_scope"] == "post"
+    assert skipped[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["candidate_identities"] == [
+        "retry-aweme",
+        "success-aweme",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_image_failure_is_recorded_seen_and_later_candidate_continues(
     monkeypatch, tmp_path
 ):
     state_path = tmp_path / "state.json"
@@ -237,19 +287,23 @@ async def test_image_failure_keeps_page_offset_cursor_and_candidate_unseen(
     store.assert_awaited_once()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    deferred = [event for event in events if event["type"] == "candidate_deferred"]
-    assert deferred[0]["details"]["identity"] == "retry-aweme"
-    assert deferred[0]["details"]["attempts"] == 3
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
+    assert skipped[0]["details"]["identity"] == "retry-aweme"
+    assert skipped[0]["details"]["failure_scope"] == "image"
+    assert skipped[0]["details"]["attempts"] == 3
     assert stopped["details"]["stop_reason"] == "target_new_met"
-    assert stopped["details"]["resume_page"] == 1
-    assert stopped["details"]["resume_offset"] == 0
-    assert stopped["details"]["resume_cursor"] == ""
+    assert stopped["details"]["resume_page"] == 2
+    assert stopped["details"]["resume_offset"] == 10
+    assert stopped["details"]["resume_cursor"] == "fresh-search-id"
     assert stopped["details"]["candidate_count"] == 2
-    assert stopped["details"]["candidate_identities"] == ["success-aweme"]
+    assert stopped["details"]["candidate_identities"] == [
+        "retry-aweme",
+        "success-aweme",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
+async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     monkeypatch, tmp_path
 ):
     state_path = tmp_path / "state.json"
@@ -286,11 +340,15 @@ async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
     store.assert_awaited_once()
     assert crawler.get_aweme_images.await_count == 2
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    deferred = [event for event in events if event["type"] == "candidate_deferred"]
-    assert deferred[0]["details"]["identity"] == "retry-aweme"
-    assert deferred[0]["details"]["retryable"] is False
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
+    assert skipped[0]["details"]["identity"] == "retry-aweme"
+    assert skipped[0]["details"]["failure_scope"] == "image"
+    assert skipped[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
     assert stopped["details"]["stop_reason"] == "target_new_met"
-    assert stopped["details"]["resume_page"] == 1
-    assert stopped["details"]["resume_offset"] == 0
-    assert stopped["details"]["candidate_identities"] == ["success-aweme"]
+    assert stopped["details"]["resume_page"] == 2
+    assert stopped["details"]["resume_offset"] == 10
+    assert stopped["details"]["candidate_identities"] == [
+        "retry-aweme",
+        "success-aweme",
+    ]

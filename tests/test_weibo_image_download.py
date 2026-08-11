@@ -220,7 +220,7 @@ async def test_known_id_and_invalid_note_are_skipped_before_media(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_image_failure_is_deferred_and_later_candidate_continues(monkeypatch, tmp_path):
+async def test_image_failure_is_recorded_and_later_candidate_continues(monkeypatch, tmp_path):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
     crawler, state_path = prepare_search(
         monkeypatch,
@@ -242,18 +242,21 @@ async def test_image_failure_is_deferred_and_later_candidate_continues(monkeypat
     weibo_core.weibo_store.update_weibo_note.assert_awaited_once()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    deferred = [event for event in events if event["type"] == "candidate_deferred"]
-    assert deferred[0]["details"]["identity"] == "retry-note"
-    assert deferred[0]["details"]["attempts"] == 3
-    assert stopped["details"]["stop_reason"] == "deferred_retry_pending"
-    assert stopped["details"]["stop_detail"] == "image_candidate_failures"
-    assert stopped["details"]["resume_page"] == 1
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
+    assert skipped[0]["details"]["identity"] == "retry-note"
+    assert skipped[0]["details"]["failure_scope"] == "image"
+    assert skipped[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
+    assert stopped["details"]["resume_page"] == 2
     assert stopped["details"]["candidate_count"] == 2
-    assert stopped["details"]["candidate_identities"] == ["success-note"]
+    assert stopped["details"]["candidate_identities"] == [
+        "retry-note",
+        "success-note",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
+async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     monkeypatch, tmp_path
 ):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
@@ -277,14 +280,17 @@ async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
     weibo_core.weibo_store.update_weibo_note.assert_awaited_once()
     assert crawler.get_note_images.await_count == 2
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    deferred = [event for event in events if event["type"] == "candidate_deferred"]
-    assert deferred[0]["details"]["identity"] == "terminal-note"
-    assert deferred[0]["details"]["retryable"] is False
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
+    assert skipped[0]["details"]["identity"] == "terminal-note"
+    assert skipped[0]["details"]["failure_scope"] == "image"
+    assert skipped[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "deferred_retry_pending"
-    assert stopped["details"]["stop_detail"] == "image_candidate_failures"
-    assert stopped["details"]["resume_page"] == 1
-    assert stopped["details"]["candidate_identities"] == ["must-not-store"]
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
+    assert stopped["details"]["resume_page"] == 2
+    assert stopped["details"]["candidate_identities"] == [
+        "must-not-store",
+        "terminal-note",
+    ]
 
 
 @pytest.mark.asyncio
@@ -310,7 +316,7 @@ async def test_short_and_long_posts_record_authoritative_full_text_sources(monke
 
 
 @pytest.mark.asyncio
-async def test_long_text_detail_failure_blocks_batch_and_keeps_candidate_unseen(
+async def test_long_text_detail_failure_is_recorded_seen_and_search_continues(
     monkeypatch,
     tmp_path,
 ):
@@ -322,19 +328,26 @@ async def test_long_text_detail_failure_blocks_batch_and_keeps_candidate_unseen(
         tmp_path,
         [{"card_type": 9, "mblog": long_mblog}],
     )
-    crawler.batch_get_notes_full_text = AsyncMock(
-        side_effect=WeiboFullTextFetchError("long-retry", "detail_request_failed")
+    crawler.get_note_full_text = AsyncMock(
+        side_effect=WeiboFullTextFetchError(
+            "long-retry",
+            "detail_request_failed",
+            attempts=3,
+        )
     )
 
-    with pytest.raises(WeiboFullTextFetchError):
-        await crawler.search()
+    await crawler.search()
 
     weibo_core.weibo_store.update_weibo_note.assert_not_awaited()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_detail"] == "full_text_request_failed"
-    assert stopped["details"]["resume_page"] == 1
-    assert stopped["details"]["candidate_identities"] == []
+    assert skipped[0]["details"]["identity"] == "long-retry"
+    assert skipped[0]["details"]["failure_scope"] == "post"
+    assert skipped[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
+    assert stopped["details"]["resume_page"] == 2
+    assert stopped["details"]["candidate_identities"] == ["long-retry"]
 
 
 @pytest.mark.asyncio

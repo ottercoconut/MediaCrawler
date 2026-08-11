@@ -170,9 +170,8 @@ class AdaptiveAccumulator:
     last_batch_complete: bool = False
     last_discovery_phase: str = "frontier"
     stop_detail: str = ""
-    deferred_image_failures: list[dict[str, Any]] = field(default_factory=list)
-    deferred_image_identities: set[str] = field(default_factory=set)
-    _deferred_resume: dict[str, Any] | None = None
+    skipped_candidate_failures: list[dict[str, Any]] = field(default_factory=list)
+    skipped_candidate_identities: set[str] = field(default_factory=set)
     _batch_new_before: int = 0
     _batch_candidate_before: int = 0
 
@@ -218,17 +217,13 @@ class AdaptiveAccumulator:
             and (
                 identity in self.existing_identities
                 or identity in self.seen_candidate_identities
-                or identity in self.deferred_image_identities
+                or identity in self.skipped_candidate_identities
             )
         )
 
     def consider(self, identity: str, *, valid: bool) -> bool:
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
-            self.stop_reason = (
-                "deferred_retry_pending"
-                if self.deferred_image_failures
-                else "candidate_hard_limit_reached"
-            )
+            self.stop_reason = "candidate_hard_limit_reached"
             return True
         self.candidate_count += 1
         if identity:
@@ -242,40 +237,35 @@ class AdaptiveAccumulator:
             self.stop_reason = "target_new_met"
             return True
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
-            self.stop_reason = (
-                "deferred_retry_pending"
-                if self.deferred_image_failures
-                else "candidate_hard_limit_reached"
-            )
+            self.stop_reason = "candidate_hard_limit_reached"
             return True
         return False
 
-    def defer_image_failure(
+    def skip_candidate_failure(
         self,
         identity: str,
         *,
+        failure_scope: str,
         detail: str,
         error_code: str,
         attempts: int,
+        retryable: bool | None = None,
         source_index: int | None = None,
         source_page: int | str | None = None,
         source_offset: int | None = None,
         source_cursor: int | str | None = None,
         discovery_phase: str = "frontier",
     ) -> bool:
-        """Record an image-failed candidate without crossing its safe frontier."""
+        """Record a failed candidate as processed and continue past it."""
 
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
-            self.stop_reason = (
-                "deferred_retry_pending"
-                if self.deferred_image_failures
-                else "candidate_hard_limit_reached"
-            )
+            self.stop_reason = "candidate_hard_limit_reached"
             return True
         self.candidate_count += 1
         failure = {
             "platform": self.platform,
             "identity": identity,
+            "failure_scope": failure_scope,
             "detail": detail,
             "error_code": error_code,
             "attempts": max(1, int(attempts)),
@@ -285,20 +275,18 @@ class AdaptiveAccumulator:
             "source_cursor": source_cursor,
             "discovery_phase": discovery_phase,
         }
-        failure["retryable"] = error_code == "image_download_retryable"
-        self.deferred_image_failures.append(failure)
+        failure["retryable"] = (
+            error_code == "image_download_retryable"
+            if retryable is None
+            else bool(retryable)
+        )
+        self.skipped_candidate_failures.append(failure)
         if identity:
-            self.deferred_image_identities.add(identity)
-        if self._deferred_resume is None:
-            self._deferred_resume = {
-                "resume_page": source_page,
-                "resume_offset": source_offset,
-                "resume_cursor": source_cursor,
-                "discovery_phase": discovery_phase,
-            }
-        append_execution_event("candidate_deferred", failure)
+            self.skipped_candidate_identities.add(identity)
+            self.seen_candidate_identities.add(identity)
+        append_execution_event("candidate_skipped", failure)
         if not self.exhaustion_mode and self.candidate_count >= self.hard_limit:
-            self.stop_reason = "deferred_retry_pending"
+            self.stop_reason = "candidate_hard_limit_reached"
             return True
         return False
 
@@ -376,11 +364,7 @@ class AdaptiveAccumulator:
             and not self.exhaustion_mode
             and self.stagnant_batches >= self.max_stagnant_batches
         ):
-            self.stop_reason = (
-                "deferred_retry_pending"
-                if self.deferred_image_failures
-                else "stagnated"
-            )
+            self.stop_reason = "stagnated"
         details = {
             "platform": self.platform,
             "batch_no": self.batch_no,
@@ -444,19 +428,9 @@ class AdaptiveAccumulator:
             batch_complete=batch_complete,
             discovery_phase=discovery_phase,
         )
-        if not self.stop_reason or (
-            self.stop_reason == "stagnated" and self.deferred_image_failures
-        ):
-            self.stop_reason = (
-                "deferred_retry_pending"
-                if self.deferred_image_failures
-                else "source_exhausted"
-            )
-        self.stop_detail = (
-            "image_candidate_failures"
-            if self.deferred_image_failures
-            else detail
-        )
+        if not self.stop_reason:
+            self.stop_reason = "source_exhausted"
+        self.stop_detail = detail
         append_execution_event("adaptive_search_stopped", self.summary())
 
     def mark_runtime_failed(
@@ -513,15 +487,11 @@ class AdaptiveAccumulator:
             "discovery_phase": self.last_discovery_phase,
             "stop_detail": self.stop_detail,
         }
-        if self._deferred_resume is not None:
-            result.update(self._deferred_resume)
-            result["batch_complete"] = False
-            result["source_has_more"] = True
-        result["deferred_image_count"] = len(
-            self.deferred_image_failures
+        result["skipped_candidate_count"] = len(
+            self.skipped_candidate_failures
         )
-        result["deferred_image_failures"] = list(
-            self.deferred_image_failures
+        result["skipped_candidate_failures"] = list(
+            self.skipped_candidate_failures
         )
         result["candidate_identities"] = sorted(self.seen_candidate_identities)
         return result

@@ -74,7 +74,7 @@ XHS_NEW_PAGE_MIN_HOLD_SECONDS = 30.0
 
 
 class XHSImageDownloadError(RuntimeError):
-    """An XHS post image failed before the candidate safe frontier."""
+    """An XHS post image exhausted its applicable fetch attempts."""
 
     def __init__(self, note_id: str, source_index: int, code: str, attempts: int = 1):
         super().__init__(
@@ -1108,17 +1108,59 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             )
                             for post_item in selected_items
                         ]
-                        note_details = await asyncio.gather(*task_list)
+                        note_details = await asyncio.gather(
+                            *task_list,
+                            return_exceptions=True,
+                        )
                         note_ids: List[str] = []
                         xsec_tokens: List[str] = []
                         processed_count = 0
                         for post_item, note_detail in zip(selected_items, note_details):
                             identity = str(
-                                (note_detail or {}).get("note_id")
+                                (
+                                    (note_detail or {}).get("note_id")
+                                    if isinstance(note_detail, dict)
+                                    else ""
+                                )
                                 or post_item.get("id")
                                 or ""
                             )
                             processed_count += 1
+                            if isinstance(note_detail, BaseException):
+                                detail_text = str(note_detail).lower()
+                                if (
+                                    isinstance(note_detail, PlaywrightError)
+                                    or self._is_login_expired_failure(note_detail)
+                                    or any(
+                                        marker in detail_text
+                                        for marker in (
+                                            "platform_security_limit",
+                                            "captcha",
+                                            "rate_limit",
+                                            "login_required",
+                                        )
+                                    )
+                                ):
+                                    raise note_detail
+                                error_code = (
+                                    note_detail.code
+                                    if isinstance(note_detail, XHSNoteDetailUnavailable)
+                                    else "detail_request_failed"
+                                )
+                                should_stop = accumulator.skip_candidate_failure(
+                                    identity,
+                                    failure_scope="post",
+                                    detail="note_detail_unavailable",
+                                    error_code=error_code,
+                                    attempts=3,
+                                    retryable=True,
+                                    source_page=requested_page,
+                                    source_cursor=search_id,
+                                    discovery_phase=discovery_phase,
+                                )
+                                if should_stop:
+                                    break
+                                continue
                             if note_detail:
                                 if self.is_video_note(note_detail):
                                     utils.logger.info(
@@ -1129,7 +1171,47 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                         break
                                     continue
                                 await self._maybe_run_post_interaction(note_detail)
-                                await self.enrich_note_creator(note_detail)
+                                try:
+                                    await self.enrich_note_creator(note_detail)
+                                except RuntimeError as exc:
+                                    detail_text = str(exc).lower()
+                                    if any(
+                                        marker in detail_text
+                                        for marker in (
+                                            "platform_security_limit",
+                                            "captcha",
+                                            "rate_limit",
+                                            "login_required",
+                                        )
+                                    ):
+                                        raise
+                                    should_stop = accumulator.skip_candidate_failure(
+                                        identity,
+                                        failure_scope="post",
+                                        detail="creator_profile_failed",
+                                        error_code=(
+                                            "creator_profile_unavailable"
+                                            if "creator_profile_unavailable_after_retry"
+                                            in detail_text
+                                            else type(exc).__name__
+                                        ),
+                                        attempts=(
+                                            3
+                                            if "creator_profile_unavailable_after_retry"
+                                            in detail_text
+                                            else 1
+                                        ),
+                                        retryable=(
+                                            "creator_profile_unavailable_after_retry"
+                                            in detail_text
+                                        ),
+                                        source_page=requested_page,
+                                        source_cursor=search_id,
+                                        discovery_phase=discovery_phase,
+                                    )
+                                    if should_stop:
+                                        break
+                                    continue
                                 creator_profile = note_detail.get("creator_profile") or {}
                                 creator_item = (
                                     xhs_store._normalized_creator_item(
@@ -1168,8 +1250,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                     try:
                                         await self.get_notice_media(note_detail)
                                     except XHSImageDownloadError as exc:
-                                        should_stop = accumulator.defer_image_failure(
+                                        should_stop = accumulator.skip_candidate_failure(
                                             identity,
+                                            failure_scope="image",
                                             detail="image_download_failed",
                                             error_code=exc.code,
                                             attempts=exc.attempts,
@@ -1192,7 +1275,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
                         utils.logger.info(
                             "[XiaoHongShuCrawler.search] Note detail summaries: "
-                            f"{self.note_detail_summaries(note_details)}"
+                            f"{self.note_detail_summaries([item for item in note_details if isinstance(item, dict)])}"
                         )
                         await self.batch_get_note_comments(note_ids, xsec_tokens)
                         batch_complete = processed_count >= len(unknown_items)
@@ -1438,6 +1521,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             utils.logger.warning(
                 f"[XiaoHongShuCrawler.enrich_note_creator] creator profile empty after browser fallback: {user_id}"
             )
+            raise RuntimeError("creator_profile_unavailable_after_retry")
 
     async def _get_creator_info_from_browser(self, user_id: str) -> Optional[Dict]:
         """Load an author homepage in the signed-in context when the direct request is empty."""

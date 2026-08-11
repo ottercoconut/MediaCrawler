@@ -137,7 +137,7 @@ class WeiboClient(ProxyRefreshMixin):
             if resp_data.get("login"):
                 ping_flag = True
             else:
-                utils.logger.error(f"[WeiboClient.pong] cookie may be invalid and again login...")
+                utils.logger.error("[WeiboClient.pong] cookie may be invalid and again login...")
         except Exception as e:
             utils.logger.error(f"[WeiboClient.pong] Pong weibo failed: {e}, and try to login again...")
             ping_flag = False
@@ -256,7 +256,7 @@ class WeiboClient(ProxyRefreshMixin):
 
         """
         if not config.ENABLE_GET_SUB_COMMENTS:
-            utils.logger.info(f"[WeiboClient.get_comments_all_sub_comments] Crawling sub_comment mode is not enabled")
+            utils.logger.info("[WeiboClient.get_comments_all_sub_comments] Crawling sub_comment mode is not enabled")
             return []
 
         res_sub_comments = []
@@ -267,6 +267,7 @@ class WeiboClient(ProxyRefreshMixin):
                 res_sub_comments.extend(sub_comments)
         return res_sub_comments
 
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
     async def get_note_info_by_id(self, note_id: str) -> Dict:
         """
         Get note details by note ID
@@ -286,8 +287,9 @@ class WeiboClient(ProxyRefreshMixin):
                 note_item = {"mblog": note_detail}
                 return note_item
             else:
-                utils.logger.info(f"[WeiboClient.get_note_info_by_id] $render_data value not found")
-                return dict()
+                raise DataFetchError(
+                    "get weibo detail err: $render_data value not found"
+                )
 
     async def get_note_image(self, image_url: str) -> bytes:
         image_url = image_url[8:]  # Remove https://
@@ -413,7 +415,7 @@ class WeiboClient(ProxyRefreshMixin):
         while notes_has_more:
             notes_res = await self.get_notes_by_creator(creator_id, container_id, since_id)
             if not notes_res:
-                utils.logger.error(f"[WeiboClient.get_notes_by_creator] The current creator may have been banned by Weibo, so they cannot access the data.")
+                utils.logger.error("[WeiboClient.get_notes_by_creator] The current creator may have been banned by Weibo, so they cannot access the data.")
                 break
             since_id = notes_res.get("cardlistInfo", {}).get("since_id", "0")
             if "cards" not in notes_res:

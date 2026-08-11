@@ -151,7 +151,7 @@ async def test_failed_or_unparsed_detail_cannot_enter_image_success(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_recoverable_detail_failure_keeps_zhihu_candidate_unseen(
+async def test_detail_failure_is_recorded_seen_and_search_continues(
     monkeypatch,
     tmp_path,
 ):
@@ -169,13 +169,16 @@ async def test_recoverable_detail_failure_keeps_zhihu_candidate_unseen(
     monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
     crawler = ZhihuCrawler()
     crawler.zhihu_client = AsyncMock()
-    crawler.zhihu_client.get_note_by_keyword.return_value = [
-        ZhihuContent(
-            content_id="retry-detail",
-            question_id="question-1",
-            content_type="answer",
-            content_text="search excerpt",
-        )
+    crawler.zhihu_client.get_note_by_keyword.side_effect = [
+        [
+            ZhihuContent(
+                content_id="retry-detail",
+                question_id="question-1",
+                content_type="answer",
+                content_text="search excerpt",
+            )
+        ],
+        [],
     ]
     crawler.zhihu_client.get_answer_info.side_effect = DataFetchError("temporary")
     store = AsyncMock(return_value=None)
@@ -185,15 +188,18 @@ async def test_recoverable_detail_failure_keeps_zhihu_candidate_unseen(
 
     store.assert_not_awaited()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "runtime_failed"
-    assert stopped["details"]["stop_detail"] == "content_detail_failed"
-    assert stopped["details"]["resume_page"] == 4
-    assert stopped["details"]["candidate_identities"] == []
+    assert skipped[0]["details"]["identity"] == "retry-detail"
+    assert skipped[0]["details"]["failure_scope"] == "post"
+    assert skipped[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
+    assert stopped["details"]["resume_page"] == 5
+    assert stopped["details"]["candidate_identities"] == ["retry-detail"]
 
 
 @pytest.mark.asyncio
-async def test_image_failure_is_deferred_and_later_zhihu_candidate_continues(
+async def test_image_failure_is_recorded_and_later_zhihu_candidate_continues(
     monkeypatch,
     tmp_path,
 ):
@@ -249,17 +255,21 @@ async def test_image_failure_is_deferred_and_later_zhihu_candidate_continues(
 
     store.assert_awaited_once()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert deferred[0]["details"]["identity"] == "retry-image"
-    assert deferred[0]["details"]["attempts"] == 3
+    assert skipped[0]["details"]["identity"] == "retry-image"
+    assert skipped[0]["details"]["failure_scope"] == "image"
+    assert skipped[0]["details"]["attempts"] == 3
     assert stopped["details"]["stop_reason"] == "target_new_met"
-    assert stopped["details"]["resume_page"] == 4
-    assert stopped["details"]["candidate_identities"] == ["success-image"]
+    assert stopped["details"]["resume_page"] == 5
+    assert stopped["details"]["candidate_identities"] == [
+        "retry-image",
+        "success-image",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
+async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     monkeypatch, tmp_path
 ):
     state_path = tmp_path / "state.json"
@@ -322,10 +332,14 @@ async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
 
     store.assert_awaited_once()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    deferred = [event for event in events if event["type"] == "candidate_deferred"]
-    assert deferred[0]["details"]["identity"] == "terminal-image"
-    assert deferred[0]["details"]["retryable"] is False
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
+    assert skipped[0]["details"]["identity"] == "terminal-image"
+    assert skipped[0]["details"]["failure_scope"] == "image"
+    assert skipped[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
     assert stopped["details"]["stop_reason"] == "target_new_met"
-    assert stopped["details"]["resume_page"] == 4
-    assert stopped["details"]["candidate_identities"] == ["success-image"]
+    assert stopped["details"]["resume_page"] == 5
+    assert stopped["details"]["candidate_identities"] == [
+        "success-image",
+        "terminal-image",
+    ]

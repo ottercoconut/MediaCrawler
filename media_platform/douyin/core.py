@@ -61,7 +61,7 @@ from .search_safety import inspect_empty_first_page
 
 
 class DouyinImageDownloadError(RuntimeError):
-    """A Douyin note image failed before the candidate safe frontier."""
+    """A Douyin note image exhausted its applicable fetch attempts."""
 
     def __init__(self, aweme_id: str, source_index: int, code: str, attempts: int = 1):
         super().__init__(
@@ -427,6 +427,23 @@ class DouYinCrawler(AbstractCrawler):
                             processed_count += 1
                             continue
                         aweme_info = await self.enrich_aweme_creator(aweme_info)
+                        if aweme_info.get("creator_profile_error"):
+                            should_stop = accumulator.skip_candidate_failure(
+                                aweme_id,
+                                failure_scope="post",
+                                detail="creator_profile_failed",
+                                error_code=str(aweme_info["creator_profile_error"]),
+                                attempts=3,
+                                retryable=True,
+                                source_page=requested_page,
+                                source_offset=requested_offset,
+                                source_cursor=requested_search_id,
+                                discovery_phase=discovery_phase,
+                            )
+                            processed_count += 1
+                            if should_stop:
+                                break
+                            continue
                         author = aweme_info.get("author") or {}
                         creator_profile = aweme_info.get("creator_profile") or {}
                         author_stats = douyin_store._normalized_author_stats(
@@ -460,8 +477,9 @@ class DouYinCrawler(AbstractCrawler):
                                     "[DouYinCrawler.search] Image materialization failed: "
                                     f"{exc!r}"
                                 )
-                                should_stop = accumulator.defer_image_failure(
+                                should_stop = accumulator.skip_candidate_failure(
                                     aweme_id,
+                                    failure_scope="image",
                                     detail="image_download_failed",
                                     error_code=exc.code,
                                     attempts=exc.attempts,
@@ -616,6 +634,7 @@ class DouYinCrawler(AbstractCrawler):
                 await asyncio.sleep(sleep_seconds)
         except DataFetchError as exc:
             self.creator_profile_cache[sec_uid] = {}
+            aweme_info["creator_profile_error"] = "detail_request_failed"
             utils.logger.warning(f"[DouYinCrawler.enrich_aweme_creator] get creator profile failed: {exc}")
         return aweme_info
 

@@ -56,6 +56,18 @@ async def test_creator_enrichment_falls_back_to_signed_in_browser(crawler):
 
 
 @pytest.mark.asyncio
+async def test_creator_enrichment_reports_empty_profile_after_all_fallbacks(crawler):
+    crawler.xhs_client = _CreatorClient(None)
+    crawler._get_creator_info_from_browser = AsyncMock(return_value=None)
+    note = {"user": {"user_id": "author-empty"}}
+
+    with pytest.raises(RuntimeError, match="creator_profile_unavailable_after_retry"):
+        await crawler.enrich_note_creator(note)
+
+    crawler._get_creator_info_from_browser.assert_awaited_once_with("author-empty")
+
+
+@pytest.mark.asyncio
 async def test_creator_enrichment_does_not_hide_visible_browser_block(crawler):
     crawler.xhs_client = _CreatorClient(None)
     crawler._get_creator_info_from_browser = AsyncMock(

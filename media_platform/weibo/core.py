@@ -60,7 +60,7 @@ from .login import WeiboLogin
 
 
 class WeiboImageDownloadError(RuntimeError):
-    """A post image failed before the candidate could cross the safe frontier."""
+    """A post image exhausted its applicable fetch attempts."""
 
     def __init__(self, note_id: str, source_index: int, code: str, attempts: int = 1):
         super().__init__(
@@ -74,14 +74,15 @@ class WeiboImageDownloadError(RuntimeError):
 
 
 class WeiboFullTextFetchError(RuntimeError):
-    """A long Weibo post could not be proven complete at its detail endpoint."""
+    """A long Weibo post remained unavailable after its detail attempts."""
 
-    def __init__(self, note_id: str, code: str):
+    def __init__(self, note_id: str, code: str, attempts: int = 3):
         super().__init__(
             f"Weibo full-text fetch failed: note_id={note_id or '<missing>'}, code={code}"
         )
         self.note_id = note_id
         self.code = code
+        self.attempts = max(1, int(attempts))
 
 
 class WeiboCrawler(AbstractCrawler):
@@ -264,25 +265,34 @@ class WeiboCrawler(AbstractCrawler):
                             pending_note_ids.add(note_id)
                         unknown_notes.append(note_item)
                     note_list = unknown_notes
-                    try:
-                        note_list = await self.batch_get_notes_full_text(note_list)
-                    except WeiboFullTextFetchError as exc:
-                        utils.logger.error(
-                            "[WeiboCrawler.search] Full-text observation failed "
-                            f"on page {requested_page}: {exc!r}"
-                        )
-                        accumulator.mark_runtime_failed(
-                            "full_text_request_failed",
-                            source_page=requested_page,
-                            resume_page=requested_page,
-                            discovery_phase=discovery_phase,
-                        )
-                        raise
                     accumulator.begin_batch()
                     processed_count = 0
                     for note_item in note_list:
                         processed_count += 1
                         if not note_item:
+                            continue
+                        preliminary_id = str(
+                            ((note_item or {}).get("mblog") or {}).get("id") or ""
+                        )
+                        try:
+                            note_item = await self.get_note_full_text(note_item)
+                        except WeiboFullTextFetchError as exc:
+                            utils.logger.error(
+                                "[WeiboCrawler.search] Skip full-text candidate after "
+                                f"failed attempts: {exc!r}"
+                            )
+                            should_stop = accumulator.skip_candidate_failure(
+                                preliminary_id or exc.note_id,
+                                failure_scope="post",
+                                detail="full_text_request_failed",
+                                error_code=exc.code,
+                                attempts=exc.attempts,
+                                retryable=True,
+                                source_page=requested_page,
+                                discovery_phase=discovery_phase,
+                            )
+                            if should_stop:
+                                break
                             continue
                         mblog: Dict = note_item.get("mblog")
                         if not mblog:
@@ -322,8 +332,9 @@ class WeiboCrawler(AbstractCrawler):
                             try:
                                 await self.get_note_images(mblog)
                             except WeiboImageDownloadError as exc:
-                                should_stop = accumulator.defer_image_failure(
+                                should_stop = accumulator.skip_candidate_failure(
                                     note_id,
+                                    failure_scope="image",
                                     detail="image_download_failed",
                                     error_code=exc.code,
                                     attempts=exc.attempts,
@@ -679,9 +690,9 @@ class WeiboCrawler(AbstractCrawler):
 
         note_id = str(mblog.get("id") or "")
         if not note_id:
-            raise WeiboFullTextFetchError(note_id, "missing_note_id")
+            raise WeiboFullTextFetchError(note_id, "missing_note_id", attempts=1)
         if not config.ENABLE_WEIBO_FULL_TEXT:
-            raise WeiboFullTextFetchError(note_id, "full_text_disabled")
+            raise WeiboFullTextFetchError(note_id, "full_text_disabled", attempts=1)
 
         try:
             utils.logger.info(f"[WeiboCrawler.get_note_full_text] Fetching full text for note: {note_id}")

@@ -67,7 +67,7 @@ def test_runtime_failure_has_distinct_stop_reason(monkeypatch, tmp_path) -> None
     assert event["details"]["source_page"] == 3
 
 
-def test_image_failed_candidate_is_deferred_without_becoming_seen(
+def test_image_failed_candidate_is_recorded_seen_and_does_not_block_batch(
     monkeypatch, tmp_path
 ) -> None:
     state_path = tmp_path / "state.json"
@@ -77,12 +77,13 @@ def test_image_failed_candidate_is_deferred_without_becoming_seen(
         platform="zhihu",
         hard_limit=10,
         target_new=2,
-        max_stagnant_batches=1,
+        max_stagnant_batches=2,
     )
     accumulator.begin_batch()
 
-    assert accumulator.defer_image_failure(
+    assert accumulator.skip_candidate_failure(
         "answer-1",
+        failure_scope="image",
         detail="image_download_failed",
         error_code="image_download_retryable",
         attempts=3,
@@ -90,20 +91,24 @@ def test_image_failed_candidate_is_deferred_without_becoming_seen(
         source_page=4,
     ) is False
     assert accumulator.is_known("answer-1") is True
-    assert "answer-1" not in accumulator.seen_candidate_identities
-    assert accumulator.finish_batch(source_page=5, resume_page=6) is True
+    assert "answer-1" in accumulator.seen_candidate_identities
+    assert accumulator.finish_batch(
+        source_page=5,
+        resume_page=6,
+        batch_complete=True,
+    ) is False
 
     summary = accumulator.summary()
-    assert summary["stop_reason"] == "deferred_retry_pending"
-    assert summary["resume_page"] == 4
-    assert summary["batch_complete"] is False
+    assert summary["stop_reason"] == "running"
+    assert summary["resume_page"] == 6
+    assert summary["batch_complete"] is True
     assert summary["candidate_count"] == 1
-    assert summary["candidate_identities"] == []
-    assert summary["deferred_image_failures"][0]["attempts"] == 3
-    assert summary["deferred_image_failures"][0]["retryable"] is True
+    assert summary["candidate_identities"] == ["answer-1"]
+    assert summary["skipped_candidate_failures"][0]["attempts"] == 3
+    assert summary["skipped_candidate_failures"][0]["retryable"] is True
 
 
-def test_source_exhaustion_is_not_claimed_while_deferred_candidate_remains(
+def test_source_exhaustion_is_claimed_after_failed_candidate_is_skipped(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -117,8 +122,9 @@ def test_source_exhaustion_is_not_claimed_while_deferred_candidate_remains(
         max_stagnant_batches=3,
         completion_mode="source-exhausted",
     )
-    accumulator.defer_image_failure(
+    accumulator.skip_candidate_failure(
         "note-1",
+        failure_scope="image",
         detail="image_download_failed",
         error_code="image_download_retryable",
         attempts=3,
@@ -136,14 +142,15 @@ def test_source_exhaustion_is_not_claimed_while_deferred_candidate_remains(
     )
 
     summary = accumulator.summary()
-    assert summary["stop_reason"] == "deferred_retry_pending"
-    assert summary["stop_detail"] == "image_candidate_failures"
-    assert summary["resume_page"] == 2
+    assert summary["stop_reason"] == "source_exhausted"
+    assert summary["stop_detail"] == "has_more_false"
+    assert summary["resume_page"] == 5
     assert summary["resume_cursor"] == "search-id"
-    assert summary["source_has_more"] is True
+    assert summary["source_has_more"] is False
+    assert summary["candidate_identities"] == ["note-1"]
 
 
-def test_deferred_candidate_exactly_at_hard_limit_stays_retry_pending(
+def test_skipped_candidate_exactly_at_hard_limit_stops_by_candidate_limit(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -157,8 +164,9 @@ def test_deferred_candidate_exactly_at_hard_limit_stays_retry_pending(
         max_stagnant_batches=3,
     )
 
-    stopped = accumulator.defer_image_failure(
+    stopped = accumulator.skip_candidate_failure(
         "mblog-1",
+        failure_scope="image",
         detail="image_download_failed",
         error_code="image_download_retryable",
         attempts=3,
@@ -166,8 +174,8 @@ def test_deferred_candidate_exactly_at_hard_limit_stays_retry_pending(
     )
 
     assert stopped is True
-    assert accumulator.summary()["stop_reason"] == "deferred_retry_pending"
-    assert accumulator.summary()["candidate_identities"] == []
+    assert accumulator.summary()["stop_reason"] == "candidate_hard_limit_reached"
+    assert accumulator.summary()["candidate_identities"] == ["mblog-1"]
 
 
 def test_existing_database_identity_does_not_advance_new_target(monkeypatch, tmp_path) -> None:

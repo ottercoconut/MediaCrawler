@@ -204,7 +204,7 @@ async def test_browser_context_close_is_recorded_as_resumable_runtime_failure(
 
 
 @pytest.mark.asyncio
-async def test_recoverable_detail_failure_keeps_xhs_candidate_unseen(
+async def test_detail_failure_is_recorded_seen_and_search_continues(
     monkeypatch,
     tmp_path,
 ):
@@ -217,21 +217,29 @@ async def test_recoverable_detail_failure_keeps_xhs_candidate_unseen(
     crawler.get_note_detail_async_task = AsyncMock(
         side_effect=XHSNoteDetailUnavailable("retry-detail", "api_and_html_empty")
     )
+    crawler.xhs_client = AsyncMock()
+    crawler.xhs_client.get_note_by_keyword.side_effect = [
+        {"items": [{"id": "retry-detail"}], "has_more": True},
+        {"items": [], "has_more": False},
+    ]
 
     await crawler.search()
 
     xhs_core.xhs_store.update_xhs_note.assert_not_awaited()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "runtime_failed"
-    assert stopped["details"]["stop_detail"] == "note_detail_unavailable"
-    assert stopped["details"]["resume_page"] == 3
+    assert skipped[0]["details"]["identity"] == "retry-detail"
+    assert skipped[0]["details"]["failure_scope"] == "post"
+    assert skipped[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
+    assert stopped["details"]["resume_page"] == 5
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
-    assert stopped["details"]["candidate_identities"] == []
+    assert stopped["details"]["candidate_identities"] == ["retry-detail"]
 
 
 @pytest.mark.asyncio
-async def test_image_failure_is_deferred_and_later_xhs_candidate_continues(
+async def test_image_failure_is_recorded_and_later_xhs_candidate_continues(
     monkeypatch,
     tmp_path,
 ):
@@ -255,18 +263,59 @@ async def test_image_failure_is_deferred_and_later_xhs_candidate_continues(
 
     xhs_core.xhs_store.update_xhs_note.assert_awaited_once()
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    deferred = [event for event in events if event["type"] == "candidate_deferred"]
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert deferred[0]["details"]["identity"] == "retry-image"
-    assert deferred[0]["details"]["attempts"] == 3
+    assert skipped[0]["details"]["identity"] == "retry-image"
+    assert skipped[0]["details"]["failure_scope"] == "image"
+    assert skipped[0]["details"]["attempts"] == 3
     assert stopped["details"]["stop_reason"] == "target_new_met"
-    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_page"] == 4
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
-    assert stopped["details"]["candidate_identities"] == ["success-image"]
+    assert stopped["details"]["candidate_identities"] == [
+        "retry-image",
+        "success-image",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
+async def test_creator_failure_is_recorded_and_later_xhs_candidate_continues(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[{"id": "retry-creator"}, {"id": "success-creator"}],
+    )
+    crawler.enrich_note_creator = AsyncMock(
+        side_effect=[
+            RuntimeError("creator_profile_unavailable_after_retry"),
+            None,
+        ]
+    )
+
+    await crawler.search()
+
+    xhs_core.xhs_store.update_xhs_note.assert_awaited_once()
+    assert crawler.get_notice_media.await_count == 1
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert skipped[0]["details"]["identity"] == "retry-creator"
+    assert skipped[0]["details"]["failure_scope"] == "post"
+    assert skipped[0]["details"]["error_code"] == "creator_profile_unavailable"
+    assert skipped[0]["details"]["attempts"] == 3
+    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["candidate_identities"] == [
+        "retry-creator",
+        "success-creator",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     monkeypatch,
     tmp_path,
 ):
@@ -291,14 +340,18 @@ async def test_terminal_image_failure_is_deferred_and_later_candidate_continues(
     xhs_core.xhs_store.update_xhs_note.assert_awaited_once()
     assert crawler.get_notice_media.await_count == 2
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
-    deferred = [event for event in events if event["type"] == "candidate_deferred"]
-    assert deferred[0]["details"]["identity"] == "terminal-image"
-    assert deferred[0]["details"]["retryable"] is False
+    skipped = [event for event in events if event["type"] == "candidate_skipped"]
+    assert skipped[0]["details"]["identity"] == "terminal-image"
+    assert skipped[0]["details"]["failure_scope"] == "image"
+    assert skipped[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
     assert stopped["details"]["stop_reason"] == "target_new_met"
-    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_page"] == 4
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
-    assert stopped["details"]["candidate_identities"] == ["must-not-store"]
+    assert stopped["details"]["candidate_identities"] == [
+        "must-not-store",
+        "terminal-image",
+    ]
 
 
 @pytest.mark.asyncio
