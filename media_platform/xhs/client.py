@@ -185,11 +185,18 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 response_data = candidate_data
         except (ValueError, TypeError):
             response_data = None
-        if (
-            response_data is not None
-            and response_data.get("code") == self.IP_ERROR_CODE
-        ):
+        response_code = (
+            str(response_data.get("code")).strip()
+            if response_data is not None and response_data.get("code") is not None
+            else ""
+        )
+        if response_code == str(self.IP_ERROR_CODE):
             raise IPBlockError(self.IP_ERROR_STR)
+        if response_code == "300011":
+            raise PlatformRuntimeError(
+                "XHS platform security limit, code 300011",
+                code="platform_security_limit_300011",
+            )
 
         if return_response:
             return response.text

@@ -116,6 +116,33 @@ async def test_xhs_html_response_preserves_ip_block_business_code(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_xhs_html_response_preserves_security_limit_business_code(
+    monkeypatch,
+) -> None:
+    payload = b'{"success":false,"code":300011,"msg":"Account exception"}'
+    monkeypatch.setattr(
+        xhs_client,
+        "make_async_client",
+        async_client_factory(200, payload),
+    )
+    client = object.__new__(xhs_client.XiaoHongShuClient)
+    client.proxy = None
+    client.timeout = 1
+    client._refresh_proxy_if_expired = AsyncMock(return_value=None)
+    client.IP_ERROR_CODE = 300012
+    client.IP_ERROR_STR = "Network connection error, code 300012"
+
+    with pytest.raises(PlatformRuntimeError) as exc_info:
+        await client.request(
+            "GET",
+            "https://www.xiaohongshu.com/user/profile/test",
+            return_response=True,
+        )
+
+    assert exc_info.value.code == "platform_security_limit_300011"
+
+
+@pytest.mark.asyncio
 async def test_zhihu_http_404_preserves_terminal_status(monkeypatch) -> None:
     monkeypatch.setattr(zhihu_client, "make_async_client", async_client_factory(404))
     client = object.__new__(zhihu_client.ZhiHuClient)
