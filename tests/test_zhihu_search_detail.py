@@ -5,7 +5,8 @@ import asyncio
 import config
 import pytest
 from constant import zhihu as constant
-from media_platform.zhihu.core import ZhihuCrawler
+from media_platform.zhihu.core import ZhihuCrawler, ZhihuDetailFetchError
+from media_platform.zhihu.exception import PlatformRuntimeError
 from media_platform.zhihu.help import merge_search_content_detail
 from model.m_zhihu import ZhihuContent
 from store import zhihu as zhihu_store
@@ -42,6 +43,35 @@ def test_merge_search_detail_keeps_search_author_evidence() -> None:
     assert merged.followers_count == 123
     assert merged.followers_observed is True
     assert merged.author_followers_source == "search_author"
+
+
+@pytest.mark.asyncio
+async def test_detail_rate_limit_is_preserved_as_run_level_failure() -> None:
+    crawler = ZhihuCrawler.__new__(ZhihuCrawler)
+    crawler.zhihu_client = type(
+        "Client",
+        (),
+        {
+            "get_answer_info": lambda self, question_id, answer_id: _raise_async(
+                PlatformRuntimeError("HTTP 429", code="rate_limited")
+            )
+        },
+    )()
+    content = ZhihuContent(
+        content_id="answer-rate-limited",
+        question_id="question-1",
+        content_type=constant.ANSWER_NAME,
+    )
+
+    with pytest.raises(ZhihuDetailFetchError) as exc_info:
+        await crawler.enrich_search_content_detail(content)
+
+    assert exc_info.value.code == "rate_limited"
+    assert exc_info.value.runtime_blocking is True
+
+
+async def _raise_async(error: BaseException):
+    raise error
 
 
 @pytest.mark.asyncio

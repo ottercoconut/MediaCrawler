@@ -40,6 +40,7 @@ from tools import utils
 from tools.image_download_retry import (
     ImageDownloadFetchError,
     fetch_image_bytes_with_retry,
+    is_runtime_blocking_image_error,
 )
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
@@ -427,13 +428,28 @@ class DouYinCrawler(AbstractCrawler):
                             processed_count += 1
                             continue
                         aweme_info = await self.enrich_aweme_creator(aweme_info)
+                        if aweme_info.get("creator_profile_runtime_error"):
+                            accumulator.mark_runtime_failed(
+                                str(aweme_info["creator_profile_runtime_error"]),
+                                source_page=requested_page,
+                                source_offset=requested_offset,
+                                source_cursor=requested_search_id,
+                                resume_page=requested_page,
+                                resume_offset=requested_offset,
+                                resume_cursor=requested_search_id,
+                                discovery_phase=discovery_phase,
+                            )
+                            processed_count += 1
+                            break
                         if aweme_info.get("creator_profile_error"):
                             should_stop = accumulator.skip_candidate_failure(
                                 aweme_id,
                                 failure_scope="post",
                                 detail="creator_profile_failed",
                                 error_code=str(aweme_info["creator_profile_error"]),
-                                attempts=3,
+                                attempts=int(
+                                    aweme_info.get("creator_profile_attempts") or 1
+                                ),
                                 retryable=True,
                                 source_page=requested_page,
                                 source_offset=requested_offset,
@@ -477,6 +493,19 @@ class DouYinCrawler(AbstractCrawler):
                                     "[DouYinCrawler.search] Image materialization failed: "
                                     f"{exc!r}"
                                 )
+                                if is_runtime_blocking_image_error(exc.code):
+                                    accumulator.mark_runtime_failed(
+                                        exc.code,
+                                        source_page=requested_page,
+                                        source_offset=requested_offset,
+                                        source_cursor=requested_search_id,
+                                        resume_page=requested_page,
+                                        resume_offset=requested_offset,
+                                        resume_cursor=requested_search_id,
+                                        discovery_phase=discovery_phase,
+                                    )
+                                    processed_count += 1
+                                    break
                                 should_stop = accumulator.skip_candidate_failure(
                                     aweme_id,
                                     failure_scope="image",
@@ -623,12 +652,36 @@ class DouYinCrawler(AbstractCrawler):
         max_enrich = int(os.environ.get("TRIPPOSTCOLLECT_DOUYIN_MAX_CREATOR_ENRICH", "30"))
         if max_enrich >= 0 and self.creator_profile_enriched_count >= max_enrich:
             return aweme_info
+        creator_profile = None
+        last_error: DataFetchError | None = None
+        attempts = 0
+        for attempt in range(1, 4):
+            attempts = attempt
+            try:
+                creator_profile = await self.dy_client.get_user_info(sec_uid)
+                last_error = None
+                if creator_profile:
+                    break
+            except DataFetchError as exc:
+                last_error = exc
+                if "account blocked" in str(exc).lower():
+                    break
+            if attempt < 3:
+                await asyncio.sleep(attempt)
+        aweme_info["creator_profile_attempts"] = attempts
         try:
-            creator_profile = await self.dy_client.get_user_info(sec_uid)
+            if last_error and "account blocked" in str(last_error).lower():
+                self.creator_profile_cache[sec_uid] = {}
+                aweme_info["creator_profile_runtime_error"] = "account_blocked"
+                return aweme_info
             self.creator_profile_cache[sec_uid] = creator_profile or {}
             self.creator_profile_enriched_count += 1
             if creator_profile:
                 aweme_info["creator_profile"] = creator_profile
+            elif last_error is not None:
+                aweme_info["creator_profile_error"] = "detail_request_failed"
+            else:
+                aweme_info["creator_profile_error"] = "creator_profile_empty"
             sleep_seconds = float(os.environ.get("TRIPPOSTCOLLECT_DOUYIN_CREATOR_SLEEP_SECONDS", "0.25"))
             if sleep_seconds > 0:
                 await asyncio.sleep(sleep_seconds)

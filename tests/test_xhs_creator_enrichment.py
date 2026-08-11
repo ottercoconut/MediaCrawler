@@ -2,7 +2,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from media_platform.xhs.core import XiaoHongShuCrawler
+from media_platform.xhs.core import XiaoHongShuCrawler, XHSCreatorProfileUnavailable
+from media_platform.xhs.exception import IPBlockError
 from media_platform.xhs.extractor import XiaoHongShuExtractor
 
 
@@ -61,10 +62,26 @@ async def test_creator_enrichment_reports_empty_profile_after_all_fallbacks(craw
     crawler._get_creator_info_from_browser = AsyncMock(return_value=None)
     note = {"user": {"user_id": "author-empty"}}
 
-    with pytest.raises(RuntimeError, match="creator_profile_unavailable_after_retry"):
+    with pytest.raises(XHSCreatorProfileUnavailable) as exc_info:
         await crawler.enrich_note_creator(note)
 
+    assert exc_info.value.attempts == 2
     crawler._get_creator_info_from_browser.assert_awaited_once_with("author-empty")
+
+
+@pytest.mark.asyncio
+async def test_creator_enrichment_does_not_hide_ip_block(crawler):
+    crawler.xhs_client = AsyncMock()
+    crawler.xhs_client.get_creator_info.side_effect = IPBlockError(
+        "Network connection error, code 300012"
+    )
+    crawler._get_creator_info_from_browser = AsyncMock()
+    note = {"user": {"user_id": "author-blocked"}}
+
+    with pytest.raises(IPBlockError):
+        await crawler.enrich_note_creator(note)
+
+    crawler._get_creator_info_from_browser.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -45,6 +45,7 @@ from tools import utils
 from tools.image_download_retry import (
     ImageDownloadFetchError,
     fetch_image_bytes_with_retry,
+    is_runtime_blocking_image_error,
 )
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
@@ -53,7 +54,7 @@ from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
 from .client import ZhiHuClient
-from .exception import DataFetchError
+from .exception import DataFetchError, PlatformRuntimeError
 from .help import ZhihuExtractor, judge_zhihu_url, merge_search_content_detail
 from .login import ZhiHuLogin
 
@@ -75,13 +76,21 @@ class ZhihuImageDownloadError(RuntimeError):
 class ZhihuDetailFetchError(RuntimeError):
     """A search candidate detail remained unavailable after retries."""
 
-    def __init__(self, content_id: str, code: str, attempts: int = 3):
+    def __init__(
+        self,
+        content_id: str,
+        code: str,
+        attempts: int = 3,
+        *,
+        runtime_blocking: bool = False,
+    ):
         super().__init__(
             f"Zhihu detail fetch failed: content_id={content_id or '<missing>'}, code={code}"
         )
         self.content_id = content_id
         self.code = code
         self.attempts = max(1, int(attempts))
+        self.runtime_blocking = runtime_blocking
 
 
 class ZhihuCrawler(AbstractCrawler):
@@ -182,6 +191,18 @@ class ZhihuCrawler(AbstractCrawler):
             else:
                 detail = await self.zhihu_client.get_article_info(content.content_id)
         except (DataFetchError, RetryError) as exc:
+            nested = exc
+            if isinstance(exc, RetryError):
+                try:
+                    nested = exc.last_attempt.exception() or exc
+                except Exception:
+                    nested = exc
+            if isinstance(nested, PlatformRuntimeError):
+                raise ZhihuDetailFetchError(
+                    content.content_id,
+                    nested.code,
+                    runtime_blocking=True,
+                ) from exc
             utils.logger.warning(
                 "[ZhihuCrawler.enrich_search_content_detail] Detail request failed "
                 f"for {content.content_type}:{content.content_id}: {exc}"
@@ -400,6 +421,15 @@ class ZhihuCrawler(AbstractCrawler):
                             try:
                                 content = await self.enrich_search_content_detail(content)
                             except ZhihuDetailFetchError as exc:
+                                if exc.runtime_blocking:
+                                    accumulator.mark_runtime_failed(
+                                        exc.code,
+                                        source_page=requested_page,
+                                        resume_page=requested_page,
+                                        discovery_phase=discovery_phase,
+                                    )
+                                    processed_count += 1
+                                    break
                                 utils.logger.error(
                                     "[ZhihuCrawler.search] Skip content after detail "
                                     f"attempts failed: {exc!r}"
@@ -445,6 +475,15 @@ class ZhihuCrawler(AbstractCrawler):
                                 try:
                                     await self.get_content_images(content)
                                 except ZhihuImageDownloadError as exc:
+                                    if is_runtime_blocking_image_error(exc.code):
+                                        accumulator.mark_runtime_failed(
+                                            exc.code,
+                                            source_page=requested_page,
+                                            resume_page=requested_page,
+                                            discovery_phase=discovery_phase,
+                                        )
+                                        processed_count += 1
+                                        break
                                     should_stop = accumulator.skip_candidate_failure(
                                         str(content.content_id or ""),
                                         failure_scope="image",

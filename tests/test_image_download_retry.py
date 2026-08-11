@@ -108,3 +108,32 @@ async def test_retryable_http_error_preserves_status_after_exhaustion(monkeypatc
     assert exc_info.value.http_status == 503
     assert exc_info.value.attempts == 3
     assert fetcher.await_count == 3
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(401, "image_auth_required"), (403, "image_auth_required"), (429, "image_rate_limited")],
+)
+@pytest.mark.asyncio
+async def test_run_level_http_error_is_classified_without_candidate_retry(
+    status,
+    code,
+):
+    fetcher = AsyncMock(
+        side_effect=image_download_retry.classified_http_image_error(
+            status, f"HTTP {status}"
+        )
+    )
+
+    with pytest.raises(image_download_retry.ImageDownloadFetchError) as exc_info:
+        await image_download_retry.fetch_image_bytes_with_retry(
+            fetcher,
+            logger=MagicMock(),
+            label="platform=test post_id=blocked source_index=0",
+        )
+
+    assert exc_info.value.code == code
+    assert exc_info.value.retryable is False
+    assert exc_info.value.attempts == 1
+    assert image_download_retry.is_runtime_blocking_image_error(code) is True
+    assert fetcher.await_count == 1

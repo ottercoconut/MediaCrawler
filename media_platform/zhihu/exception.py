@@ -25,6 +25,14 @@ class DataFetchError(RequestError):
     """something error when fetch"""
 
 
+class PlatformRuntimeError(DataFetchError):
+    """A login or rate-limit response that must stop the current run."""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
 class IPBlockError(RequestError):
     """fetch so fast that the server block us ip"""
 

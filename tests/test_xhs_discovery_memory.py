@@ -12,10 +12,11 @@ from tenacity import Future, RetryError
 from media_platform.xhs import core as xhs_core
 from media_platform.xhs.core import (
     XiaoHongShuCrawler,
+    XHSCreatorProfileUnavailable,
     XHSImageDownloadError,
     XHSNoteDetailUnavailable,
 )
-from media_platform.xhs.exception import DataFetchError
+from media_platform.xhs.exception import DataFetchError, IPBlockError
 
 
 class SearchClient:
@@ -215,7 +216,9 @@ async def test_detail_failure_is_recorded_seen_and_search_continues(
         items=[{"id": "retry-detail"}],
     )
     crawler.get_note_detail_async_task = AsyncMock(
-        side_effect=XHSNoteDetailUnavailable("retry-detail", "api_and_html_empty")
+        side_effect=XHSNoteDetailUnavailable(
+            "retry-detail", "api_and_html_empty", attempts=3
+        )
     )
     crawler.xhs_client = AsyncMock()
     crawler.xhs_client.get_note_by_keyword.side_effect = [
@@ -236,6 +239,38 @@ async def test_detail_failure_is_recorded_seen_and_search_continues(
     assert stopped["details"]["resume_page"] == 5
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["candidate_identities"] == ["retry-detail"]
+
+
+@pytest.mark.asyncio
+async def test_ip_block_stops_run_without_skipping_or_marking_seen(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[{"id": "blocked-detail"}],
+    )
+    crawler.get_note_detail_async_task = AsyncMock(
+        side_effect=RetryError(
+            Future.construct(
+                3,
+                IPBlockError("Network connection error, code 300012"),
+                has_exception=True,
+            )
+        )
+    )
+
+    await crawler.search()
+
+    xhs_core.xhs_store.update_xhs_note.assert_not_awaited()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not [event for event in events if event["type"] == "candidate_skipped"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == "ip_blocked_300012"
+    assert stopped["details"]["candidate_identities"] == []
 
 
 @pytest.mark.asyncio
@@ -291,7 +326,7 @@ async def test_creator_failure_is_recorded_and_later_xhs_candidate_continues(
     )
     crawler.enrich_note_creator = AsyncMock(
         side_effect=[
-            RuntimeError("creator_profile_unavailable_after_retry"),
+            XHSCreatorProfileUnavailable("author-retry", attempts=3),
             None,
         ]
     )

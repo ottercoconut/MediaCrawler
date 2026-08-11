@@ -46,7 +46,7 @@ from tools.image_download_retry import (
 if TYPE_CHECKING:
     from proxy.proxy_ip_pool import ProxyIpPool
 
-from .exception import DataFetchError
+from .exception import DataFetchError, PlatformRuntimeError
 from .field import SearchType
 
 
@@ -267,7 +267,7 @@ class WeiboClient(ProxyRefreshMixin):
                 res_sub_comments.extend(sub_comments)
         return res_sub_comments
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1), reraise=True)
     async def get_note_info_by_id(self, note_id: str) -> Dict:
         """
         Get note details by note ID
@@ -278,6 +278,16 @@ class WeiboClient(ProxyRefreshMixin):
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request("GET", url, timeout=self.timeout, headers=self.headers)
             if response.status_code != 200:
+                if response.status_code in {401, 403}:
+                    raise PlatformRuntimeError(
+                        f"get weibo detail HTTP {response.status_code}",
+                        code="login_required",
+                    )
+                if response.status_code == 429:
+                    raise PlatformRuntimeError(
+                        "get weibo detail HTTP 429",
+                        code="rate_limited",
+                    )
                 raise DataFetchError(f"get weibo detail err: {response.text}")
             match = re.search(r'var \$render_data = (\[.*?\])\[0\]', response.text, re.DOTALL)
             if match:

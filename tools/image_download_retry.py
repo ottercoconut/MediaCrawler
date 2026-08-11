@@ -12,7 +12,10 @@ IMAGE_DOWNLOAD_MAX_ATTEMPTS = 3
 IMAGE_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024
 IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS = (1.0, 2.0)
 RETRYABLE_IMAGE_ERROR_CODES = frozenset({"image_download_retryable"})
-RETRYABLE_IMAGE_HTTP_STATUS_CODES = frozenset({401, 403, 408, 425, 429})
+RETRYABLE_IMAGE_HTTP_STATUS_CODES = frozenset({408, 425})
+RUNTIME_BLOCKING_IMAGE_ERROR_CODES = frozenset(
+    {"image_auth_required", "image_rate_limited"}
+)
 
 
 class ImageDownloadFetchError(RuntimeError):
@@ -44,6 +47,20 @@ class ImageDownloadFetchError(RuntimeError):
 
 
 def classified_http_image_error(status_code: int, message: str) -> ImageDownloadFetchError:
+    if status_code in {401, 403}:
+        return ImageDownloadFetchError(
+            message,
+            code="image_auth_required",
+            retryable=False,
+            http_status=status_code,
+        )
+    if status_code == 429:
+        return ImageDownloadFetchError(
+            message,
+            code="image_rate_limited",
+            retryable=False,
+            http_status=status_code,
+        )
     retryable = (
         status_code in RETRYABLE_IMAGE_HTTP_STATUS_CODES or status_code >= 500
     )
@@ -61,6 +78,12 @@ def is_retryable_image_error(code: str | None) -> bool:
     """Return whether a recorded image failure is eligible for finite retry."""
 
     return str(code or "") in RETRYABLE_IMAGE_ERROR_CODES
+
+
+def is_runtime_blocking_image_error(code: str | None) -> bool:
+    """Return whether an image failure represents a run-level platform block."""
+
+    return str(code or "") in RUNTIME_BLOCKING_IMAGE_ERROR_CODES
 
 
 async def fetch_image_bytes_with_retry(

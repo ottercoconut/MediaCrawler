@@ -47,6 +47,7 @@ from tools import utils
 from tools.image_download_retry import (
     ImageDownloadFetchError,
     fetch_image_bytes_with_retry,
+    is_runtime_blocking_image_error,
 )
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import (
@@ -64,7 +65,7 @@ from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
 from .client import XiaoHongShuClient
-from .exception import DataFetchError, NoteNotFoundError
+from .exception import DataFetchError, IPBlockError, NoteNotFoundError
 from .field import SearchSortType
 from .help import parse_note_info_from_note_url, parse_creator_info_from_url, get_search_id
 from .login import XiaoHongShuLogin
@@ -88,14 +89,27 @@ class XHSImageDownloadError(RuntimeError):
 
 
 class XHSNoteDetailUnavailable(RuntimeError):
-    """An XHS note detail is recoverably unavailable and must not become seen."""
+    """An XHS note detail remained unavailable after bounded attempts."""
 
-    def __init__(self, note_id: str, code: str):
+    def __init__(self, note_id: str, code: str, attempts: int = 1):
         super().__init__(
             f"XHS note detail unavailable: note_id={note_id or '<missing>'}, code={code}"
         )
         self.note_id = note_id
         self.code = code
+        self.attempts = max(1, int(attempts))
+
+
+class XHSCreatorProfileUnavailable(RuntimeError):
+    """An XHS creator profile remained unavailable after observed attempts."""
+
+    def __init__(self, user_id: str, attempts: int):
+        super().__init__(
+            "creator_profile_unavailable_after_retry:"
+            f"user_id={user_id or '<missing>'}:attempts={attempts}"
+        )
+        self.user_id = user_id
+        self.attempts = max(1, int(attempts))
 
 
 class XiaoHongShuCrawler(AbstractCrawler):
@@ -769,6 +783,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
             nested = None
         return nested if isinstance(nested, BaseException) else exc
 
+    @staticmethod
+    def _request_failure_attempts(exc: BaseException) -> int:
+        """Return the observed tenacity attempt count without inventing retries."""
+
+        if not isinstance(exc, RetryError):
+            return 1
+        return max(1, int(getattr(exc.last_attempt, "attempt_number", 1) or 1))
+
     @classmethod
     def _is_login_expired_failure(cls, exc: BaseException) -> bool:
         nested = cls._request_failure_exception(exc)
@@ -1127,9 +1149,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             )
                             processed_count += 1
                             if isinstance(note_detail, BaseException):
-                                detail_text = str(note_detail).lower()
+                                request_failure = self._request_failure_exception(
+                                    note_detail
+                                )
+                                detail_text = str(request_failure).lower()
                                 if (
-                                    isinstance(note_detail, PlaywrightError)
+                                    isinstance(request_failure, IPBlockError)
+                                    or isinstance(note_detail, PlaywrightError)
                                     or self._is_login_expired_failure(note_detail)
                                     or any(
                                         marker in detail_text
@@ -1141,7 +1167,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                         )
                                     )
                                 ):
-                                    raise note_detail
+                                    raise request_failure
                                 error_code = (
                                     note_detail.code
                                     if isinstance(note_detail, XHSNoteDetailUnavailable)
@@ -1152,7 +1178,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                     failure_scope="post",
                                     detail="note_detail_unavailable",
                                     error_code=error_code,
-                                    attempts=3,
+                                    attempts=(
+                                        note_detail.attempts
+                                        if isinstance(
+                                            note_detail, XHSNoteDetailUnavailable
+                                        )
+                                        else self._request_failure_attempts(note_detail)
+                                    ),
                                     retryable=True,
                                     source_page=requested_page,
                                     source_cursor=search_id,
@@ -1173,6 +1205,21 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                 await self._maybe_run_post_interaction(note_detail)
                                 try:
                                     await self.enrich_note_creator(note_detail)
+                                except XHSCreatorProfileUnavailable as exc:
+                                    should_stop = accumulator.skip_candidate_failure(
+                                        identity,
+                                        failure_scope="post",
+                                        detail="creator_profile_failed",
+                                        error_code="creator_profile_unavailable",
+                                        attempts=exc.attempts,
+                                        retryable=True,
+                                        source_page=requested_page,
+                                        source_cursor=search_id,
+                                        discovery_phase=discovery_phase,
+                                    )
+                                    if should_stop:
+                                        break
+                                    continue
                                 except RuntimeError as exc:
                                     detail_text = str(exc).lower()
                                     if any(
@@ -1195,12 +1242,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                             in detail_text
                                             else type(exc).__name__
                                         ),
-                                        attempts=(
-                                            3
-                                            if "creator_profile_unavailable_after_retry"
-                                            in detail_text
-                                            else 1
-                                        ),
+                                        attempts=1,
                                         retryable=(
                                             "creator_profile_unavailable_after_retry"
                                             in detail_text
@@ -1250,6 +1292,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                     try:
                                         await self.get_notice_media(note_detail)
                                     except XHSImageDownloadError as exc:
+                                        if is_runtime_blocking_image_error(exc.code):
+                                            accumulator.mark_runtime_failed(
+                                                exc.code,
+                                                source_page=requested_page,
+                                                source_cursor=search_id,
+                                                resume_page=requested_page,
+                                                resume_cursor=search_id,
+                                                discovery_phase=discovery_phase,
+                                            )
+                                            break
                                         should_stop = accumulator.skip_candidate_failure(
                                             identity,
                                             failure_scope="image",
@@ -1325,7 +1377,32 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             discovery_phase=discovery_phase,
                         )
                         break
+                    except IPBlockError as exc:
+                        utils.logger.error(
+                            "[XiaoHongShuCrawler.search] Platform IP block: "
+                            f"{exc!r}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            "ip_blocked_300012",
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            resume_page=requested_page,
+                            resume_cursor=search_id,
+                            discovery_phase=discovery_phase,
+                        )
+                        break
                     except (DataFetchError, RetryError) as exc:
+                        request_failure = self._request_failure_exception(exc)
+                        if isinstance(request_failure, IPBlockError):
+                            accumulator.mark_runtime_failed(
+                                "ip_blocked_300012",
+                                source_page=requested_page,
+                                source_cursor=search_id,
+                                resume_page=requested_page,
+                                resume_cursor=search_id,
+                                discovery_phase=discovery_phase,
+                            )
+                            break
                         if self._is_login_expired_failure(exc):
                             if await self._wait_for_midrun_login_recovery(keyword):
                                 continue
@@ -1502,9 +1579,17 @@ class XiaoHongShuCrawler(AbstractCrawler):
             note_detail["creator_profile"] = cached_creator
             return
         creator_info = None
+        attempts = 0
         try:
             creator_info = await self.xhs_client.get_creator_info(user_id=user_id)
+            attempts += 1
         except Exception as exc:
+            attempts += self._request_failure_attempts(exc)
+            request_failure = self._request_failure_exception(exc)
+            if isinstance(request_failure, IPBlockError):
+                raise request_failure
+            if self._is_login_expired_failure(exc):
+                raise RuntimeError("login_required") from request_failure
             utils.logger.warning(
                 "[XiaoHongShuCrawler.enrich_note_creator] "
                 f"session profile request failed, using browser fallback: {user_id}, {exc}"
@@ -1512,6 +1597,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
         if not creator_info:
             await self._guarded_pause("creator_profile_browser_fallback", 12.0, 30.0)
+            attempts += 1
             creator_info = await self._get_creator_info_from_browser(str(user_id))
         if creator_info:
             self.creator_profile_cache[str(user_id)] = creator_info
@@ -1521,7 +1607,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             utils.logger.warning(
                 f"[XiaoHongShuCrawler.enrich_note_creator] creator profile empty after browser fallback: {user_id}"
             )
-            raise RuntimeError("creator_profile_unavailable_after_retry")
+            raise XHSCreatorProfileUnavailable(str(user_id), attempts)
 
     async def _get_creator_info_from_browser(self, user_id: str) -> Optional[Dict]:
         """Load an author homepage in the signed-in context when the direct request is empty."""
@@ -1712,23 +1798,44 @@ class XiaoHongShuCrawler(AbstractCrawler):
             Dict: note detail
         """
         note_detail = None
+        attempts = 0
         utils.logger.info(f"[get_note_detail_async_task] Begin get note detail, note_id: {note_id}")
         async with semaphore:
             try:
                 try:
                     note_detail = await self.xhs_client.get_note_by_id(note_id, xsec_source, xsec_token)
-                except RetryError:
-                    pass
+                    attempts += 1
+                except RetryError as exc:
+                    attempts += self._request_failure_attempts(exc)
+                    request_failure = self._request_failure_exception(exc)
+                    if isinstance(request_failure, IPBlockError):
+                        raise request_failure
 
                 if not note_detail:
-                    note_detail = await self.xhs_client.get_note_by_id_from_html(note_id, xsec_source, xsec_token,
-                                                                                 enable_cookie=True)
+                    try:
+                        note_detail = await self.xhs_client.get_note_by_id_from_html(
+                            note_id,
+                            xsec_source,
+                            xsec_token,
+                            enable_cookie=True,
+                        )
+                        attempts += 1
+                    except RetryError as exc:
+                        attempts += self._request_failure_attempts(exc)
+                        request_failure = self._request_failure_exception(exc)
+                        if isinstance(request_failure, IPBlockError):
+                            raise request_failure
+                        note_detail = None
                     if not note_detail:
                         utils.logger.warning(
                             "[XiaoHongShuCrawler.get_note_detail_async_task] "
                             f"Detail remained unavailable after API and HTML fallback: {note_id}"
                         )
-                        raise XHSNoteDetailUnavailable(note_id, "api_and_html_empty")
+                        raise XHSNoteDetailUnavailable(
+                            note_id,
+                            "api_and_html_empty",
+                            attempts=max(1, attempts),
+                        )
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
                 note_detail.update(
@@ -1750,7 +1857,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 raise
             except KeyError as ex:
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}")
-                raise XHSNoteDetailUnavailable(note_id, "detail_parse_failed") from ex
+                raise XHSNoteDetailUnavailable(
+                    note_id,
+                    "detail_parse_failed",
+                    attempts=max(1, attempts),
+                ) from ex
 
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""

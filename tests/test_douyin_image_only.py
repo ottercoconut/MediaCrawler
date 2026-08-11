@@ -241,12 +241,76 @@ async def test_creator_profile_failure_is_recorded_and_later_candidate_continues
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
     assert skipped[0]["details"]["identity"] == "retry-aweme"
     assert skipped[0]["details"]["failure_scope"] == "post"
-    assert skipped[0]["details"]["attempts"] == 3
+    assert skipped[0]["details"]["attempts"] == 1
     assert stopped["details"]["stop_reason"] == "target_new_met"
     assert stopped["details"]["candidate_identities"] == [
         "retry-aweme",
         "success-aweme",
     ]
+
+
+@pytest.mark.asyncio
+async def test_empty_creator_profile_retries_then_becomes_candidate_failure(
+    monkeypatch,
+):
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DOUYIN_ENRICH_CREATORS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DOUYIN_ENRICH_ONLY_IMAGES", "0")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DOUYIN_MAX_CREATOR_ENRICH", "30")
+    crawler = DouYinCrawler()
+    crawler.dy_client = AsyncMock()
+    crawler.dy_client.get_user_info.return_value = {}
+    monkeypatch.setattr(douyin_core.asyncio, "sleep", AsyncMock())
+    aweme = image_aweme("empty-creator")
+    aweme["author"]["sec_uid"] = "sec-empty-creator"
+
+    enriched = await crawler.enrich_aweme_creator(aweme)
+
+    assert crawler.dy_client.get_user_info.await_count == 3
+    assert enriched["creator_profile_attempts"] == 3
+    assert enriched["creator_profile_error"] == "creator_profile_empty"
+    assert "creator_profile" not in enriched
+
+
+@pytest.mark.asyncio
+async def test_image_rate_limit_stops_run_without_candidate_skip(
+    monkeypatch,
+    tmp_path,
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text('{"events": []}', encoding="utf-8")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
+    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_OFFSET", "0")
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_CURSOR", raising=False)
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setattr(config, "CRAWLER_MAX_NOTES_COUNT", 10)
+    monkeypatch.setattr(config, "START_PAGE", 1)
+    monkeypatch.setattr(config, "KEYWORDS", "test")
+    monkeypatch.setattr(config, "PUBLISH_TIME_TYPE", 0)
+    crawler = DouYinCrawler()
+    crawler.dy_client = SearchClient()
+    crawler.enrich_aweme_creator = AsyncMock(side_effect=lambda aweme: aweme)
+    crawler.get_aweme_images = AsyncMock(
+        side_effect=DouyinImageDownloadError(
+            "retry-aweme", 0, "image_rate_limited", attempts=1
+        )
+    )
+    crawler.batch_get_note_comments = AsyncMock(return_value=None)
+    store = AsyncMock(return_value=None)
+    monkeypatch.setattr(douyin_core.douyin_store, "update_douyin_aweme", store)
+
+    await crawler.search()
+
+    store.assert_not_awaited()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not [event for event in events if event["type"] == "candidate_skipped"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == "image_rate_limited"
+    assert stopped["details"]["candidate_identities"] == []
 
 
 @pytest.mark.asyncio

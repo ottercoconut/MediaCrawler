@@ -45,6 +45,7 @@ from tools import utils
 from tools.image_download_retry import (
     ImageDownloadFetchError,
     fetch_image_bytes_with_retry,
+    is_runtime_blocking_image_error,
 )
 from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
@@ -53,7 +54,7 @@ from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
 from .client import WeiboClient
-from .exception import DataFetchError
+from .exception import DataFetchError, PlatformRuntimeError
 from .field import SearchType
 from .help import filter_search_result_card
 from .login import WeiboLogin
@@ -76,13 +77,21 @@ class WeiboImageDownloadError(RuntimeError):
 class WeiboFullTextFetchError(RuntimeError):
     """A long Weibo post remained unavailable after its detail attempts."""
 
-    def __init__(self, note_id: str, code: str, attempts: int = 3):
+    def __init__(
+        self,
+        note_id: str,
+        code: str,
+        attempts: int = 3,
+        *,
+        runtime_blocking: bool = False,
+    ):
         super().__init__(
             f"Weibo full-text fetch failed: note_id={note_id or '<missing>'}, code={code}"
         )
         self.note_id = note_id
         self.code = code
         self.attempts = max(1, int(attempts))
+        self.runtime_blocking = runtime_blocking
 
 
 class WeiboCrawler(AbstractCrawler):
@@ -277,6 +286,14 @@ class WeiboCrawler(AbstractCrawler):
                         try:
                             note_item = await self.get_note_full_text(note_item)
                         except WeiboFullTextFetchError as exc:
+                            if exc.runtime_blocking:
+                                accumulator.mark_runtime_failed(
+                                    exc.code,
+                                    source_page=requested_page,
+                                    resume_page=requested_page,
+                                    discovery_phase=discovery_phase,
+                                )
+                                break
                             utils.logger.error(
                                 "[WeiboCrawler.search] Skip full-text candidate after "
                                 f"failed attempts: {exc!r}"
@@ -332,6 +349,14 @@ class WeiboCrawler(AbstractCrawler):
                             try:
                                 await self.get_note_images(mblog)
                             except WeiboImageDownloadError as exc:
+                                if is_runtime_blocking_image_error(exc.code):
+                                    accumulator.mark_runtime_failed(
+                                        exc.code,
+                                        source_page=requested_page,
+                                        resume_page=requested_page,
+                                        discovery_phase=discovery_phase,
+                                    )
+                                    break
                                 should_stop = accumulator.skip_candidate_failure(
                                     note_id,
                                     failure_scope="image",
@@ -708,6 +733,15 @@ class WeiboCrawler(AbstractCrawler):
 
             # Sleep after request to avoid rate limiting
             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+        except PlatformRuntimeError as ex:
+            utils.logger.error(
+                f"[WeiboCrawler.get_note_full_text] Platform runtime failure for {note_id}: {ex}"
+            )
+            raise WeiboFullTextFetchError(
+                note_id,
+                ex.code,
+                runtime_blocking=True,
+            ) from ex
         except DataFetchError as ex:
             utils.logger.error(f"[WeiboCrawler.get_note_full_text] Failed to fetch full text for note {note_id}: {ex}")
             raise WeiboFullTextFetchError(note_id, "detail_request_failed") from ex

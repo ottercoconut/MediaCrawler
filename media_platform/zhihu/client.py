@@ -44,7 +44,7 @@ from tools.image_download_retry import (
 if TYPE_CHECKING:
     from proxy.proxy_ip_pool import ProxyIpPool
 
-from .exception import DataFetchError, ForbiddenError
+from .exception import DataFetchError, PlatformRuntimeError
 from .field import SearchSort, SearchTime, SearchType
 from .help import ZhihuExtractor, sign
 
@@ -87,7 +87,7 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
         headers['x-zse-96'] = sign_res["x-zse-96"]
         return headers
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1), reraise=True)
     async def request(self, method, url, **kwargs) -> Union[str, Any]:
         """
         Wrapper for httpx common request method with response handling
@@ -110,8 +110,16 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
 
         if response.status_code != 200:
             utils.logger.error(f"[ZhiHuClient.request] Requset Url: {url}, Request error: {response.text}")
-            if response.status_code == 403:
-                raise ForbiddenError(response.text)
+            if response.status_code in {401, 403}:
+                raise PlatformRuntimeError(
+                    response.text or f"HTTP {response.status_code}",
+                    code="login_required",
+                )
+            if response.status_code == 429:
+                raise PlatformRuntimeError(
+                    response.text or "HTTP 429",
+                    code="rate_limited",
+                )
             elif response.status_code == 404:  # Content without comments also returns 404
                 return {}
 

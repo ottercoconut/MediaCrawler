@@ -15,7 +15,7 @@ from media_platform.weibo.core import (
     WeiboFullTextFetchError,
     WeiboImageDownloadError,
 )
-from media_platform.weibo.exception import DataFetchError
+from media_platform.weibo.exception import DataFetchError, PlatformRuntimeError
 from tools.image_download_retry import ImageDownloadFetchError
 
 
@@ -362,4 +362,23 @@ async def test_long_text_detail_request_error_never_returns_search_excerpt(monke
         await crawler.get_note_full_text(note)
 
     assert exc_info.value.code == "detail_request_failed"
+    assert "content_detail_status" not in note["mblog"]
+
+
+@pytest.mark.asyncio
+async def test_long_text_rate_limit_is_preserved_as_run_level_failure(monkeypatch):
+    monkeypatch.setattr(config, "ENABLE_WEIBO_FULL_TEXT", True)
+    crawler = WeiboCrawler()
+    crawler.wb_client = AsyncMock()
+    crawler.wb_client.get_note_info_by_id.side_effect = PlatformRuntimeError(
+        "HTTP 429",
+        code="rate_limited",
+    )
+    note = {"mblog": {"id": "long", "text": "truncated...全文", "isLongText": True}}
+
+    with pytest.raises(WeiboFullTextFetchError) as exc_info:
+        await crawler.get_note_full_text(note)
+
+    assert exc_info.value.code == "rate_limited"
+    assert exc_info.value.runtime_blocking is True
     assert "content_detail_status" not in note["mblog"]
