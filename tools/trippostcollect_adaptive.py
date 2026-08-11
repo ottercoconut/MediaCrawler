@@ -91,6 +91,21 @@ def existing_platform_identities(platform: str) -> set[str]:
                             (platform_post_id, None)
                             for (platform_post_id,) in seen_rows
                         )
+                        try:
+                            excluded_rows = conn.execute(
+                                """
+                                SELECT platform_post_id
+                                FROM crawl_discovery_candidate_exclusions
+                                WHERE job_id=? AND platform_key=? AND query_fingerprint=?
+                                """,
+                                (int(job_id), platform, fingerprint),
+                            ).fetchall()
+                        except (ValueError, sqlite3.Error):
+                            excluded_rows = []
+                        rows.extend(
+                            (platform_post_id, None)
+                            for (platform_post_id,) in excluded_rows
+                        )
         except (OSError, sqlite3.Error):
             rows = []
     identities: set[str] = set()

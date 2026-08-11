@@ -253,6 +253,48 @@ def test_xhs_persisted_seen_candidate_is_loaded_before_detail(monkeypatch, tmp_p
     assert accumulator.is_known("seen-invalid-note") is True
 
 
+def test_common_operator_exclusion_is_loaded_before_detail(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "candidate-exclusion.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE web_posts (platform_key TEXT, platform_post_id TEXT, canonical_url TEXT)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE crawl_discovery_seen_candidates (
+                job_id INTEGER,
+                platform_key TEXT,
+                query_fingerprint TEXT,
+                platform_post_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE crawl_discovery_candidate_exclusions (
+                job_id INTEGER,
+                platform_key TEXT,
+                query_fingerprint TEXT,
+                platform_post_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO crawl_discovery_candidate_exclusions VALUES (51, 'zhihu', 'fingerprint', 'excluded-answer')"
+        )
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_JOB_ID", "51")
+    monkeypatch.setenv(
+        "TRIPPOSTCOLLECT_DISCOVERY_QUERY_FINGERPRINT",
+        "fingerprint",
+    )
+
+    accumulator = AdaptiveAccumulator.from_environment("zhihu", hard_limit=10)
+
+    assert accumulator.is_known("excluded-answer") is True
+    assert accumulator.candidate_count == 0
+
+
 def test_refresh_batch_does_not_consume_frontier_stagnation(monkeypatch) -> None:
     monkeypatch.setattr(
         "tools.trippostcollect_adaptive.append_execution_event",
