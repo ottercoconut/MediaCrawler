@@ -265,10 +265,17 @@ async def test_empty_creator_profile_retries_then_becomes_candidate_failure(
 
     enriched = await crawler.enrich_aweme_creator(aweme)
 
+    second_aweme = image_aweme("empty-creator-second")
+    second_aweme["author"]["sec_uid"] = "sec-empty-creator"
+    second_enriched = await crawler.enrich_aweme_creator(second_aweme)
+
     assert crawler.dy_client.get_user_info.await_count == 3
     assert enriched["creator_profile_attempts"] == 3
     assert enriched["creator_profile_error"] == "creator_profile_empty"
     assert "creator_profile" not in enriched
+    assert second_enriched["creator_profile_attempts"] == 3
+    assert second_enriched["creator_profile_error"] == "creator_profile_empty"
+    assert "creator_profile" not in second_enriched
 
 
 @pytest.mark.asyncio

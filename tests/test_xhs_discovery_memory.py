@@ -274,6 +274,33 @@ async def test_ip_block_stops_run_without_skipping_or_marking_seen(
 
 
 @pytest.mark.asyncio
+async def test_detail_fallback_attempt_count_matches_actual_requests(monkeypatch) -> None:
+    crawler = XiaoHongShuCrawler()
+    crawler._guarded_pause = AsyncMock(return_value=0.0)
+    crawler.xhs_client = AsyncMock()
+    crawler.xhs_client.get_note_by_id.return_value = None
+    crawler.xhs_client.get_note_by_id_from_html.side_effect = RetryError(
+        Future.construct(
+            3,
+            DataFetchError("temporary HTML detail failure"),
+            has_exception=True,
+        )
+    )
+
+    with pytest.raises(XHSNoteDetailUnavailable) as exc_info:
+        await crawler.get_note_detail_async_task(
+            note_id="attempt-count",
+            xsec_source="pc_search",
+            xsec_token="token",
+            semaphore=xhs_core.asyncio.Semaphore(1),
+        )
+
+    assert exc_info.value.attempts == 4
+    assert crawler.xhs_client.get_note_by_id.await_count == 1
+    assert crawler.xhs_client.get_note_by_id_from_html.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_image_failure_is_recorded_and_later_xhs_candidate_continues(
     monkeypatch,
     tmp_path,

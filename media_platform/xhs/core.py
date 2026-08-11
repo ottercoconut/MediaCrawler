@@ -65,7 +65,12 @@ from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
 from .client import XiaoHongShuClient
-from .exception import DataFetchError, IPBlockError, NoteNotFoundError
+from .exception import (
+    DataFetchError,
+    IPBlockError,
+    NoteNotFoundError,
+    PlatformRuntimeError,
+)
 from .field import SearchSortType
 from .help import parse_note_info_from_note_url, parse_creator_info_from_url, get_search_id
 from .login import XiaoHongShuLogin
@@ -1154,7 +1159,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                 )
                                 detail_text = str(request_failure).lower()
                                 if (
-                                    isinstance(request_failure, IPBlockError)
+                                    isinstance(
+                                        request_failure,
+                                        (IPBlockError, PlatformRuntimeError),
+                                    )
                                     or isinstance(note_detail, PlaywrightError)
                                     or self._is_login_expired_failure(note_detail)
                                     or any(
@@ -1391,11 +1399,31 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             discovery_phase=discovery_phase,
                         )
                         break
+                    except PlatformRuntimeError as exc:
+                        accumulator.mark_runtime_failed(
+                            exc.code,
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            resume_page=requested_page,
+                            resume_cursor=search_id,
+                            discovery_phase=discovery_phase,
+                        )
+                        break
                     except (DataFetchError, RetryError) as exc:
                         request_failure = self._request_failure_exception(exc)
                         if isinstance(request_failure, IPBlockError):
                             accumulator.mark_runtime_failed(
                                 "ip_blocked_300012",
+                                source_page=requested_page,
+                                source_cursor=search_id,
+                                resume_page=requested_page,
+                                resume_cursor=search_id,
+                                discovery_phase=discovery_phase,
+                            )
+                            break
+                        if isinstance(request_failure, PlatformRuntimeError):
+                            accumulator.mark_runtime_failed(
+                                request_failure.code,
                                 source_page=requested_page,
                                 source_cursor=search_id,
                                 resume_page=requested_page,
@@ -1588,8 +1616,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
             request_failure = self._request_failure_exception(exc)
             if isinstance(request_failure, IPBlockError):
                 raise request_failure
+            if isinstance(request_failure, PlatformRuntimeError):
+                raise request_failure
             if self._is_login_expired_failure(exc):
-                raise RuntimeError("login_required") from request_failure
+                raise PlatformRuntimeError(
+                    "XHS creator profile login expired",
+                    code="login_required",
+                ) from request_failure
             utils.logger.warning(
                 "[XiaoHongShuCrawler.enrich_note_creator] "
                 f"session profile request failed, using browser fallback: {user_id}, {exc}"

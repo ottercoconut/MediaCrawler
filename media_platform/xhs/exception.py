@@ -29,5 +29,13 @@ class IPBlockError(RequestError):
     """fetch so fast that the server block us ip"""
 
 
+class PlatformRuntimeError(RequestError):
+    """A login or rate-limit response that must stop the current run."""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
 class NoteNotFoundError(RequestError):
     """Note does not exist or is abnormal"""

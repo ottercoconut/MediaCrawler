@@ -40,7 +40,12 @@ from tools.trippostcollect_behavior import run_required_api_captcha_verification
 if TYPE_CHECKING:
     from proxy.proxy_ip_pool import ProxyIpPool
 
-from .exception import DataFetchError, IPBlockError, NoteNotFoundError
+from .exception import (
+    DataFetchError,
+    IPBlockError,
+    NoteNotFoundError,
+    PlatformRuntimeError,
+)
 from .field import SearchNoteType, SearchSortType
 from .help import get_search_id
 from .extractor import XiaoHongShuExtractor
@@ -117,7 +122,13 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         self.headers.update(headers)
         return self.headers
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1), retry=retry_if_not_exception_type(NoteNotFoundError))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_fixed(1),
+        retry=retry_if_not_exception_type(
+            (NoteNotFoundError, IPBlockError, PlatformRuntimeError)
+        ),
+    )
     async def request(self, method, url, **kwargs) -> Union[str, Any]:
         """
         Wrapper for httpx common request method, processes request response
@@ -136,6 +147,17 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         return_response = kwargs.pop("return_response", False)
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
+
+        if response.status_code in {401, 403}:
+            raise PlatformRuntimeError(
+                f"XHS request HTTP {response.status_code}",
+                code="login_required",
+            )
+        if response.status_code == 429:
+            raise PlatformRuntimeError(
+                "XHS request HTTP 429",
+                code="rate_limited",
+            )
 
         if response.status_code == 471 or response.status_code == 461:
             verify_type = response.headers.get("Verifytype", "")
@@ -156,9 +178,22 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             )
             raise DataFetchError("XHS API CAPTCHA completed; retrying the original request")
 
+        response_data: Dict | None = None
+        try:
+            candidate_data = response.json()
+            if isinstance(candidate_data, dict):
+                response_data = candidate_data
+        except (ValueError, TypeError):
+            response_data = None
+        if (
+            response_data is not None
+            and response_data.get("code") == self.IP_ERROR_CODE
+        ):
+            raise IPBlockError(self.IP_ERROR_STR)
+
         if return_response:
             return response.text
-        data: Dict = response.json()
+        data: Dict = response_data if response_data is not None else response.json()
         if data["success"]:
             return data.get("data", data.get("success", {}))
         elif data["code"] == self.IP_ERROR_CODE:
@@ -692,7 +727,6 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         data = {"original_url": f"{self._domain}/discovery/item/{note_id}"}
         return await self.post(uri, data=data, return_response=True)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
     async def get_note_by_id_from_html(
         self,
         note_id: str,

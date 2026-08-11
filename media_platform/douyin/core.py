@@ -93,6 +93,7 @@ class DouYinCrawler(AbstractCrawler):
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
         self.creator_profile_cache: Dict[str, Dict] = {}
+        self.creator_profile_failure_cache: Dict[str, Dict[str, Any]] = {}
         self.creator_profile_enriched_count = 0
 
     async def start(self) -> None:
@@ -649,6 +650,20 @@ class DouYinCrawler(AbstractCrawler):
             if creator_profile:
                 aweme_info["creator_profile"] = creator_profile
             return aweme_info
+        if sec_uid in self.creator_profile_failure_cache:
+            cached_failure = self.creator_profile_failure_cache[sec_uid]
+            aweme_info["creator_profile_attempts"] = int(
+                cached_failure.get("attempts") or 1
+            )
+            if cached_failure.get("runtime_error"):
+                aweme_info["creator_profile_runtime_error"] = str(
+                    cached_failure["runtime_error"]
+                )
+            else:
+                aweme_info["creator_profile_error"] = str(
+                    cached_failure.get("error") or "detail_request_failed"
+                )
+            return aweme_info
         max_enrich = int(os.environ.get("TRIPPOSTCOLLECT_DOUYIN_MAX_CREATOR_ENRICH", "30"))
         if max_enrich >= 0 and self.creator_profile_enriched_count >= max_enrich:
             return aweme_info
@@ -671,23 +686,34 @@ class DouYinCrawler(AbstractCrawler):
         aweme_info["creator_profile_attempts"] = attempts
         try:
             if last_error and "account blocked" in str(last_error).lower():
-                self.creator_profile_cache[sec_uid] = {}
                 aweme_info["creator_profile_runtime_error"] = "account_blocked"
+                self.creator_profile_failure_cache[sec_uid] = {
+                    "runtime_error": "account_blocked",
+                    "attempts": attempts,
+                }
                 return aweme_info
-            self.creator_profile_cache[sec_uid] = creator_profile or {}
             self.creator_profile_enriched_count += 1
             if creator_profile:
+                self.creator_profile_cache[sec_uid] = creator_profile
                 aweme_info["creator_profile"] = creator_profile
             elif last_error is not None:
                 aweme_info["creator_profile_error"] = "detail_request_failed"
             else:
                 aweme_info["creator_profile_error"] = "creator_profile_empty"
+            if not creator_profile:
+                self.creator_profile_failure_cache[sec_uid] = {
+                    "error": aweme_info["creator_profile_error"],
+                    "attempts": attempts,
+                }
             sleep_seconds = float(os.environ.get("TRIPPOSTCOLLECT_DOUYIN_CREATOR_SLEEP_SECONDS", "0.25"))
             if sleep_seconds > 0:
                 await asyncio.sleep(sleep_seconds)
         except DataFetchError as exc:
-            self.creator_profile_cache[sec_uid] = {}
             aweme_info["creator_profile_error"] = "detail_request_failed"
+            self.creator_profile_failure_cache[sec_uid] = {
+                "error": "detail_request_failed",
+                "attempts": attempts,
+            }
             utils.logger.warning(f"[DouYinCrawler.enrich_aweme_creator] get creator profile failed: {exc}")
         return aweme_info
 
