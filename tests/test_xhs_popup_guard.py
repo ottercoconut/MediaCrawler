@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from media_platform.xhs.core import XiaoHongShuCrawler
@@ -182,3 +184,49 @@ async def test_standalone_xhs_login_waits_before_closing_extra_tab(
         ("sleep", 30),
         ("close", "verification"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_standalone_xhs_login_stops_on_platform_security_limit() -> None:
+    class SecurityLimitPage:
+        url = "https://www.xiaohongshu.com/website-login/error"
+
+        async def is_visible(self, selector: str, timeout: int) -> bool:
+            return True
+
+        async def content(self) -> str:
+            return ""
+
+    login = XiaoHongShuLogin(
+        login_type="qrcode",
+        browser_context=object(),
+        context_page=SecurityLimitPage(),
+    )
+    login._single_login_page = AsyncMock(return_value=login.context_page)
+
+    with pytest.raises(RuntimeError, match="xhs_platform_security_limit_300011"):
+        await login._check_login_state_once("")
+
+
+@pytest.mark.asyncio
+async def test_crawler_checkpoint_markers_detect_url_only_security_limit() -> None:
+    class SecurityLimitPage:
+        url = "https://www.xiaohongshu.com/website-login/error?redirectPath=%2Fexplore"
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def content(self) -> str:
+            return ""
+
+    class Context:
+        pages = [SecurityLimitPage()]
+
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = Context()
+    crawler.context_page = Context.pages[0]
+
+    markers = await crawler._visible_checkpoint_markers()
+
+    assert markers["security"] == ["website-login/error"]
+    assert markers["pages"][0]["url"] == Context.pages[0].url

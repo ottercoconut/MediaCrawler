@@ -68,6 +68,81 @@ async def test_creator_enrichment_does_not_hide_visible_browser_block(crawler):
 
 
 @pytest.mark.asyncio
+async def test_creator_browser_fallback_stops_on_platform_security_limit(crawler, monkeypatch):
+    class SecurityLimitPage:
+        async def wait_for_timeout(self, milliseconds):
+            assert milliseconds >= 0
+
+    page = SecurityLimitPage()
+    crawler._new_guarded_page = AsyncMock(return_value=page)
+    crawler._goto_with_deadline = AsyncMock()
+    crawler._close_page_with_deadline = AsyncMock()
+    crawler._wait_for_creator_profile_verification = AsyncMock()
+    record_limit = AsyncMock(return_value={"observed_error_code": "300011"})
+
+    async def inspect_state(current_page):
+        assert current_page is page
+        return "安全限制 Account exception, please retry later 300011", {
+            "platform_security_limit": True,
+            "captcha_or_verify": True,
+            "rate_limited": False,
+            "blocked": False,
+            "login_required": False,
+        }
+
+    monkeypatch.setattr(
+        "media_platform.xhs.core.inspect_visible_page_state",
+        inspect_state,
+    )
+    monkeypatch.setattr(
+        "media_platform.xhs.core.record_platform_security_limit",
+        record_limit,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="xhs_creator_profile_visible_block:platform_security_limit",
+    ):
+        await crawler._get_creator_info_from_browser("author-security-limit")
+
+    crawler._close_page_with_deadline.assert_awaited_once_with(
+        page,
+        reason="creator_profile_cleanup",
+    )
+    crawler._wait_for_creator_profile_verification.assert_not_awaited()
+    record_limit.assert_awaited_once_with(
+        page,
+        stage="creator_profile:author-security-limit:arrival",
+        visible_text_sample="安全限制 Account exception, please retry later 300011",
+        visible_markers={
+            "platform_security_limit": True,
+            "captcha_or_verify": True,
+            "rate_limited": False,
+            "blocked": False,
+            "login_required": False,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_checkpoint_wait_stops_on_platform_security_limit(crawler, monkeypatch):
+    monkeypatch.setattr(crawler, "_env_int", lambda name, default: 600)
+    crawler._single_page_for_login = AsyncMock()
+    crawler._cookie_markers = AsyncMock(return_value={"web_session": True})
+    crawler._profile_ui_visible = AsyncMock(return_value=True)
+    crawler._visible_checkpoint_markers = AsyncMock(
+        return_value={
+            "security": ["website-login/error"],
+            "login_or_qr": [],
+            "pages": [],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="xhs_platform_security_limit_300011"):
+        await crawler._wait_for_manual_checkpoint_if_needed()
+
+
+@pytest.mark.asyncio
 async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
     crawler,
     monkeypatch,

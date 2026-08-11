@@ -53,6 +53,7 @@ from tools.trippostcollect_behavior import (
     inspect_visible_page_state,
     install_project_runtime_hints,
     project_browser_args,
+    record_platform_security_limit,
     run_required_continuity_behavior,
     run_required_human_behavior,
     run_required_request_pause,
@@ -664,7 +665,19 @@ class XiaoHongShuCrawler(AbstractCrawler):
             "login_or_qr": [],
             "pages": [],
         }
-        security_texts = ("请通过验证", "安全验证", "验证码", "身份验证", "操作频繁", "环境异常", "风险")
+        security_texts = (
+            "请通过验证",
+            "安全验证",
+            "验证码",
+            "身份验证",
+            "操作频繁",
+            "环境异常",
+            "风险",
+            "安全限制",
+            "账号异常",
+            "Account exception",
+            "300011",
+        )
         login_texts = ("扫码登录", "二维码", "打开小红书扫一扫", "确认登录", "登录确认", "手机号登录")
         try:
             pages = [page for page in self.browser_context.pages if not page.is_closed()]
@@ -677,6 +690,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
             except Exception:
                 content = ""
             security = sorted({text for text in security_texts if text in content})
+            if "/website-login/error" in str(page.url or ""):
+                security.append("website-login/error")
+                security = sorted(set(security))
             login_or_qr = sorted({text for text in login_texts if text in content})
             if security:
                 markers["security"] = sorted(set(markers["security"]) | set(security))  # type: ignore[arg-type]
@@ -717,6 +733,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
         last_print = 0.0
         while time.monotonic() - started < wait_seconds:
             await self._single_page_for_login()
+            checkpoint_markers = await self._visible_checkpoint_markers()
+            security_markers = set(checkpoint_markers.get("security") or [])
+            if security_markers.intersection(
+                {"安全限制", "账号异常", "Account exception", "300011", "website-login/error"}
+            ):
+                raise RuntimeError("xhs_platform_security_limit_300011")
             cookie_markers = await self._cookie_markers()
             profile_ui = await self._profile_ui_visible()
             if profile_ui:
@@ -728,7 +750,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             now = time.monotonic()
             if now - last_print >= 10:
-                checkpoint_markers = await self._visible_checkpoint_markers()
                 utils.logger.info(
                     "[XiaoHongShuCrawler] Waiting for Xiaohongshu checkpoint: "
                     f"profile_ui={profile_ui}, cookies={cookie_markers}, visible={checkpoint_markers}"
@@ -1429,13 +1450,21 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             await page.wait_for_timeout(random.randint(1_200, 3_000))
 
-            _, markers = await inspect_visible_page_state(page)
+            text_sample, markers = await inspect_visible_page_state(page)
+            if markers.get("platform_security_limit"):
+                await record_platform_security_limit(
+                    page,
+                    stage=f"creator_profile:{user_id}:arrival",
+                    visible_text_sample=text_sample,
+                    visible_markers=markers,
+                )
+                raise RuntimeError("xhs_creator_profile_visible_block:platform_security_limit")
             if markers.get("captcha_or_verify"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
             challenge = next(
                 (
                     key
-                    for key in ("rate_limited", "blocked")
+                    for key in ("platform_security_limit", "rate_limited", "blocked")
                     if markers.get(key)
                 ),
                 "",
@@ -1454,13 +1483,21 @@ class XiaoHongShuCrawler(AbstractCrawler):
             await page.mouse.wheel(0, random.randint(180, 460))
             await page.wait_for_timeout(random.randint(500, 1_500))
 
-            _, markers = await inspect_visible_page_state(page)
+            text_sample, markers = await inspect_visible_page_state(page)
+            if markers.get("platform_security_limit"):
+                await record_platform_security_limit(
+                    page,
+                    stage=f"creator_profile:{user_id}:post_scroll",
+                    visible_text_sample=text_sample,
+                    visible_markers=markers,
+                )
+                raise RuntimeError("xhs_creator_profile_visible_block:platform_security_limit")
             if markers.get("captcha_or_verify"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
             challenge = next(
                 (
                     key
-                    for key in ("rate_limited", "blocked")
+                    for key in ("platform_security_limit", "rate_limited", "blocked")
                     if markers.get(key)
                 ),
                 "",
@@ -1503,11 +1540,19 @@ class XiaoHongShuCrawler(AbstractCrawler):
             if time.monotonic() >= deadline:
                 raise RuntimeError("xhs_creator_profile_verification_timeout")
 
-            _, markers = await inspect_visible_page_state(page)
+            text_sample, markers = await inspect_visible_page_state(page)
+            if markers.get("platform_security_limit"):
+                await record_platform_security_limit(
+                    page,
+                    stage=f"creator_profile:{user_id}:verification_wait",
+                    visible_text_sample=text_sample,
+                    visible_markers=markers,
+                )
+                raise RuntimeError("xhs_creator_profile_visible_block:platform_security_limit")
             challenge = next(
                 (
                     key
-                    for key in ("rate_limited", "blocked")
+                    for key in ("platform_security_limit", "rate_limited", "blocked")
                     if markers.get(key)
                 ),
                 "",

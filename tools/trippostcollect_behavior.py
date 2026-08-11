@@ -146,6 +146,34 @@ async def inspect_visible_page_state(page: Page) -> tuple[str, dict[str, bool]]:
     return await visible_page_state(page)
 
 
+async def record_platform_security_limit(
+    page: Page,
+    *,
+    stage: str,
+    visible_text_sample: str,
+    visible_markers: dict[str, bool],
+) -> dict[str, Any]:
+    """Persist an XHS terminal account restriction through the project evidence writer."""
+    if not _enabled():
+        raise RuntimeError("required TripPostCollect platform security evidence is disabled")
+    scripts_dir = Path(os.environ.get("TRIPPOSTCOLLECT_PROJECT_SCRIPTS", "")).expanduser()
+    evidence_path = os.environ.get("TRIPPOSTCOLLECT_HUMAN_BEHAVIOR_EVIDENCE", "").strip()
+    if not scripts_dir.is_dir() or not evidence_path:
+        raise RuntimeError("required TripPostCollect platform security evidence configuration is incomplete")
+    scripts_value = str(scripts_dir.resolve())
+    if scripts_value not in sys.path:
+        sys.path.insert(0, scripts_value)
+    from mediacrawler_behavior import record_xhs_platform_security_limit
+
+    return await record_xhs_platform_security_limit(
+        page,
+        evidence_path=evidence_path,
+        stage=stage,
+        visible_text_sample=visible_text_sample,
+        visible_markers=visible_markers,
+    )
+
+
 async def run_requested_post_interaction(
     page: Page,
     *,

@@ -108,21 +108,42 @@ class XiaoHongShuLogin(AbstractLogin):
         page = await self._single_login_page()
 
         user_profile_selector = "xpath=//a[contains(@href, '/user/profile/')]//span[text()='我']"
-        security_texts = ("请通过验证", "安全验证", "验证码", "身份验证", "操作频繁", "环境异常", "风险")
+        security_texts = (
+            "请通过验证",
+            "安全验证",
+            "验证码",
+            "身份验证",
+            "操作频繁",
+            "环境异常",
+            "风险",
+            "安全限制",
+            "账号异常",
+            "Account exception",
+            "300011",
+        )
         login_texts = ("扫码登录", "二维码", "打开小红书扫一扫", "确认登录", "登录确认", "手机号登录")
         try:
-            # Selector for elements containing "Me" text with a link pointing to the profile.
+            content = await page.content()
+        except Exception:
+            content = ""
+        markers = sorted({text for text in (*security_texts, *login_texts) if text in content})
+        if "/website-login/error" in str(page.url or ""):
+            markers.append("website-login/error")
+            markers = sorted(set(markers))
+        if set(markers).intersection(
+            {"安全限制", "账号异常", "Account exception", "300011", "website-login/error"}
+        ):
+            raise RuntimeError("xhs_platform_security_limit_300011")
+
+        try:
+            # A stale signed-in shell can remain behind a security overlay, so
+            # terminal platform evidence must win before this profile check.
             is_visible = await page.is_visible(user_profile_selector, timeout=500)
             if is_visible:
                 utils.logger.info("[XiaoHongShuLogin.check_login_state] Login status confirmed by UI element ('Me' button).")
                 return True
         except Exception:
             pass
-        try:
-            content = await page.content()
-        except Exception:
-            content = ""
-        markers = sorted({text for text in (*security_texts, *login_texts) if text in content})
 
         # 2. Check for CAPTCHA/security/login prompts on the single login page.
         if markers:
