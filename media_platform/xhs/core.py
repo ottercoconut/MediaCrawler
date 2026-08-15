@@ -658,10 +658,23 @@ class XiaoHongShuCrawler(AbstractCrawler):
         return page
 
     async def _profile_ui_visible(self) -> bool:
+        """Recognize the signed-in profile entry across XHS sidebar DOM variants."""
+
         try:
             await self._activate_latest_xhs_page()
-            selector = "xpath=//a[contains(@href, '/user/profile/')]//span[text()='我']"
-            return await self.context_page.locator(selector).count() > 0
+            selectors = (
+                # The original sidebar layout exposes a profile URL.
+                "xpath=//a[contains(@href, '/user/profile/')]"
+                "[.//*[normalize-space()='我'] or normalize-space()='我']",
+                # Current XHS can render the signed-in sidebar entry as a
+                # button rather than a profile anchor before navigation.
+                "xpath=//*[self::a or self::button]"
+                "[.//*[normalize-space()='我'] or normalize-space()='我']",
+            )
+            for selector in selectors:
+                if await self.context_page.locator(selector).count() > 0:
+                    return True
+            return False
         except Exception:
             return False
 

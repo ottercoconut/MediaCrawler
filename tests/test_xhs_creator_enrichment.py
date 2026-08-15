@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -23,6 +23,31 @@ def crawler(monkeypatch):
     instance = XiaoHongShuCrawler()
     instance._guarded_pause = AsyncMock(return_value=0.0)
     return instance
+
+
+@pytest.mark.asyncio
+async def test_profile_ui_visible_accepts_current_button_sidebar_variant(crawler):
+    original_layout = Mock()
+    original_layout.count = AsyncMock(return_value=0)
+    current_layout = Mock()
+    current_layout.count = AsyncMock(return_value=1)
+    crawler.context_page = Mock()
+    crawler.context_page.locator.side_effect = [original_layout, current_layout]
+    crawler._activate_latest_xhs_page = AsyncMock()
+
+    assert await crawler._profile_ui_visible() is True
+    assert crawler.context_page.locator.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_profile_ui_visible_rejects_logged_out_sidebar(crawler):
+    locator = Mock()
+    locator.count = AsyncMock(return_value=0)
+    crawler.context_page = Mock()
+    crawler.context_page.locator.side_effect = [locator, locator]
+    crawler._activate_latest_xhs_page = AsyncMock()
+
+    assert await crawler._profile_ui_visible() is False
 
 
 @pytest.mark.asyncio
