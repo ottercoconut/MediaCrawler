@@ -670,6 +670,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 # button rather than a profile anchor before navigation.
                 "xpath=//*[self::a or self::button]"
                 "[.//*[normalize-space()='我'] or normalize-space()='我']",
+                # Some current sidebar builds use a non-semantic container.
+                # The logged-out dialog has “我已阅读”, not an exact “我”.
+                "xpath=//*[normalize-space()='我']",
             )
             for selector in selectors:
                 if await self.context_page.locator(selector).count() > 0:

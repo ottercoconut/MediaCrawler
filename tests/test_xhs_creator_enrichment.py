@@ -31,8 +31,14 @@ async def test_profile_ui_visible_accepts_current_button_sidebar_variant(crawler
     original_layout.count = AsyncMock(return_value=0)
     current_layout = Mock()
     current_layout.count = AsyncMock(return_value=1)
+    generic_current_layout = Mock()
+    generic_current_layout.count = AsyncMock(return_value=1)
     crawler.context_page = Mock()
-    crawler.context_page.locator.side_effect = [original_layout, current_layout]
+    crawler.context_page.locator.side_effect = [
+        original_layout,
+        current_layout,
+        generic_current_layout,
+    ]
     crawler._activate_latest_xhs_page = AsyncMock()
 
     assert await crawler._profile_ui_visible() is True
@@ -44,10 +50,28 @@ async def test_profile_ui_visible_rejects_logged_out_sidebar(crawler):
     locator = Mock()
     locator.count = AsyncMock(return_value=0)
     crawler.context_page = Mock()
-    crawler.context_page.locator.side_effect = [locator, locator]
+    crawler.context_page.locator.side_effect = [locator, locator, locator]
     crawler._activate_latest_xhs_page = AsyncMock()
 
     assert await crawler._profile_ui_visible() is False
+
+
+@pytest.mark.asyncio
+async def test_profile_ui_visible_accepts_nonsemantic_current_sidebar(crawler):
+    missing_layout = Mock()
+    missing_layout.count = AsyncMock(return_value=0)
+    current_layout = Mock()
+    current_layout.count = AsyncMock(return_value=1)
+    crawler.context_page = Mock()
+    crawler.context_page.locator.side_effect = [
+        missing_layout,
+        missing_layout,
+        current_layout,
+    ]
+    crawler._activate_latest_xhs_page = AsyncMock()
+
+    assert await crawler._profile_ui_visible() is True
+    assert crawler.context_page.locator.call_count == 3
 
 
 @pytest.mark.asyncio
