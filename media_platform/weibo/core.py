@@ -180,7 +180,18 @@ class WeiboCrawler(AbstractCrawler):
                 await self.search()
             elif config.CRAWLER_TYPE == "detail":
                 # Get the information and comments of the specified post
+                behavior_keyword = config.KEYWORDS.split(",", maxsplit=1)[0].strip()
+                source_keyword_var.set(behavior_keyword)
+                container_id = quote(f"100103type=1&q={behavior_keyword}", safe="")
+                await self.context_page.goto(
+                    f"{self.mobile_index_url}/search?containerid={container_id}",
+                    wait_until="domcontentloaded",
+                )
                 await run_required_human_behavior(self.context_page, "weibo")
+                await self.wb_client.update_cookies(
+                    browser_context=self.browser_context,
+                    urls=self.cookie_urls,
+                )
                 await self.get_specified_notes()
             elif config.CRAWLER_TYPE == "creator":
                 # Get creator's information and their notes and comments
@@ -413,6 +424,18 @@ class WeiboCrawler(AbstractCrawler):
         video_details = await asyncio.gather(*task_list)
         for note_item in video_details:
             if note_item:
+                mblog = note_item.get("mblog") or {}
+                if weibo_store._weibo_pic_urls(mblog):
+                    try:
+                        await self.get_note_images(mblog)
+                    except WeiboImageDownloadError as exc:
+                        if is_runtime_blocking_image_error(exc.code):
+                            raise
+                        utils.logger.warning(
+                            "[WeiboCrawler.get_specified_notes] Skip note after image "
+                            f"failure: {exc}"
+                        )
+                        continue
                 await weibo_store.update_weibo_note(note_item)
         await self.batch_get_notes_comments(config.WEIBO_SPECIFIED_ID_LIST)
 
@@ -426,6 +449,10 @@ class WeiboCrawler(AbstractCrawler):
         async with semaphore:
             try:
                 result = await self.wb_client.get_note_info_by_id(note_id)
+                mblog = (result or {}).get("mblog") or {}
+                if mblog.get("text"):
+                    mblog["content_detail_status"] = "detail_observed"
+                    mblog["content_detail_source"] = "mobile_detail"
 
                 # Sleep after fetching note details
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)

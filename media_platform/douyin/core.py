@@ -157,7 +157,15 @@ class DouYinCrawler(AbstractCrawler):
                 await self.search()
             elif config.CRAWLER_TYPE == "detail":
                 # Get the information and comments of the specified post
+                behavior_keyword = config.KEYWORDS.split(",", maxsplit=1)[0].strip()
+                source_keyword_var.set(behavior_keyword)
+                search_url = f"{self.index_url}/search/{quote(behavior_keyword)}?type=general"
+                await self.context_page.goto(search_url, wait_until="domcontentloaded")
                 await run_required_human_behavior(self.context_page, "douyin")
+                await self.dy_client.update_cookies(
+                    browser_context=self.browser_context,
+                    urls=self.cookie_urls,
+                )
                 await self.get_specified_awemes()
             elif config.CRAWLER_TYPE == "creator":
                 # Get the information and comments of the specified creator

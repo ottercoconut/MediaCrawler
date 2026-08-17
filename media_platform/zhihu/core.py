@@ -336,6 +336,7 @@ class ZhihuCrawler(AbstractCrawler):
                 await self.search()
             elif config.CRAWLER_TYPE == "detail":
                 # Get the information and comments of the specified post
+                source_keyword_var.set(search_cookie_keyword)
                 await self.get_specified_notes()
             elif config.CRAWLER_TYPE == "creator":
                 # Get creator's information and their notes and comments

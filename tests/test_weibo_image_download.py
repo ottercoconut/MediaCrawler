@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from io import BytesIO
 import json
 import sqlite3
@@ -38,6 +39,38 @@ def valid_mblog(note_id: str) -> dict:
         "pics": [{"pid": f"pid-{note_id}", "url": f"https://wx.test/{note_id}.jpg"}],
         "user": {"id": "author", "screen_name": "name", "followers_count": 4},
     }
+
+
+@pytest.mark.asyncio
+async def test_detail_task_marks_mobile_detail_as_authoritative(monkeypatch):
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    crawler = WeiboCrawler()
+    crawler.wb_client = AsyncMock()
+    crawler.wb_client.get_note_info_by_id.return_value = {
+        "mblog": {"id": "detail-note", "text": "完整正文"}
+    }
+
+    result = await crawler.get_note_info_task("detail-note", asyncio.Semaphore(1))
+
+    assert result["mblog"]["content_detail_status"] == "detail_observed"
+    assert result["mblog"]["content_detail_source"] == "mobile_detail"
+
+
+@pytest.mark.asyncio
+async def test_specified_detail_downloads_images_before_store(monkeypatch):
+    monkeypatch.setattr(config, "WEIBO_SPECIFIED_ID_LIST", ["detail-note"])
+    crawler = WeiboCrawler()
+    note = {"mblog": valid_mblog("detail-note")}
+    crawler.get_note_info_task = AsyncMock(return_value=note)
+    crawler.get_note_images = AsyncMock()
+    crawler.batch_get_notes_comments = AsyncMock()
+    store = AsyncMock()
+    monkeypatch.setattr(weibo_core.weibo_store, "update_weibo_note", store)
+
+    await crawler.get_specified_notes()
+
+    crawler.get_note_images.assert_awaited_once_with(note["mblog"])
+    store.assert_awaited_once_with(note)
 
 
 @pytest.mark.asyncio
