@@ -1678,7 +1678,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     visible_markers=markers,
                 )
                 raise RuntimeError("xhs_creator_profile_visible_block:platform_security_limit")
-            if markers.get("captcha_or_verify"):
+            if markers.get("captcha_or_verify") or markers.get("login_required"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
             challenge = next(
                 (
@@ -1690,9 +1690,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             if challenge:
                 raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
-            if markers.get("login_required"):
-                raise RuntimeError("xhs_creator_profile_visible_block:login_required")
-
             viewport = page.viewport_size or {"width": 1280, "height": 800}
             await page.mouse.move(
                 random.randint(80, max(81, viewport["width"] - 80)),
@@ -1711,7 +1708,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     visible_markers=markers,
                 )
                 raise RuntimeError("xhs_creator_profile_visible_block:platform_security_limit")
-            if markers.get("captcha_or_verify"):
+            if markers.get("captcha_or_verify") or markers.get("login_required"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
             challenge = next(
                 (
@@ -1723,9 +1720,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             if challenge:
                 raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
-            if markers.get("login_required"):
-                raise RuntimeError("xhs_creator_profile_visible_block:login_required")
-
             html_content = await page.content()
             return self.xhs_client.extract_creator_info_from_html(html_content)
         finally:
@@ -1739,7 +1733,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         page: Page,
         user_id: str,
     ) -> Optional[Dict]:
-        """Keep a QR security-check page open until the operator completes it."""
+        """Keep a creator page open until manual login or security verification completes."""
         timeout_seconds = max(
             30.0,
             self._env_float("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_WAIT_SECONDS", 600.0),
@@ -1751,7 +1745,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         deadline = time.monotonic() + timeout_seconds
         await page.bring_to_front()
         utils.logger.warning(
-            "[XiaoHongShuCrawler] Manual QR security verification required for creator profile; "
+            "[XiaoHongShuCrawler] Manual login or security verification required for creator profile; "
             f"keeping page open for up to {timeout_seconds:.0f}s: {user_id}"
         )
 
@@ -1778,9 +1772,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             if challenge:
                 raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
-            if markers.get("login_required") and not markers.get("captcha_or_verify"):
-                raise RuntimeError("xhs_creator_profile_visible_block:login_required")
-
             if not markers.get("captcha_or_verify"):
                 html_content = await page.content()
                 creator_info = self.xhs_client.extract_creator_info_from_html(html_content)

@@ -203,6 +203,42 @@ async def test_creator_browser_fallback_stops_on_platform_security_limit(crawler
 
 
 @pytest.mark.asyncio
+async def test_creator_browser_fallback_waits_on_login_url(crawler, monkeypatch):
+    creator = {"interactions": [{"type": "fans", "count": "321"}]}
+
+    class LoginPage:
+        async def wait_for_timeout(self, milliseconds):
+            assert milliseconds >= 0
+
+    page = LoginPage()
+    crawler._new_guarded_page = AsyncMock(return_value=page)
+    crawler._goto_with_deadline = AsyncMock()
+    crawler._close_page_with_deadline = AsyncMock()
+    crawler._wait_for_creator_profile_verification = AsyncMock(return_value=creator)
+
+    async def inspect_state(current_page):
+        assert current_page is page
+        return "", {"login_required": True, "captcha_or_verify": False}
+
+    monkeypatch.setattr(
+        "media_platform.xhs.core.inspect_visible_page_state",
+        inspect_state,
+    )
+
+    result = await crawler._get_creator_info_from_browser("author-login")
+
+    assert result == creator
+    crawler._wait_for_creator_profile_verification.assert_awaited_once_with(
+        page,
+        "author-login",
+    )
+    crawler._close_page_with_deadline.assert_awaited_once_with(
+        page,
+        reason="creator_profile_cleanup",
+    )
+
+
+@pytest.mark.asyncio
 async def test_startup_checkpoint_wait_stops_on_platform_security_limit(crawler, monkeypatch):
     monkeypatch.setattr(crawler, "_env_int", lambda name, default: 600)
     crawler._single_page_for_login = AsyncMock()
