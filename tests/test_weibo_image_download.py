@@ -17,6 +17,7 @@ from media_platform.weibo.core import (
     WeiboImageDownloadError,
 )
 from media_platform.weibo.exception import DataFetchError, PlatformRuntimeError
+from media_platform.weibo.client import weibo_image_request_urls
 from tools.image_download_retry import ImageDownloadFetchError
 
 
@@ -24,6 +25,24 @@ def png_bytes() -> bytes:
     output = BytesIO()
     Image.new("RGB", (4, 3), color="blue").save(output, format="PNG")
     return output.getvalue()
+
+
+def test_weibo_image_urls_do_not_double_wrap_existing_proxy() -> None:
+    assert weibo_image_request_urls(
+        "https://i1.wp.com/ww3.sinaimg.cn/large/example.jpg"
+    ) == [
+        "https://i1.wp.com/ww3.sinaimg.cn/large/example.jpg",
+        "https://ww3.sinaimg.cn/large/example.jpg",
+    ]
+
+
+def test_weibo_image_urls_keep_bounded_proxy_and_direct_fallbacks() -> None:
+    assert weibo_image_request_urls(
+        "https://wx4.sinaimg.cn/orj360/example.jpg?token=ignored"
+    ) == [
+        "https://i1.wp.com/wx4.sinaimg.cn/large/example.jpg",
+        "https://wx4.sinaimg.cn/large/example.jpg",
+    ]
 
 
 def valid_mblog(note_id: str) -> dict:

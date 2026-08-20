@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import config
 import pytest
 from constant import zhihu as constant
-from media_platform.zhihu.core import ZhihuCrawler, ZhihuDetailFetchError
+from media_platform.zhihu.core import (
+    ZhihuCrawler,
+    ZhihuDetailFetchError,
+    ZhihuImageDownloadError,
+)
 from media_platform.zhihu.exception import PlatformRuntimeError
-from media_platform.zhihu.help import merge_search_content_detail
+from media_platform.zhihu.help import ZhihuExtractor, merge_search_content_detail
 from model.m_zhihu import ZhihuContent
 from store import zhihu as zhihu_store
 
@@ -45,6 +50,47 @@ def test_merge_search_detail_keeps_search_author_evidence() -> None:
     assert merged.author_followers_source == "search_author"
 
 
+def test_detail_html_selects_exact_non_empty_answer_entity() -> None:
+    payload = {
+        "initialState": {
+            "entities": {
+                "answers": {
+                    "wrong": {"id": "wrong", "type": "answer", "content": "wrong body"},
+                    "target": {
+                        "id": "target",
+                        "type": "answer",
+                        "content": "<p>target body</p>",
+                        "question": {"id": "question-1"},
+                    },
+                }
+            }
+        }
+    }
+    html = f'<script id="js-initialData">{json.dumps(payload)}</script>'
+
+    result = ZhihuExtractor().extract_answer_content_from_html(html, "target")
+
+    assert result is not None
+    assert result.content_id == "target"
+    assert result.content_text == "target body"
+
+
+def test_detail_html_rejects_empty_target_even_when_other_entity_has_body() -> None:
+    payload = {
+        "initialState": {
+            "entities": {
+                "articles": {
+                    "other": {"id": "other", "type": "article", "content": "other body"},
+                    "target": {"id": "target", "type": "article", "content": ""},
+                }
+            }
+        }
+    }
+    html = f'<script id="js-initialData">{json.dumps(payload)}</script>'
+
+    assert ZhihuExtractor().extract_article_content_from_html(html, "target") is None
+
+
 @pytest.mark.asyncio
 async def test_detail_rate_limit_is_preserved_as_run_level_failure() -> None:
     crawler = ZhihuCrawler.__new__(ZhihuCrawler)
@@ -74,6 +120,10 @@ async def _raise_async(error: BaseException):
     raise error
 
 
+async def _return_none_async(*_: object) -> None:
+    return None
+
+
 @pytest.mark.asyncio
 async def test_detail_mode_marks_success_and_parse_failure(monkeypatch) -> None:
     crawler = ZhihuCrawler.__new__(ZhihuCrawler)
@@ -86,6 +136,7 @@ async def test_detail_mode_marks_success_and_parse_failure(monkeypatch) -> None:
                 content_id=answer_id,
                 question_id=question_id,
                 content_type=constant.ANSWER_NAME,
+                content_text="full body",
                 image_list=[],
             )
 
@@ -122,7 +173,10 @@ async def test_specified_detail_mode_reuses_one_semaphore(monkeypatch) -> None:
         return ZhihuContent(
             content_id=full_note_url.rsplit("/", 1)[-1],
             content_type=constant.ARTICLE_NAME,
+            content_text="full body",
+            image_list=["https://pic1.zhimg.com/detail_r.jpg"],
             content_detail_status="detail_observed",
+            content_detail_source="article_detail",
         )
 
     stored: list[str] = []
@@ -139,6 +193,7 @@ async def test_specified_detail_mode_reuses_one_semaphore(monkeypatch) -> None:
     ])
     monkeypatch.setattr(config, "MAX_CONCURRENCY_NUM", 1)
     monkeypatch.setattr(crawler, "get_note_detail", fake_detail)
+    monkeypatch.setattr(crawler, "get_content_images", _return_none_async)
     monkeypatch.setattr(crawler, "batch_get_content_comments", no_comments)
     monkeypatch.setattr(zhihu_store, "update_zhihu_content", fake_store)
 
@@ -146,3 +201,58 @@ async def test_specified_detail_mode_reuses_one_semaphore(monkeypatch) -> None:
 
     assert len(set(semaphore_ids)) == 1
     assert stored == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_specified_detail_image_failure_does_not_block_later_candidate(
+    monkeypatch,
+) -> None:
+    crawler = ZhihuCrawler.__new__(ZhihuCrawler)
+
+    async def fake_detail(full_note_url: str, semaphore: asyncio.Semaphore):
+        del semaphore
+        content_id = full_note_url.rsplit("/", 1)[-1]
+        return ZhihuContent(
+            content_id=content_id,
+            content_type=constant.ARTICLE_NAME,
+            content_text="full body",
+            image_list=[f"https://pic1.zhimg.com/{content_id}_r.jpg"],
+            content_detail_status="detail_observed",
+            content_detail_source="article_detail",
+        )
+
+    image_calls: list[str] = []
+
+    async def fake_images(content: ZhihuContent) -> None:
+        image_calls.append(content.content_id)
+        if content.content_id == "failed":
+            raise ZhihuImageDownloadError(
+                "failed",
+                0,
+                "image_source_unavailable",
+                attempts=1,
+            )
+
+    stored: list[str] = []
+
+    async def fake_store(content: ZhihuContent) -> None:
+        stored.append(content.content_id)
+
+    monkeypatch.setattr(
+        config,
+        "ZHIHU_SPECIFIED_ID_LIST",
+        [
+            "https://zhuanlan.zhihu.com/p/failed",
+            "https://zhuanlan.zhihu.com/p/success",
+        ],
+    )
+    monkeypatch.setattr(config, "MAX_CONCURRENCY_NUM", 1)
+    monkeypatch.setattr(crawler, "get_note_detail", fake_detail)
+    monkeypatch.setattr(crawler, "get_content_images", fake_images)
+    monkeypatch.setattr(crawler, "batch_get_content_comments", _return_none_async)
+    monkeypatch.setattr(zhihu_store, "update_zhihu_content", fake_store)
+
+    await crawler.get_specified_notes()
+
+    assert image_calls == ["failed", "success"]
+    assert stored == ["success"]

@@ -27,7 +27,7 @@ import copy
 import json
 import re
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
-from urllib.parse import parse_qs, unquote, urlencode
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import httpx
 from httpx import Response
@@ -39,6 +39,7 @@ import config
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
 from tools.image_download_retry import (
+    IMAGE_DOWNLOAD_MAX_BYTES,
     ImageDownloadFetchError,
     classified_http_image_error,
 )
@@ -48,6 +49,34 @@ if TYPE_CHECKING:
 
 from .exception import DataFetchError, PlatformRuntimeError
 from .field import SearchType
+
+
+def weibo_image_request_urls(image_url: str) -> List[str]:
+    """Return idempotent proxy/direct candidates for one authoritative image URL."""
+
+    parsed = urlparse(str(image_url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return []
+    hostname = parsed.hostname.lower()
+    candidates: List[str] = []
+
+    if hostname == "i1.wp.com":
+        candidates.append(parsed.geturl())
+        embedded = parsed.path.lstrip("/")
+        embedded_host, separator, embedded_path = embedded.partition("/")
+        if separator and embedded_host.lower().endswith(".sinaimg.cn"):
+            candidates.append(f"https://{embedded_host}/{embedded_path}")
+    elif hostname.endswith(".sinaimg.cn"):
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 2:
+            path_parts[0] = "large"
+        normalized_path = "/" + "/".join(path_parts)
+        direct = parsed._replace(path=normalized_path, query="", fragment="").geturl()
+        candidates.extend((f"https://i1.wp.com/{hostname}{normalized_path}", direct))
+    else:
+        candidates.append(parsed.geturl())
+
+    return list(dict.fromkeys(candidates))
 
 
 class WeiboClient(ProxyRefreshMixin):
@@ -69,7 +98,6 @@ class WeiboClient(ProxyRefreshMixin):
         self.cookie_urls = [self._host]
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
-        self._image_agent_host = "https://i1.wp.com/"
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
 
@@ -302,39 +330,60 @@ class WeiboClient(ProxyRefreshMixin):
                 )
 
     async def get_note_image(self, image_url: str) -> bytes:
-        image_url = image_url[8:]  # Remove https://
-        sub_url = image_url.split("/")
-        image_url = ""
-        for i in range(len(sub_url)):
-            if i == 1:
-                image_url += "large/"  # Get high-resolution images
-            elif i == len(sub_url) - 1:
-                image_url += sub_url[i]
-            else:
-                image_url += sub_url[i] + "/"
-        # Weibo image hosting has anti-hotlinking, so proxy access is needed
-        # Since Weibo images are accessed through i1.wp.com, we need to concatenate the URL
-        final_uri = (f"{self._image_agent_host}"
-                     f"{image_url}")
-        async with make_async_client(proxy=self.proxy) as client:
+        candidates = weibo_image_request_urls(image_url)
+        if not candidates:
+            raise ImageDownloadFetchError(
+                "invalid Weibo image URL",
+                code="image_source_unavailable",
+                retryable=False,
+            )
+        last_error: ImageDownloadFetchError | None = None
+        headers = dict(getattr(self, "headers", {}) or {})
+        headers["Referer"] = headers.get("Referer") or "https://m.weibo.cn/"
+        headers["Accept"] = "image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.8"
+        for final_uri in candidates:
             try:
-                response = await client.request("GET", final_uri, timeout=self.timeout)
+                async with make_async_client(proxy=self.proxy) as client:
+                    response = await client.request(
+                        "GET",
+                        final_uri,
+                        timeout=self.timeout,
+                        headers=headers,
+                    )
                 response.raise_for_status()
+                if len(response.content) > IMAGE_DOWNLOAD_MAX_BYTES:
+                    last_error = ImageDownloadFetchError(
+                        "Weibo image exceeded byte limit",
+                        code="image_too_large",
+                        retryable=False,
+                        http_status=response.status_code,
+                    )
+                    continue
                 return response.content
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 utils.logger.error(
                     f"[WeiboClient.get_note_image] HTTP {status} for {exc.request.url}"
                 )
-                raise classified_http_image_error(status, f"HTTP {status}") from exc
+                classified = classified_http_image_error(status, f"HTTP {status}")
+                if classified.code in {"image_auth_required", "image_rate_limited"}:
+                    raise classified from exc
+                last_error = classified
             except httpx.HTTPError as exc:  # transport error without an HTTP response
                 utils.logger.error(
                     f"[WeiboClient.get_note_image] {exc.__class__.__name__} "
                     f"for {exc.request.url} - {exc}"
                 )
-                raise ImageDownloadFetchError(
+                last_error = ImageDownloadFetchError(
                     str(exc), code="image_download_retryable", retryable=True
-                ) from exc
+                )
+        if last_error is not None:
+            raise last_error
+        raise ImageDownloadFetchError(
+            "Weibo image candidates exhausted",
+            code="image_source_unavailable",
+            retryable=False,
+        )
 
     async def get_creator_container_info(self, creator_id: str) -> Dict:
         """

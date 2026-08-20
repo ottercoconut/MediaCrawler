@@ -630,7 +630,7 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
         """
         uri = f"/question/{question_id}/answer/{answer_id}"
         response_html = await self.get(uri, return_response=True)
-        return self._extractor.extract_answer_content_from_html(response_html)
+        return self._extractor.extract_answer_content_from_html(response_html, answer_id)
 
     async def get_article_info(self, article_id: str) -> Optional[ZhihuContent]:
         """
@@ -643,7 +643,7 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
         """
         uri = f"/p/{article_id}"
         response_html = await self.get(uri, return_response=True)
-        return self._extractor.extract_article_content_from_html(response_html)
+        return self._extractor.extract_article_content_from_html(response_html, article_id)
 
     async def get_video_info(self, video_id: str) -> Optional[ZhihuContent]:
         """

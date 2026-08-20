@@ -51,6 +51,66 @@ def _normalize_image_url(url: str) -> str:
     return ""
 
 
+def _find_target_content_entity(
+    value,
+    target_id: str,
+    expected_type: str,
+    *,
+    depth: int = 0,
+) -> Optional[Dict]:
+    """Find one exact answer/article entity with a non-empty authoritative body."""
+
+    if depth > 12:
+        return None
+    if isinstance(value, dict):
+        identity = str(value.get("id") or value.get("content_id") or "")
+        content_type = str(value.get("type") or value.get("content_type") or "").lower()
+        body = value.get("content") or value.get("content_text")
+        if (
+            identity == str(target_id)
+            and content_type == expected_type
+            and isinstance(body, str)
+            and body.strip()
+        ):
+            return value
+        for nested in value.values():
+            found = _find_target_content_entity(
+                nested,
+                target_id,
+                expected_type,
+                depth=depth + 1,
+            )
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _find_target_content_entity(
+                nested,
+                target_id,
+                expected_type,
+                depth=depth + 1,
+            )
+            if found is not None:
+                return found
+    return None
+
+
+def _detail_json_payloads(html_content: str) -> List[Dict]:
+    selector = Selector(text=html_content or "")
+    payloads: List[Dict] = []
+    for script_text in selector.xpath("//script/text()").getall():
+        text = str(script_text or "").strip()
+        if not text or text[0] not in "[{":
+            continue
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            payloads.append(value)
+    return payloads
+
+
 def extract_image_urls_from_html(html_content: str) -> List[str]:
     """
     Extract content image URLs before the HTML is converted to plain text.
@@ -472,7 +532,11 @@ class ZhihuExtractor:
 
 
 
-    def extract_answer_content_from_html(self, html_content: str) -> Optional[ZhihuContent]:
+    def extract_answer_content_from_html(
+        self,
+        html_content: str,
+        answer_id: str = "",
+    ) -> Optional[ZhihuContent]:
         """
         extract zhihu answer content from html
         Args:
@@ -481,17 +545,29 @@ class ZhihuExtractor:
         Returns:
 
         """
-        js_init_data: str = Selector(text=html_content).xpath("//script[@id='js-initialData']/text()").get(default="")
-        if not js_init_data:
+        payloads = _detail_json_payloads(html_content)
+        if not payloads:
             return None
-        json_data: Dict = json.loads(js_init_data)
-        answer_info: Dict = json_data.get("initialState", {}).get("entities", {}).get("answers", {})
-        if not answer_info:
+        target = str(answer_id or "")
+        if not target:
+            answer_info = (
+                payloads[0].get("initialState", {}).get("entities", {}).get("answers", {})
+            )
+            if len(answer_info) == 1:
+                target = str(next(iter(answer_info)))
+        if not target:
             return None
+        for payload in payloads:
+            answer = _find_target_content_entity(payload, target, zhihu_constant.ANSWER_NAME)
+            if answer is not None:
+                return self._extract_answer_content(answer)
+        return None
 
-        return self._extract_answer_content(answer_info.get(list(answer_info.keys())[0]))
-
-    def extract_article_content_from_html(self, html_content: str) -> Optional[ZhihuContent]:
+    def extract_article_content_from_html(
+        self,
+        html_content: str,
+        article_id: str = "",
+    ) -> Optional[ZhihuContent]:
         """
         extract zhihu article content from html
         Args:
@@ -500,15 +576,23 @@ class ZhihuExtractor:
         Returns:
 
         """
-        js_init_data: str = Selector(text=html_content).xpath("//script[@id='js-initialData']/text()").get(default="")
-        if not js_init_data:
+        payloads = _detail_json_payloads(html_content)
+        if not payloads:
             return None
-        json_data: Dict = json.loads(js_init_data)
-        article_info: Dict = json_data.get("initialState", {}).get("entities", {}).get("articles", {})
-        if not article_info:
+        target = str(article_id or "")
+        if not target:
+            article_info = (
+                payloads[0].get("initialState", {}).get("entities", {}).get("articles", {})
+            )
+            if len(article_info) == 1:
+                target = str(next(iter(article_info)))
+        if not target:
             return None
-
-        return self._extract_article_content(article_info.get(list(article_info.keys())[0]))
+        for payload in payloads:
+            article = _find_target_content_entity(payload, target, zhihu_constant.ARTICLE_NAME)
+            if article is not None:
+                return self._extract_article_content(article)
+        return None
 
     def extract_zvideo_content_from_html(self, html_content: str) -> Optional[ZhihuContent]:
         """

@@ -687,7 +687,16 @@ class ZhihuCrawler(AbstractCrawler):
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                 utils.logger.info(f"[ZhihuCrawler.get_note_detail] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching answer details {answer_id}")
 
-                if result is None:
+                if (
+                    result is None
+                    or str(result.content_id or "") != str(answer_id)
+                    or result.content_type != constant.ANSWER_NAME
+                    or not str(result.content_text or "").strip()
+                ):
+                    utils.logger.warning(
+                        "[ZhihuCrawler.get_note_detail] Answer detail did not contain "
+                        f"the requested non-empty entity: {answer_id}"
+                    )
                     return ZhihuContent(
                         content_id=answer_id,
                         question_id=question_id,
@@ -722,7 +731,16 @@ class ZhihuCrawler(AbstractCrawler):
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                 utils.logger.info(f"[ZhihuCrawler.get_note_detail] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching article details {article_id}")
 
-                if result is None:
+                if (
+                    result is None
+                    or str(result.content_id or "") != str(article_id)
+                    or result.content_type != constant.ARTICLE_NAME
+                    or not str(result.content_text or "").strip()
+                ):
+                    utils.logger.warning(
+                        "[ZhihuCrawler.get_note_detail] Article detail did not contain "
+                        f"the requested non-empty entity: {article_id}"
+                    )
                     return ZhihuContent(
                         content_id=article_id,
                         content_type=constant.ARTICLE_NAME,
@@ -773,10 +791,36 @@ class ZhihuCrawler(AbstractCrawler):
                 continue
 
             note_detail = cast(ZhihuContent, note_detail)  # only for type check
-            need_get_comment_notes.append(note_detail)
-            if zhihu_store.zhihu_content_image_assets(note_detail):
+            content_id = str(note_detail.content_id or "")
+            image_assets = zhihu_store.zhihu_content_image_assets(note_detail)
+            detail_ready = bool(
+                note_detail.content_detail_status == "detail_observed"
+                and note_detail.content_detail_source
+                in {"answer_detail", "article_detail"}
+                and str(note_detail.content_text or "").strip()
+                and image_assets
+            )
+            if not detail_ready:
+                utils.logger.warning(
+                    "[ZhihuCrawler.get_specified_notes] Skip incomplete detail candidate: "
+                    f"content_id={content_id or '<missing>'}, "
+                    f"detail_status={note_detail.content_detail_status or '<missing>'}, "
+                    f"image_count={len(image_assets)}"
+                )
+                continue
+            try:
                 await self.get_content_images(note_detail)
+            except ZhihuImageDownloadError as exc:
+                if is_runtime_blocking_image_error(exc.code):
+                    raise
+                utils.logger.warning(
+                    "[ZhihuCrawler.get_specified_notes] Skip detail candidate after image "
+                    f"failure: content_id={content_id}, code={exc.code}, "
+                    f"source_index={exc.source_index}, attempts={exc.attempts}"
+                )
+                continue
             await zhihu_store.update_zhihu_content(note_detail)
+            need_get_comment_notes.append(note_detail)
 
         await self.batch_get_content_comments(need_get_comment_notes)
 
