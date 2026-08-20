@@ -24,7 +24,13 @@ from urllib.parse import quote
 
 import httpx
 from playwright.async_api import BrowserContext, Page
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_not_exception_type
+from tenacity import (
+    RetryError,
+    retry,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_fixed,
+)
 from tools.httpx_util import make_async_client
 
 import config
@@ -76,6 +82,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         self.cookie_urls = [self._domain]
         self.IP_ERROR_STR = "Network connection error, please check network settings or restart"
         self.IP_ERROR_CODE = 300012
+        self.SECURITY_LIMIT_CODE = 300011
         self.NOTE_NOT_FOUND_CODE = -510000
         self.NOTE_ABNORMAL_STR = "Note status abnormal, please check later"
         self.NOTE_ABNORMAL_CODE = -510001
@@ -192,10 +199,11 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         )
         if response_code == str(self.IP_ERROR_CODE):
             raise IPBlockError(self.IP_ERROR_STR)
-        if response_code == "300011":
+        security_limit_code = getattr(self, "SECURITY_LIMIT_CODE", 300011)
+        if response_code == str(security_limit_code):
             raise PlatformRuntimeError(
-                "XHS platform security limit, code 300011",
-                code="platform_security_limit_300011",
+                f"XHS platform security limit, code {security_limit_code}",
+                code=f"platform_security_limit_{security_limit_code}",
             )
 
         if return_response:
@@ -203,8 +211,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         data: Dict = response_data if response_data is not None else response.json()
         if data["success"]:
             return data.get("data", data.get("success", {}))
-        elif data["code"] == self.IP_ERROR_CODE:
-            raise IPBlockError(self.IP_ERROR_STR)
+        # IP_ERROR_CODE / SECURITY_LIMIT_CODE are already handled above, before return_response.
         elif data["code"] in (self.NOTE_NOT_FOUND_CODE, self.NOTE_ABNORMAL_CODE):
             raise NoteNotFoundError(f"Note not found or abnormal, code: {data['code']}")
         else:
@@ -734,6 +741,13 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         data = {"original_url": f"{self._domain}/discovery/item/{note_id}"}
         return await self.post(uri, data=data, return_response=True)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_fixed(1),
+        retry=retry_if_not_exception_type(
+            (RetryError, IPBlockError, PlatformRuntimeError)
+        ),
+    )
     async def get_note_by_id_from_html(
         self,
         note_id: str,
