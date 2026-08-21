@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -230,3 +231,140 @@ async def test_crawler_checkpoint_markers_detect_url_only_security_limit() -> No
 
     assert markers["security"] == ["website-login/error"]
     assert markers["pages"][0]["url"] == Context.pages[0].url
+
+
+@pytest.mark.asyncio
+async def test_xhs_shutdown_snapshots_device_state_before_closing_pages() -> None:
+    events: list[tuple[str, object]] = []
+    page = FakePage("search", events)
+    context = FakeContext([page], events)
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = context
+
+    async def snapshot() -> None:
+        events.append(("snapshot", "state"))
+
+    crawler._write_storage_state = snapshot
+    await crawler._prepare_browser_shutdown()
+
+    assert events[0] == ("snapshot", "state")
+    assert events[1] == ("close", "search")
+    assert crawler._shutdown_storage_state_written is True
+
+
+@pytest.mark.asyncio
+async def test_xhs_restore_does_not_overwrite_newer_profile_cookie(tmp_path) -> None:
+    snapshot_path = tmp_path / "storage-state.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "web_session",
+                        "value": "stale",
+                        "domain": ".xiaohongshu.com",
+                        "path": "/",
+                    },
+                    {
+                        "name": "a1",
+                        "value": "fallback",
+                        "domain": ".xiaohongshu.com",
+                        "path": "/",
+                    },
+                ],
+                "origins": [],
+                "trippostcollect": {
+                    "runtime_storage": [
+                        {
+                            "origin": "https://www.xiaohongshu.com",
+                            "localStorage": {},
+                            "sessionStorage": {"XHS_TAB_DEVICE_ID": "stable-device"},
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class RestoreContext:
+        def __init__(self) -> None:
+            self.added_cookies = []
+            self.script = ""
+
+        async def cookies(self):
+            return [{"name": "web_session", "domain": ".xiaohongshu.com", "path": "/"}]
+
+        async def add_cookies(self, cookies):
+            self.added_cookies = cookies
+
+        async def add_init_script(self, *, script):
+            self.script = script
+
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = RestoreContext()
+    crawler._storage_state_path = lambda: str(snapshot_path)
+
+    assert await crawler._restore_storage_state() is True
+    assert [cookie["name"] for cookie in crawler.browser_context.added_cookies] == ["a1"]
+    assert "XHS_TAB_DEVICE_ID" in crawler.browser_context.script
+    assert "sessionStorage.getItem(key) === null" in crawler.browser_context.script
+
+
+@pytest.mark.asyncio
+async def test_xhs_snapshot_preserves_account_binding_and_session_device_id(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    snapshot_path = tmp_path / "storage-state.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "cookies": [],
+                "origins": [],
+                "trippostcollect": {
+                    "schema_version": 2,
+                    "account_id": "xhs-a02",
+                    "identity_hash": "identity-2",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class StoragePage:
+        url = "https://www.xiaohongshu.com/explore"
+
+        def is_closed(self):
+            return False
+
+        async def evaluate(self, script):
+            assert "sessionStorage" in script
+            return {
+                "origin": "https://www.xiaohongshu.com",
+                "url": self.url,
+                "localStorage": {"b1": "browser"},
+                "sessionStorage": {"XHS_TAB_DEVICE_ID": "stable-device"},
+            }
+
+    class StorageContext:
+        pages = [StoragePage()]
+
+        async def storage_state(self):
+            return {"cookies": [], "origins": []}
+
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_ACCOUNT_ID", "xhs-a02")
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = StorageContext()
+    crawler._storage_state_path = lambda: str(snapshot_path)
+
+    await crawler._write_storage_state()
+
+    saved = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    metadata = saved["trippostcollect"]
+    assert metadata["schema_version"] == 2
+    assert metadata["account_id"] == "xhs-a02"
+    assert metadata["identity_hash"] == "identity-2"
+    assert metadata["runtime_storage"][0]["sessionStorage"] == {
+        "XHS_TAB_DEVICE_ID": "stable-device"
+    }

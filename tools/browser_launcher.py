@@ -25,8 +25,6 @@ import time
 import socket
 import signal
 from typing import Optional, List, Tuple
-import asyncio
-from pathlib import Path
 
 from tools import utils
 from tools.trippostcollect_behavior import project_browser_args
@@ -42,6 +40,20 @@ class BrowserLauncher:
         self.system = platform.system()
         self.browser_process = None
         self.debug_port = None
+
+    @staticmethod
+    def xhs_window_size_argument() -> Optional[str]:
+        value = os.environ.get("TRIPPOSTCOLLECT_XHS_WINDOW_SIZE", "").strip()
+        if not value:
+            return None
+        try:
+            width_text, height_text = value.split(",", 1)
+            width, height = int(width_text), int(height_text)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("invalid TRIPPOSTCOLLECT_XHS_WINDOW_SIZE") from exc
+        if width < 800 or height < 600:
+            raise RuntimeError("TRIPPOSTCOLLECT_XHS_WINDOW_SIZE is too small")
+        return f"--window-size={width},{height}"
 
     def detect_browser_paths(self) -> List[str]:
         """
@@ -146,6 +158,10 @@ class BrowserLauncher:
             *project_browser_args(),
         ]
 
+        stable_window_size = self.xhs_window_size_argument()
+        if stable_window_size:
+            args.append(stable_window_size)
+
         # Headless mode
         if headless:
             args.extend([
@@ -154,9 +170,8 @@ class BrowserLauncher:
             ])
         else:
             # Extra arguments for non-headless mode
-            args.extend([
-                "--start-maximized",  # Maximize window, more like real user
-            ])
+            if not stable_window_size:
+                args.append("--start-maximized")
 
         # User data directory
         if user_data_dir:
@@ -232,7 +247,7 @@ class BrowserLauncher:
                 result = subprocess.run([browser_path, "--version"],
                                       capture_output=True, text=True, encoding='utf-8', errors='ignore', timeout=5)
                 version = result.stdout.strip() if result.stdout else "Unknown Version"
-            except:
+            except Exception:
                 version = "Unknown Version"
 
             return name, version

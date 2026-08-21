@@ -136,6 +136,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self._initial_pages: Dict[int, Page] = {}
         self._new_pages: Dict[int, tuple[Page, float, str]] = {}
         self._new_page_guard_tasks: Dict[int, Task[None]] = {}
+        self._shutdown_storage_state_written = False
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -282,6 +283,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def _prepare_browser_shutdown(self) -> None:
         """Close pages through the guard before context or Playwright teardown."""
+        if not getattr(self, "_shutdown_storage_state_written", False):
+            try:
+                await self._write_storage_state()
+                self._shutdown_storage_state_written = True
+            except Exception as exc:
+                utils.logger.warning(
+                    "[XiaoHongShuCrawler] Final storage state snapshot failed before shutdown: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         while True:
             await self._wait_for_all_new_page_guards()
             try:
@@ -511,10 +521,24 @@ class XiaoHongShuCrawler(AbstractCrawler):
             utils.logger.warning(f"[XiaoHongShuCrawler] Failed to load storage state {snapshot_path}: {exc}")
             return False
 
+        existing_cookies = {
+            (
+                str(cookie.get("name") or ""),
+                str(cookie.get("domain") or ""),
+                str(cookie.get("path") or "/"),
+            )
+            for cookie in await self.browser_context.cookies()
+            if isinstance(cookie, dict)
+        }
         cookies = [
             self._cookie_for_restore(cookie)
             for cookie in state.get("cookies", [])
             if isinstance(cookie, dict) and cookie.get("name") and cookie.get("value")
+            and (
+                str(cookie.get("name") or ""),
+                str(cookie.get("domain") or ""),
+                str(cookie.get("path") or "/"),
+            ) not in existing_cookies
         ]
         if cookies:
             try:
@@ -561,10 +585,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
                   const state = storageByOrigin[location.origin];
                   if (!state) return;
                   for (const [key, value] of Object.entries(state.localStorage || {{}})) {{
-                    try {{ window.localStorage.setItem(key, value); }} catch (_) {{}}
+                    try {{
+                      if (window.localStorage.getItem(key) === null) window.localStorage.setItem(key, value);
+                    }} catch (_) {{}}
                   }}
                   for (const [key, value] of Object.entries(state.sessionStorage || {{}})) {{
-                    try {{ window.sessionStorage.setItem(key, value); }} catch (_) {{}}
+                    try {{
+                      if (window.sessionStorage.getItem(key) === null) window.sessionStorage.setItem(key, value);
+                    }} catch (_) {{}}
                   }}
                 }})();
                 """
@@ -599,14 +627,32 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 except Exception as exc:
                     storage = {"url": url, "error": f"{type(exc).__name__}: {exc}"}
                 runtime_storage.append(storage)
-            state["trippostcollect"] = {
-                "platform": "xhs",
-                "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "runtime_storage": runtime_storage,
-            }
+            previous_metadata: Dict = {}
+            try:
+                with open(snapshot_path, "r", encoding="utf-8") as handle:
+                    previous_state = json.load(handle)
+                if isinstance(previous_state, dict) and isinstance(
+                    previous_state.get("trippostcollect"), dict
+                ):
+                    previous_metadata = dict(previous_state["trippostcollect"])
+            except (OSError, json.JSONDecodeError):
+                pass
+            previous_metadata.update(
+                {
+                    "schema_version": 2,
+                    "platform": "xhs",
+                    "account_id": os.environ.get("TRIPPOSTCOLLECT_XHS_ACCOUNT_ID", "").strip(),
+                    "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "runtime_storage": runtime_storage,
+                }
+            )
+            state["trippostcollect"] = previous_metadata
             os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-            with open(snapshot_path, "w", encoding="utf-8") as handle:
+            temporary_path = f"{snapshot_path}.{os.getpid()}.tmp"
+            with open(temporary_path, "w", encoding="utf-8") as handle:
                 json.dump(state, handle, ensure_ascii=False, indent=2)
+            os.chmod(temporary_path, 0o600)
+            os.replace(temporary_path, snapshot_path)
             try:
                 os.chmod(snapshot_path, 0o600)
             except OSError:

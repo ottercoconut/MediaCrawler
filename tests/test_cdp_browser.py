@@ -5,6 +5,7 @@ import pytest
 
 import config
 from tools.cdp_browser import CDPBrowserManager
+from tools.browser_launcher import BrowserLauncher
 
 
 @pytest.mark.asyncio
@@ -93,3 +94,27 @@ async def test_launched_browser_uses_discovered_websocket_url(monkeypatch):
     playwright.chromium.connect_over_cdp.assert_awaited_once_with(
         "ws://localhost:9223/devtools/browser/generated-id"
     )
+
+
+def test_xhs_browser_uses_stable_native_window_instead_of_maximizing(monkeypatch):
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_WINDOW_SIZE", "1450,900")
+    popen = MagicMock()
+    monkeypatch.setattr("tools.browser_launcher.subprocess.Popen", popen)
+
+    BrowserLauncher().launch_browser(
+        browser_path="/Applications/Google Chrome",
+        debug_port=9222,
+        headless=False,
+        user_data_dir="/tmp/xhs-profile",
+    )
+
+    arguments = popen.call_args.args[0]
+    assert "--window-size=1450,900" in arguments
+    assert "--start-maximized" not in arguments
+
+
+def test_xhs_browser_rejects_invalid_window_size(monkeypatch):
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_WINDOW_SIZE", "invalid")
+
+    with pytest.raises(RuntimeError, match="invalid TRIPPOSTCOLLECT_XHS_WINDOW_SIZE"):
+        BrowserLauncher.xhs_window_size_argument()
