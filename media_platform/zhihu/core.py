@@ -51,7 +51,10 @@ from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
 from tools.cdp_browser import CDPBrowserManager
-from trippostcollect.records.topic_relevance import is_topic_relevant
+from trippostcollect.records.topic_relevance import (
+    is_topic_relevant,
+    web_post_content_text,
+)
 from var import crawler_type_var, source_keyword_var
 
 from .client import ZhiHuClient
@@ -507,8 +510,10 @@ class ZhihuCrawler(AbstractCrawler):
                                 str(content.content_id or ""),
                                 valid=valid
                                 and is_topic_relevant(
-                                    title=content.title,
-                                    content_text=content.content_text,
+                                    content_text=web_post_content_text(
+                                        "zhihu",
+                                        content.model_dump(),
+                                    ),
                                     keyword=keyword,
                                 ),
                             )
