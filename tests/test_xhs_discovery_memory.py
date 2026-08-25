@@ -46,7 +46,7 @@ def valid_note(note_id: str) -> dict:
     return {
         "note_id": note_id,
         "title": f"note {note_id}",
-        "desc": "body",
+        "desc": "青岛 body",
         "content_detail_status": "detail_observed",
         "content_detail_source": "note_detail",
         "time": 1_700_000_000_000,

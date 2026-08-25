@@ -51,6 +51,7 @@ from tools.image_manifest import ImageStagingError
 from tools.trippostcollect_behavior import project_browser_args, run_required_human_behavior
 from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
 from tools.cdp_browser import CDPBrowserManager
+from trippostcollect.records.topic_relevance import is_topic_relevant
 from var import crawler_type_var, source_keyword_var
 
 from .client import ZhiHuClient
@@ -504,7 +505,12 @@ class ZhihuCrawler(AbstractCrawler):
                             await zhihu_store.update_zhihu_content(content)
                             should_stop = accumulator.consider(
                                 str(content.content_id or ""),
-                                valid=valid,
+                                valid=valid
+                                and is_topic_relevant(
+                                    title=content.title,
+                                    content_text=content.content_text,
+                                    keyword=keyword,
+                                ),
                             )
                             if should_stop:
                                 break

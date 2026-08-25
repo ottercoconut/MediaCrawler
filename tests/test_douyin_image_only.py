@@ -24,7 +24,7 @@ def image_aweme(aweme_id: str = "dy-note") -> dict:
     return {
         "aweme_id": aweme_id,
         "aweme_type": 68,
-        "desc": "image note",
+        "desc": "test image note",
         "create_time": 1_700_000_000,
         "author": {"uid": "author", "nickname": "name", "follower_count": 5},
         "statistics": {
