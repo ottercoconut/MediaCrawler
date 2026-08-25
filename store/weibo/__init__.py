@@ -131,6 +131,12 @@ async def batch_update_weibo_notes(note_list: List[Dict]):
         await update_weibo_note(note_item)
 
 
+def persisted_weibo_content_text(mblog: Dict) -> str:
+    """Project the authoritative body exactly as it is persisted for ``web_posts``."""
+
+    return re.sub(r"<.*?>", "", str(mblog.get("text") or ""))
+
+
 async def update_weibo_note(note_item: Dict):
     """
     Update weibo note
@@ -146,8 +152,7 @@ async def update_weibo_note(note_item: Dict):
     mblog: Dict = note_item.get("mblog") or {}
     user_info: Dict = mblog.get("user") or {}
     note_id = mblog.get("id")
-    content_text = mblog.get("text")
-    clean_text = re.sub(r"<.*?>", "", content_text)
+    clean_text = persisted_weibo_content_text(mblog)
     image_assets = _weibo_pic_assets(mblog)
     image_list = [asset["url"] for asset in image_assets]
     followers_count = _first_present(

@@ -386,7 +386,7 @@ class WeiboCrawler(AbstractCrawler):
                         note_id_list.append(note_id)
                         target_valid = valid and is_topic_relevant(
                             title="",
-                            content_text=mblog.get("text"),
+                            content_text=weibo_store.persisted_weibo_content_text(mblog),
                             keyword=keyword,
                         )
                         should_stop = accumulator.consider(note_id, valid=target_valid)

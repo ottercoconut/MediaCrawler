@@ -272,6 +272,39 @@ async def test_known_id_and_invalid_note_are_skipped_before_media(monkeypatch, t
 
 
 @pytest.mark.asyncio
+async def test_topic_target_uses_the_body_that_store_persists(monkeypatch, tmp_path):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    false_raw_match = valid_mblog("html-attribute-only")
+    false_raw_match["text"] = '<a title="青岛">普通正文</a>'
+    true_persisted_match = valid_mblog("html-split-literal")
+    true_persisted_match["text"] = "<span>青</span><span>岛</span>攻略"
+    crawler, state_path = prepare_search(
+        monkeypatch,
+        tmp_path,
+        [
+            {"card_type": 9, "mblog": false_raw_match},
+            {"card_type": 9, "mblog": true_persisted_match},
+        ],
+    )
+    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
+    monkeypatch.setattr(config, "KEYWORDS", "青岛旅游")
+
+    await crawler.search()
+
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["candidate_count"] == 2
+    assert stopped["details"]["valid_new_count"] == 1
+    assert stopped["details"]["candidate_identities"] == [
+        "html-attribute-only",
+        "html-split-literal",
+    ]
+    assert not [event for event in events if event["type"] == "candidate_skipped"]
+
+
+@pytest.mark.asyncio
 async def test_image_failure_is_recorded_and_later_candidate_continues(monkeypatch, tmp_path):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
     crawler, state_path = prepare_search(

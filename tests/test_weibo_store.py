@@ -18,6 +18,21 @@ def png_bytes(color: str = "red") -> bytes:
     return output.getvalue()
 
 
+def test_persisted_content_text_is_the_topic_classification_source():
+    assert (
+        weibo_store.persisted_weibo_content_text(
+            {"text": "<span>青</span><span>岛</span>攻略"}
+        )
+        == "青岛攻略"
+    )
+    assert (
+        weibo_store.persisted_weibo_content_text(
+            {"text": '<a title="青岛">普通正文</a>'}
+        )
+        == "普通正文"
+    )
+
+
 @pytest.mark.asyncio
 async def test_store_uses_true_format_post_directory_and_schema_v1_manifest(
     monkeypatch, tmp_path
