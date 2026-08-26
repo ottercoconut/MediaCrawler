@@ -52,8 +52,7 @@ from tools.trippostcollect_adaptive import (
 )
 from tools.cdp_browser import CDPBrowserManager
 from trippostcollect.records.topic_relevance import (
-    is_topic_relevant,
-    web_post_content_text,
+    topic_relevant_for_web_post,
 )
 from var import crawler_type_var, source_keyword_var
 
@@ -539,9 +538,10 @@ class DouYinCrawler(AbstractCrawler):
                         processed_count += 1
                         aweme_list.append(aweme_id)
                         page_aweme_list.append(aweme_id)
-                        target_valid = valid and is_topic_relevant(
-                            content_text=web_post_content_text("douyin", aweme_info),
-                            keyword=keyword,
+                        target_valid = valid and topic_relevant_for_web_post(
+                            "douyin",
+                            aweme_info,
+                            fallback_keyword=keyword,
                         )
                         should_stop = accumulator.consider(aweme_id, valid=target_valid)
                         if should_stop:

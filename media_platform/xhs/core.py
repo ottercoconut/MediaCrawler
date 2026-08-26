@@ -63,8 +63,7 @@ from tools.trippostcollect_behavior import (
 from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
 from tools.cdp_browser import CDPBrowserManager
 from trippostcollect.records.topic_relevance import (
-    is_topic_relevant,
-    web_post_content_text,
+    topic_relevant_for_web_post,
 )
 from var import crawler_type_var, source_keyword_var
 
@@ -1393,12 +1392,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                 await xhs_store.update_xhs_note(note_detail)
                                 note_ids.append(note_detail.get("note_id"))
                                 xsec_tokens.append(note_detail.get("xsec_token"))
-                                target_valid = valid and is_topic_relevant(
-                                    content_text=web_post_content_text(
-                                        "xhs",
-                                        note_detail,
-                                    ),
-                                    keyword=keyword,
+                                target_valid = valid and topic_relevant_for_web_post(
+                                    "xhs",
+                                    note_detail,
+                                    fallback_keyword=keyword,
                                 )
                                 should_stop = accumulator.consider(
                                     identity,
