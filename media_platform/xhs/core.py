@@ -24,6 +24,8 @@ import random
 import re
 import time
 from asyncio import Task
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote
 
@@ -128,6 +130,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     def __init__(self) -> None:
         self.index_url = "https://www.rednote.com" if config.XHS_INTERNATIONAL else "https://www.xiaohongshu.com"
+        self.explore_url = f"{self.index_url}/explore"
         self.cookie_urls = [self.index_url]
         self.user_agent: Optional[str] = None
         self.cdp_manager = None
@@ -140,6 +143,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self._new_pages: Dict[int, tuple[Page, float, str]] = {}
         self._new_page_guard_tasks: Dict[int, Task[None]] = {}
         self._shutdown_storage_state_written = False
+        self._navigation_diagnostics: List[Dict] = []
+        self._navigation_observed_pages: set[int] = set()
+        self._navigation_page_errors: List[Dict] = []
+        self._navigation_request_failures: List[Dict] = []
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -345,24 +352,271 @@ class XiaoHongShuCrawler(AbstractCrawler):
         stage: str,
         wait_until: str = "commit",
     ) -> None:
+        self._install_navigation_observers(page)
         timeout_seconds = self._env_float("TRIPPOSTCOLLECT_XHS_NAVIGATION_DEADLINE_SECONDS", 60.0)
         timeout_seconds = max(5.0, timeout_seconds)
+        response_status: Optional[int] = None
         try:
             async with asyncio.timeout(timeout_seconds + 2.0):
-                await page.goto(
+                response = await page.goto(
                     url,
                     wait_until=wait_until,
                     timeout=int(timeout_seconds * 1000),
                 )
+                response_status = response.status if response is not None else None
         except (PlaywrightTimeoutError, TimeoutError) as exc:
             current_url = page.url or ""
             if "/search_result" in url and "/search_result" in current_url:
+                await self._record_navigation_diagnostic(
+                    page,
+                    stage=stage,
+                    outcome="commit_timeout_deferred",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 utils.logger.warning(
                     "[XiaoHongShuCrawler] Navigation event timed out after URL commit; "
                     f"continuing with visible readiness gate: stage={stage}, url={current_url}"
                 )
                 return
+            await self._record_navigation_diagnostic(
+                page,
+                stage=stage,
+                outcome="navigation_timeout",
+                error=f"{type(exc).__name__}: {exc}",
+            )
             raise RuntimeError(f"xhs_navigation_timeout:{stage}:{current_url}") from exc
+        await self._record_navigation_diagnostic(
+            page,
+            stage=stage,
+            outcome="navigation_committed",
+            response_status=response_status,
+        )
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def _install_navigation_observers(self, page: Page) -> None:
+        page_id = id(page)
+        if page_id in self._navigation_observed_pages:
+            return
+        on = getattr(page, "on", None)
+        if not callable(on):
+            return
+        self._navigation_observed_pages.add(page_id)
+
+        def record_page_error(error: object) -> None:
+            self._navigation_page_errors.append(
+                {
+                    "at": self._utc_now(),
+                    "message": str(error)[:500],
+                }
+            )
+            self._navigation_page_errors = self._navigation_page_errors[-8:]
+
+        def record_request_failure(request: object) -> None:
+            failure = getattr(request, "failure", None)
+            request_url = str(getattr(request, "url", "") or "")
+            if request_url.startswith("chrome-extension://invalid"):
+                return
+            self._navigation_request_failures.append(
+                {
+                    "at": self._utc_now(),
+                    "resource_type": str(getattr(request, "resource_type", "") or "")[:80],
+                    "url": request_url[:500],
+                    "failure": str(failure or "")[:300],
+                }
+            )
+            self._navigation_request_failures = self._navigation_request_failures[-12:]
+
+        on("pageerror", record_page_error)
+        on("requestfailed", record_request_failure)
+
+    def _navigation_diagnostics_path(self) -> Optional[Path]:
+        evidence_path = os.environ.get(
+            "TRIPPOSTCOLLECT_HUMAN_BEHAVIOR_EVIDENCE",
+            "",
+        ).strip()
+        if not evidence_path:
+            return None
+        path = Path(evidence_path).expanduser()
+        return path.with_name(f"{path.stem}.navigation.json")
+
+    def _write_navigation_diagnostics(self) -> None:
+        path = self._navigation_diagnostics_path()
+        if path is None:
+            return
+        payload = {
+            "schema_version": 1,
+            "platform": "xhs",
+            "updated_at": self._utc_now(),
+            "events": self._navigation_diagnostics[-30:],
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        except OSError as exc:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] Could not persist navigation diagnostics: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    async def _page_render_diagnostic(self, page: Page) -> Dict:
+        diagnostic: Dict = {
+            "url": str(getattr(page, "url", "") or ""),
+            "page_errors": list(self._navigation_page_errors[-5:]),
+            "request_failures": list(self._navigation_request_failures[-8:]),
+        }
+        try:
+            async with asyncio.timeout(5.0):
+                observed = await page.evaluate(
+                    """() => ({
+                        ready_state: document.readyState || '',
+                        title: (document.title || '').slice(0, 160),
+                        dom_length: document.documentElement
+                            ? document.documentElement.outerHTML.length
+                            : 0,
+                        body_text_length: document.body
+                            ? (document.body.innerText || '').trim().length
+                            : 0,
+                        body_child_element_count: document.body
+                            ? document.body.childElementCount
+                            : 0,
+                        visibility_state: document.visibilityState || '',
+                    })"""
+                )
+            if isinstance(observed, dict):
+                diagnostic.update(observed)
+        except Exception as exc:
+            diagnostic["inspection_error"] = f"{type(exc).__name__}: {exc}"
+        return diagnostic
+
+    async def _record_navigation_diagnostic(
+        self,
+        page: Page,
+        *,
+        stage: str,
+        outcome: str,
+        response_status: Optional[int] = None,
+        error: str = "",
+    ) -> Dict:
+        diagnostic = await self._page_render_diagnostic(page)
+        diagnostic.update(
+            {
+                "at": self._utc_now(),
+                "stage": stage,
+                "outcome": outcome,
+                "response_status": response_status,
+                "error": error[:500],
+            }
+        )
+        self._navigation_diagnostics.append(diagnostic)
+        self._navigation_diagnostics = self._navigation_diagnostics[-30:]
+        self._write_navigation_diagnostics()
+        return diagnostic
+
+    async def _wait_for_visible_page_shell(
+        self,
+        page: Page,
+        *,
+        stage: str,
+        timeout_seconds: float,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        last_diagnostic: Dict = {}
+        while True:
+            last_diagnostic = await self._page_render_diagnostic(page)
+            body_text_length = int(last_diagnostic.get("body_text_length") or 0)
+            body_child_count = int(last_diagnostic.get("body_child_element_count") or 0)
+            ready_state = str(last_diagnostic.get("ready_state") or "")
+            if (
+                ready_state in {"interactive", "complete"}
+                and body_text_length > 0
+                and body_child_count > 0
+            ):
+                await self._record_navigation_diagnostic(
+                    page,
+                    stage=stage,
+                    outcome="visible_shell_ready",
+                )
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                diagnostic = await self._record_navigation_diagnostic(
+                    page,
+                    stage=stage,
+                    outcome="visible_shell_timeout",
+                    error="visible_page_shell_not_rendered",
+                )
+                utils.logger.warning(
+                    "[XiaoHongShuCrawler] Visible page shell did not render: "
+                    f"stage={stage}, ready_state={diagnostic.get('ready_state')}, "
+                    f"body_text_length={diagnostic.get('body_text_length')}, "
+                    f"body_child_element_count={diagnostic.get('body_child_element_count')}, "
+                    f"url={diagnostic.get('url')}"
+                )
+                return False
+            await asyncio.sleep(min(2.0, remaining))
+
+    async def _open_behavior_search_page(self, keyword: str) -> None:
+        search_url = f"{self.index_url}/search_result?keyword={quote(keyword)}"
+        await self._goto_with_deadline(
+            self.context_page,
+            search_url,
+            stage="behavior_search",
+        )
+        search_shell_timeout = self._env_float(
+            "TRIPPOSTCOLLECT_XHS_SEARCH_SHELL_TIMEOUT_SECONDS",
+            30.0,
+        )
+        if await self._wait_for_visible_page_shell(
+            self.context_page,
+            stage="behavior_search",
+            timeout_seconds=search_shell_timeout,
+        ):
+            return
+
+        await self._record_navigation_diagnostic(
+            self.context_page,
+            stage="behavior_search_recovery",
+            outcome="explore_fallback_started",
+        )
+        await self._goto_with_deadline(
+            self.context_page,
+            self.explore_url,
+            stage="behavior_search_recovery_explore",
+        )
+        recovery_timeout = self._env_float(
+            "TRIPPOSTCOLLECT_XHS_RECOVERY_SHELL_TIMEOUT_SECONDS",
+            60.0,
+        )
+        if not await self._wait_for_visible_page_shell(
+            self.context_page,
+            stage="behavior_search_recovery_explore",
+            timeout_seconds=recovery_timeout,
+        ):
+            raise RuntimeError("xhs_navigation_recovery_failed:explore_not_rendered")
+        await self._goto_with_deadline(
+            self.context_page,
+            search_url,
+            stage="behavior_search_recovery_search",
+        )
+        if not await self._wait_for_visible_page_shell(
+            self.context_page,
+            stage="behavior_search_recovery_search",
+            timeout_seconds=recovery_timeout,
+        ):
+            raise RuntimeError("xhs_navigation_recovery_failed:search_not_rendered")
+        await self._record_navigation_diagnostic(
+            self.context_page,
+            stage="behavior_search_recovery",
+            outcome="explore_fallback_completed",
+        )
 
     async def _close_page_with_deadline(
         self,
@@ -1002,10 +1256,30 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.context_page = await self._single_page_for_login()
         await self._goto_with_deadline(
             self.context_page,
-            self.index_url,
-            stage="initial_home",
+            self.explore_url,
+            stage="initial_explore",
         )
         await self._wait_for_initial_page_settle()
+        initial_shell_timeout = self._env_float(
+            "TRIPPOSTCOLLECT_XHS_INITIAL_SHELL_TIMEOUT_SECONDS",
+            30.0,
+        )
+        if not await self._wait_for_visible_page_shell(
+            self.context_page,
+            stage="initial_explore",
+            timeout_seconds=initial_shell_timeout,
+        ):
+            await self._goto_with_deadline(
+                self.context_page,
+                self.explore_url,
+                stage="initial_explore_retry",
+            )
+            if not await self._wait_for_visible_page_shell(
+                self.context_page,
+                stage="initial_explore_retry",
+                timeout_seconds=initial_shell_timeout,
+            ):
+                raise RuntimeError("xhs_initial_explore_not_rendered")
 
         self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
         if not await self.xhs_client.pong():
@@ -1045,11 +1319,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             "",
         )
         if behavior_keyword:
-            await self._goto_with_deadline(
-                self.context_page,
-                f"https://www.xiaohongshu.com/search_result?keyword={quote(behavior_keyword)}",
-                stage="behavior_search",
-            )
+            await self._open_behavior_search_page(behavior_keyword)
         behavior_evidence = await run_required_human_behavior(self.context_page, "xhs")
         if behavior_evidence.get("status") != "completed":
             raise RuntimeError("XHS required human behavior stage did not complete")
