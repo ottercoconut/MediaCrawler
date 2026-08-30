@@ -211,7 +211,7 @@ class WeiboCrawler(AbstractCrawler):
         """
         utils.logger.info("[WeiboCrawler.search] Begin search weibo keywords")
         start_page = config.START_PAGE
-        accumulator = AdaptiveAccumulator.from_environment("weibo", config.CRAWLER_MAX_NOTES_COUNT)
+        accumulator = AdaptiveAccumulator.from_environment("weibo")
 
         # Set the search type based on the configuration for weibo
         if config.WEIBO_SEARCH_TYPE == "default":

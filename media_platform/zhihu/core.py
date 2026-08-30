@@ -353,7 +353,7 @@ class ZhihuCrawler(AbstractCrawler):
         """Search for notes and retrieve their comment information."""
         utils.logger.info("[ZhihuCrawler.search] Begin search zhihu keywords")
         start_page = config.START_PAGE
-        accumulator = AdaptiveAccumulator.from_environment("zhihu", config.CRAWLER_MAX_NOTES_COUNT)
+        accumulator = AdaptiveAccumulator.from_environment("zhihu")
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(

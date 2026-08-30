@@ -1336,8 +1336,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def search(self) -> None:
         """Search for notes and retrieve their comment information."""
         utils.logger.info("[XiaoHongShuCrawler.search] Begin search Xiaohongshu keywords")
-        candidate_hard_limit = max(1, int(config.CRAWLER_MAX_NOTES_COUNT or 1))
-        accumulator = AdaptiveAccumulator.from_environment("xhs", candidate_hard_limit)
+        accumulator = AdaptiveAccumulator.from_environment("xhs")
         start_page = config.START_PAGE
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
@@ -1418,14 +1417,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             unknown_items.append(post_item)
 
                         accumulator.begin_batch()
-                        if accumulator.exhaustion_mode:
-                            selected_items = unknown_items
-                        else:
-                            remaining = max(
-                                0,
-                                accumulator.hard_limit - accumulator.candidate_count,
-                            )
-                            selected_items = unknown_items[:remaining]
+                        selected_items = unknown_items
                         if not selected_items:
                             resume_page = requested_page + 1
                             if accumulator.finish_batch(

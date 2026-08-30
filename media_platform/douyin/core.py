@@ -180,10 +180,8 @@ class DouYinCrawler(AbstractCrawler):
     async def search(self) -> None:
         utils.logger.info("[DouYinCrawler.search] Begin search douyin keywords")
         dy_limit_count = 10  # Must match the search API count parameter.
-        if config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
         start_page = config.START_PAGE  # start page number
-        accumulator = AdaptiveAccumulator.from_environment("douyin", config.CRAWLER_MAX_NOTES_COUNT)
+        accumulator = AdaptiveAccumulator.from_environment("douyin")
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[DouYinCrawler.search] Current keyword: {keyword}")
