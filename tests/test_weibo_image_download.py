@@ -224,8 +224,6 @@ def prepare_search(monkeypatch, tmp_path, cards):
     state_path = tmp_path / "state.json"
     state_path.write_text('{"events": []}', encoding="utf-8")
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "5")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
     monkeypatch.setattr(config, "START_PAGE", 1)
@@ -272,7 +270,7 @@ async def test_known_id_and_invalid_note_are_skipped_before_media(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_topic_target_uses_the_body_that_store_persists(monkeypatch, tmp_path):
+async def test_topic_relevance_uses_the_body_that_store_persists(monkeypatch, tmp_path):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
     false_raw_match = valid_mblog("html-attribute-only")
     false_raw_match["text"] = '<a title="青岛">普通正文</a>'
@@ -286,15 +284,13 @@ async def test_topic_target_uses_the_body_that_store_persists(monkeypatch, tmp_p
             {"card_type": 9, "mblog": true_persisted_match},
         ],
     )
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     monkeypatch.setattr(config, "KEYWORDS", "青岛旅游")
 
     await crawler.search()
 
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
     assert stopped["details"]["candidate_count"] == 2
     assert stopped["details"]["valid_new_count"] == 1
     assert stopped["details"]["candidate_identities"] == [

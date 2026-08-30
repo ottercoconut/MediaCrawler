@@ -15,9 +15,6 @@ def test_batch_event_records_pagination_metadata(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
     accumulator = AdaptiveAccumulator(
         platform="xhs",
-        hard_limit=100,
-        target_new=50,
-        max_stagnant_batches=3,
     )
 
     accumulator.begin_batch()
@@ -50,9 +47,6 @@ def test_runtime_failure_has_distinct_stop_reason(monkeypatch, tmp_path) -> None
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
     accumulator = AdaptiveAccumulator(
         platform="douyin",
-        hard_limit=100,
-        target_new=50,
-        max_stagnant_batches=3,
     )
 
     accumulator.mark_runtime_failed(
@@ -75,9 +69,6 @@ def test_image_failed_candidate_is_recorded_seen_and_does_not_block_batch(
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
     accumulator = AdaptiveAccumulator(
         platform="zhihu",
-        hard_limit=10,
-        target_new=2,
-        max_stagnant_batches=2,
     )
     accumulator.begin_batch()
 
@@ -117,10 +108,6 @@ def test_source_exhaustion_is_claimed_after_failed_candidate_is_skipped(
     )
     accumulator = AdaptiveAccumulator(
         platform="xhs",
-        hard_limit=10,
-        target_new=5,
-        max_stagnant_batches=3,
-        completion_mode="source-exhausted",
     )
     accumulator.skip_candidate_failure(
         "note-1",
@@ -150,18 +137,18 @@ def test_source_exhaustion_is_claimed_after_failed_candidate_is_skipped(
     assert summary["candidate_identities"] == ["note-1"]
 
 
-def test_skipped_candidate_exactly_at_hard_limit_stops_by_candidate_limit(
+def test_skipped_candidates_never_trigger_legacy_quantity_stop(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
         "tools.trippostcollect_adaptive.append_execution_event",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_CANDIDATE_HARD_LIMIT", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_MAX_STAGNANT_BATCHES", "1")
     accumulator = AdaptiveAccumulator(
         platform="weibo",
-        hard_limit=1,
-        target_new=1,
-        max_stagnant_batches=3,
     )
 
     stopped = accumulator.skip_candidate_failure(
@@ -173,12 +160,12 @@ def test_skipped_candidate_exactly_at_hard_limit_stops_by_candidate_limit(
         source_page=7,
     )
 
-    assert stopped is True
-    assert accumulator.summary()["stop_reason"] == "candidate_hard_limit_reached"
+    assert stopped is False
+    assert accumulator.summary()["stop_reason"] == "running"
     assert accumulator.summary()["candidate_identities"] == ["mblog-1"]
 
 
-def test_existing_database_identity_does_not_advance_new_target(monkeypatch, tmp_path) -> None:
+def test_existing_database_identity_is_counted_without_stopping(monkeypatch, tmp_path) -> None:
     db_path = tmp_path / "posts.sqlite"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -186,30 +173,26 @@ def test_existing_database_identity_does_not_advance_new_target(monkeypatch, tmp
         )
         conn.execute("INSERT INTO web_posts VALUES ('xhs', 'existing-note', NULL)")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DB_PATH", str(db_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
-
-    accumulator = AdaptiveAccumulator.from_environment("xhs", hard_limit=10)
+    accumulator = AdaptiveAccumulator.from_environment("xhs")
     accumulator.begin_batch()
 
     assert accumulator.consider("existing-note", valid=True) is False
     assert len(accumulator.new_valid_identities) == 0
     assert len(accumulator.existing_valid_identities) == 1
-    assert accumulator.consider("new-note", valid=True) is True
-    assert accumulator.stop_reason == "target_new_met"
+    assert accumulator.consider("new-note", valid=True) is False
+    assert accumulator.stop_reason == ""
 
 
-def test_resume_identity_does_not_advance_continuation_target(monkeypatch, tmp_path) -> None:
+def test_resume_identity_is_counted_without_stopping(monkeypatch, tmp_path) -> None:
     resume_path = tmp_path / "resume.json"
     resume_path.write_text(json.dumps(["prior-note"]), encoding="utf-8")
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
     monkeypatch.setenv("TRIPPOSTCOLLECT_RESUME_IDENTITIES_PATH", str(resume_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
-
-    accumulator = AdaptiveAccumulator.from_environment("xhs", hard_limit=10)
+    accumulator = AdaptiveAccumulator.from_environment("xhs")
     accumulator.begin_batch()
 
     assert accumulator.consider("prior-note", valid=True) is False
-    assert accumulator.consider("new-note", valid=True) is True
+    assert accumulator.consider("new-note", valid=True) is False
     assert len(accumulator.existing_valid_identities) == 1
     assert len(accumulator.new_valid_identities) == 1
 
@@ -217,9 +200,6 @@ def test_resume_identity_does_not_advance_continuation_target(monkeypatch, tmp_p
 def test_known_identity_can_be_skipped_before_detail_fetch() -> None:
     accumulator = AdaptiveAccumulator(
         platform="douyin",
-        hard_limit=10,
-        target_new=1,
-        max_stagnant_batches=3,
         existing_identities={"known-aweme"},
     )
 
@@ -256,7 +236,7 @@ def test_xhs_persisted_seen_candidate_is_loaded_before_detail(monkeypatch, tmp_p
         "fingerprint",
     )
 
-    accumulator = AdaptiveAccumulator.from_environment("xhs", hard_limit=10)
+    accumulator = AdaptiveAccumulator.from_environment("xhs")
 
     assert accumulator.is_known("seen-invalid-note") is True
 
@@ -297,7 +277,7 @@ def test_common_operator_exclusion_is_loaded_before_detail(monkeypatch, tmp_path
         "fingerprint",
     )
 
-    accumulator = AdaptiveAccumulator.from_environment("zhihu", hard_limit=10)
+    accumulator = AdaptiveAccumulator.from_environment("zhihu")
 
     assert accumulator.is_known("excluded-answer") is True
     assert accumulator.candidate_count == 0
@@ -310,9 +290,6 @@ def test_refresh_batch_does_not_consume_frontier_stagnation(monkeypatch) -> None
     )
     accumulator = AdaptiveAccumulator(
         platform="weibo",
-        hard_limit=10,
-        target_new=2,
-        max_stagnant_batches=1,
     )
     accumulator.begin_batch()
 
@@ -335,9 +312,6 @@ def test_candidate_identity_stagnation_allows_new_invalid_results(monkeypatch) -
     )
     accumulator = AdaptiveAccumulator(
         platform="weibo",
-        hard_limit=10,
-        target_new=2,
-        max_stagnant_batches=1,
         stagnation_basis="candidate_identity",
     )
     accumulator.begin_batch()

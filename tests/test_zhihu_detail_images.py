@@ -158,8 +158,6 @@ async def test_detail_failure_is_recorded_seen_and_search_continues(
     state_path = tmp_path / "state.json"
     state_path.write_text('{"events": []}', encoding="utf-8")
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "5")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
@@ -206,8 +204,6 @@ async def test_image_failure_is_recorded_and_later_zhihu_candidate_continues(
     state_path = tmp_path / "state.json"
     state_path.write_text('{"events": []}', encoding="utf-8")
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
@@ -234,9 +230,9 @@ async def test_image_failure_is_recorded_and_later_zhihu_candidate_continues(
 
     crawler = ZhihuCrawler()
     crawler.zhihu_client = AsyncMock()
-    crawler.zhihu_client.get_note_by_keyword.return_value = [
-        content("retry-image"),
-        content("success-image"),
+    crawler.zhihu_client.get_note_by_keyword.side_effect = [
+        [content("retry-image"), content("success-image")],
+        [],
     ]
     crawler.enrich_search_content_detail = AsyncMock(side_effect=lambda item: item)
     crawler.get_content_images = AsyncMock(
@@ -260,7 +256,7 @@ async def test_image_failure_is_recorded_and_later_zhihu_candidate_continues(
     assert skipped[0]["details"]["identity"] == "retry-image"
     assert skipped[0]["details"]["failure_scope"] == "image"
     assert skipped[0]["details"]["attempts"] == 3
-    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
     assert stopped["details"]["resume_page"] == 5
     assert stopped["details"]["candidate_identities"] == [
         "retry-image",
@@ -275,8 +271,6 @@ async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     state_path = tmp_path / "state.json"
     state_path.write_text('{"events": []}', encoding="utf-8")
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
@@ -314,7 +308,10 @@ async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     )
     crawler = ZhihuCrawler()
     crawler.zhihu_client = AsyncMock()
-    crawler.zhihu_client.get_note_by_keyword.return_value = [terminal, success]
+    crawler.zhihu_client.get_note_by_keyword.side_effect = [
+        [terminal, success],
+        [],
+    ]
     crawler.enrich_search_content_detail = AsyncMock(side_effect=lambda item: item)
     crawler.get_content_images = AsyncMock(
         side_effect=[
@@ -337,7 +334,7 @@ async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     assert skipped[0]["details"]["failure_scope"] == "image"
     assert skipped[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
     assert stopped["details"]["resume_page"] == 5
     assert stopped["details"]["candidate_identities"] == [
         "success-image",

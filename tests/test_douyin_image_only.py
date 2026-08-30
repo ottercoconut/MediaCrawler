@@ -194,7 +194,7 @@ class SearchClient:
                 {"aweme_info": image_aweme("retry-aweme")},
                 {"aweme_info": image_aweme("success-aweme")},
             ],
-            "has_more": 1,
+            "has_more": 0,
             "extra": {"logid": "fresh-search-id"},
         }
 
@@ -206,8 +206,6 @@ async def test_creator_profile_failure_is_recorded_and_later_candidate_continues
     state_path = tmp_path / "state.json"
     state_path.write_text('{"events": []}', encoding="utf-8")
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_OFFSET", "0")
@@ -242,7 +240,7 @@ async def test_creator_profile_failure_is_recorded_and_later_candidate_continues
     assert skipped[0]["details"]["identity"] == "retry-aweme"
     assert skipped[0]["details"]["failure_scope"] == "post"
     assert skipped[0]["details"]["attempts"] == 1
-    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
     assert stopped["details"]["candidate_identities"] == [
         "retry-aweme",
         "success-aweme",
@@ -286,8 +284,6 @@ async def test_image_rate_limit_stops_run_without_candidate_skip(
     state_path = tmp_path / "state.json"
     state_path.write_text('{"events": []}', encoding="utf-8")
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_OFFSET", "0")
@@ -327,8 +323,6 @@ async def test_image_failure_is_recorded_seen_and_later_candidate_continues(
     state_path = tmp_path / "state.json"
     state_path.write_text('{"events": []}', encoding="utf-8")
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_OFFSET", "0")
@@ -362,7 +356,7 @@ async def test_image_failure_is_recorded_seen_and_later_candidate_continues(
     assert skipped[0]["details"]["identity"] == "retry-aweme"
     assert skipped[0]["details"]["failure_scope"] == "image"
     assert skipped[0]["details"]["attempts"] == 3
-    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
     assert stopped["details"]["resume_page"] == 2
     assert stopped["details"]["resume_offset"] == 10
     assert stopped["details"]["resume_cursor"] == "fresh-search-id"
@@ -380,8 +374,6 @@ async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     state_path = tmp_path / "state.json"
     state_path.write_text('{"events": []}', encoding="utf-8")
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", "1")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_OFFSET", "0")
@@ -416,7 +408,7 @@ async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     assert skipped[0]["details"]["failure_scope"] == "image"
     assert skipped[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
     assert stopped["details"]["resume_page"] == 2
     assert stopped["details"]["resume_offset"] == 10
     assert stopped["details"]["candidate_identities"] == [

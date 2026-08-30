@@ -26,7 +26,7 @@ class SearchClient:
 
     async def get_note_by_keyword(self, **kwargs):
         self.calls.append(kwargs)
-        return {"items": self.items, "has_more": True}
+        return {"items": self.items, "has_more": False}
 
 
 class LoginExpiredSearchClient:
@@ -63,16 +63,14 @@ def valid_note(note_id: str) -> dict:
     }
 
 
-def prepare_crawler(monkeypatch, tmp_path, *, items, start_page=3, hard_limit=10, target=1):
+def prepare_crawler(monkeypatch, tmp_path, *, items, start_page=3):
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({"events": []}), encoding="utf-8")
     monkeypatch.setenv("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", str(state_path))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_TARGET_NEW_POSTS", str(target))
-    monkeypatch.setenv("TRIPPOSTCOLLECT_MAX_STAGNANT_BATCHES", "3")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_RESUME_CURSOR", "saved-search-id")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_TOP_REFRESH_MAX_PAGES", "0")
     monkeypatch.setenv("TRIPPOSTCOLLECT_DISCOVERY_SOURCE_EXHAUSTED", "0")
-    monkeypatch.setattr(config, "CRAWLER_MAX_NOTES_COUNT", hard_limit)
+    monkeypatch.setattr(config, "CRAWLER_MAX_NOTES_COUNT", 2_147_483_647)
     monkeypatch.setattr(config, "START_PAGE", start_page)
     monkeypatch.setattr(config, "KEYWORDS", "青岛旅游")
     monkeypatch.setattr(config, "SORT_TYPE", "")
@@ -130,25 +128,27 @@ async def test_known_note_is_skipped_before_detail_request(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_incomplete_boundary_page_is_repeated(monkeypatch, tmp_path):
+async def test_all_unknown_candidates_are_processed_before_exhaustion(
+    monkeypatch,
+    tmp_path,
+):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
     crawler, detail_ids, state_path = prepare_crawler(
         monkeypatch,
         tmp_path,
         items=[{"id": "first"}, {"id": "second"}],
-        hard_limit=1,
-        target=5,
     )
 
     await crawler.search()
 
-    assert detail_ids == ["first"]
+    assert detail_ids == ["first", "second"]
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
+    assert stopped["details"]["resume_page"] == 4
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
-    assert stopped["details"]["batch_complete"] is False
-    assert stopped["details"]["candidate_identities"] == ["first"]
+    assert stopped["details"]["batch_complete"] is True
+    assert stopped["details"]["candidate_identities"] == ["first", "second"]
 
 
 @pytest.mark.asyncio
@@ -172,7 +172,7 @@ async def test_top_refresh_uses_fresh_search_id_before_saved_frontier(monkeypatc
     ]
     events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["discovery_phase"] == "refresh"
+    assert stopped["details"]["stop_detail"] == "saved_source_exhausted"
 
 
 @pytest.mark.asyncio
@@ -181,7 +181,6 @@ async def test_browser_context_close_is_recorded_as_resumable_runtime_failure(
     tmp_path,
 ):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
     crawler, _, state_path = prepare_crawler(
         monkeypatch,
         tmp_path,
@@ -210,7 +209,6 @@ async def test_creator_security_limit_is_recorded_as_terminal_runtime_failure(
     tmp_path,
 ):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
     crawler, _, state_path = prepare_crawler(
         monkeypatch,
         tmp_path,
@@ -340,7 +338,6 @@ async def test_image_failure_is_recorded_and_later_xhs_candidate_continues(
     tmp_path,
 ):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     crawler, _, state_path = prepare_crawler(
         monkeypatch,
         tmp_path,
@@ -364,7 +361,7 @@ async def test_image_failure_is_recorded_and_later_xhs_candidate_continues(
     assert skipped[0]["details"]["identity"] == "retry-image"
     assert skipped[0]["details"]["failure_scope"] == "image"
     assert skipped[0]["details"]["attempts"] == 3
-    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
     assert stopped["details"]["resume_page"] == 4
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["candidate_identities"] == [
@@ -379,7 +376,6 @@ async def test_creator_failure_is_recorded_and_later_xhs_candidate_continues(
     tmp_path,
 ):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     crawler, _, state_path = prepare_crawler(
         monkeypatch,
         tmp_path,
@@ -403,7 +399,7 @@ async def test_creator_failure_is_recorded_and_later_xhs_candidate_continues(
     assert skipped[0]["details"]["failure_scope"] == "post"
     assert skipped[0]["details"]["error_code"] == "creator_profile_unavailable"
     assert skipped[0]["details"]["attempts"] == 3
-    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
     assert stopped["details"]["candidate_identities"] == [
         "retry-creator",
         "success-creator",
@@ -416,7 +412,6 @@ async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     tmp_path,
 ):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "target-new-posts")
     crawler, _, state_path = prepare_crawler(
         monkeypatch,
         tmp_path,
@@ -441,7 +436,7 @@ async def test_terminal_image_failure_is_recorded_and_later_candidate_continues(
     assert skipped[0]["details"]["failure_scope"] == "image"
     assert skipped[0]["details"]["retryable"] is False
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
-    assert stopped["details"]["stop_reason"] == "target_new_met"
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
     assert stopped["details"]["resume_page"] == 4
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["candidate_identities"] == [
@@ -456,7 +451,6 @@ async def test_wrapped_login_expiry_waits_and_retries_same_search_page(
     tmp_path,
 ):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
     crawler, _, state_path = prepare_crawler(
         monkeypatch,
         tmp_path,
@@ -481,7 +475,6 @@ async def test_wrapped_login_expiry_timeout_keeps_current_page_as_frontier(
     tmp_path,
 ):
     monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
-    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
     crawler, _, state_path = prepare_crawler(
         monkeypatch,
         tmp_path,
