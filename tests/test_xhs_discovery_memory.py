@@ -16,7 +16,7 @@ from media_platform.xhs.core import (
     XHSImageDownloadError,
     XHSNoteDetailUnavailable,
 )
-from media_platform.xhs.exception import DataFetchError, IPBlockError
+from media_platform.xhs.exception import DataFetchError, IPBlockError, PlatformRuntimeError
 
 
 class SearchClient:
@@ -202,6 +202,40 @@ async def test_browser_context_close_is_recorded_as_resumable_runtime_failure(
     assert stopped["details"]["resume_page"] == 3
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["batch_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_creator_security_limit_is_recorded_as_terminal_runtime_failure(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_COMPLETION_MODE", "source-exhausted")
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[{"id": "security-limited-note"}],
+    )
+    crawler.enrich_note_creator = AsyncMock(
+        side_effect=PlatformRuntimeError(
+            "XHS creator profile is blocked by a platform security limit",
+            code="platform_security_limit_300011",
+        )
+    )
+
+    await crawler.search()
+
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not [event for event in events if event["type"] == "candidate_skipped"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == "platform_security_limit_300011"
+    assert stopped["details"]["source_page"] == 3
+    assert stopped["details"]["source_cursor"] == "saved-search-id"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["batch_complete"] is False
+    assert stopped["details"]["candidate_identities"] == []
 
 
 @pytest.mark.asyncio

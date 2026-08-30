@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from media_platform.xhs.core import XiaoHongShuCrawler, XHSCreatorProfileUnavailable
-from media_platform.xhs.exception import IPBlockError
+from media_platform.xhs.exception import IPBlockError, PlatformRuntimeError
 from media_platform.xhs.extractor import XiaoHongShuExtractor
 
 
@@ -177,11 +177,10 @@ async def test_creator_browser_fallback_stops_on_platform_security_limit(crawler
         record_limit,
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="xhs_creator_profile_visible_block:platform_security_limit",
-    ):
+    with pytest.raises(PlatformRuntimeError) as exc_info:
         await crawler._get_creator_info_from_browser("author-security-limit")
+
+    assert exc_info.value.code == "platform_security_limit_300011"
 
     crawler._close_page_with_deadline.assert_awaited_once_with(
         page,

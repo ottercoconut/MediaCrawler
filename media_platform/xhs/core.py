@@ -2004,7 +2004,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     visible_text_sample=text_sample,
                     visible_markers=markers,
                 )
-                raise RuntimeError("xhs_creator_profile_visible_block:platform_security_limit")
+                raise PlatformRuntimeError(
+                    "XHS creator profile is blocked by a platform security limit",
+                    code="platform_security_limit_300011",
+                )
             if markers.get("captcha_or_verify") or markers.get("login_required"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
             challenge = next(
@@ -2034,7 +2037,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     visible_text_sample=text_sample,
                     visible_markers=markers,
                 )
-                raise RuntimeError("xhs_creator_profile_visible_block:platform_security_limit")
+                raise PlatformRuntimeError(
+                    "XHS creator profile is blocked by a platform security limit",
+                    code="platform_security_limit_300011",
+                )
             if markers.get("captcha_or_verify") or markers.get("login_required"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
             challenge = next(
@@ -2088,7 +2094,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     visible_text_sample=text_sample,
                     visible_markers=markers,
                 )
-                raise RuntimeError("xhs_creator_profile_visible_block:platform_security_limit")
+                raise PlatformRuntimeError(
+                    "XHS creator profile is blocked by a platform security limit",
+                    code="platform_security_limit_300011",
+                )
             challenge = next(
                 (
                     key
