@@ -27,7 +27,7 @@ from asyncio import Task
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from playwright.async_api import (
     BrowserContext,
@@ -767,7 +767,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             restored.pop("expires", None)
         return restored
 
-    async def _restore_storage_state(self) -> bool:
+    async def _restore_storage_state(self, primary_page: Optional[Page] = None) -> bool:
         snapshot_path = self._storage_state_path()
         if not snapshot_path or not os.path.isfile(snapshot_path):
             return False
@@ -806,47 +806,78 @@ class XiaoHongShuCrawler(AbstractCrawler):
             except Exception as exc:
                 utils.logger.warning(f"[XiaoHongShuCrawler] Restore cookies failed: {exc}")
 
-        storage_by_origin: Dict[str, Dict[str, Dict[str, str]]] = {}
+        local_storage_by_origin: Dict[str, Dict[str, str]] = {}
         for origin_item in state.get("origins", []):
             if not isinstance(origin_item, dict):
                 continue
             origin = origin_item.get("origin")
             if not origin:
                 continue
-            bucket = storage_by_origin.setdefault(origin, {"localStorage": {}, "sessionStorage": {}})
+            bucket = local_storage_by_origin.setdefault(origin, {})
             for item in origin_item.get("localStorage", []):
                 if isinstance(item, dict) and item.get("name") is not None and item.get("value") is not None:
-                    bucket["localStorage"][str(item["name"])] = str(item["value"])
+                    bucket[str(item["name"])] = str(item["value"])
 
-        for item in state.get("trippostcollect", {}).get("runtime_storage", []):
+        runtime_storage = [
+            item
+            for item in state.get("trippostcollect", {}).get("runtime_storage", [])
+            if isinstance(item, dict) and item.get("origin")
+        ]
+        for item in runtime_storage:
             if not isinstance(item, dict):
                 continue
             origin = item.get("origin")
             if not origin:
                 continue
-            bucket = storage_by_origin.setdefault(origin, {"localStorage": {}, "sessionStorage": {}})
-            for storage_key in ("localStorage", "sessionStorage"):
-                values = item.get(storage_key)
-                if not isinstance(values, dict):
-                    continue
-                for key, value in values.items():
-                    if value is not None:
-                        bucket[storage_key][str(key)] = str(value)
+            values = item.get("localStorage")
+            if not isinstance(values, dict):
+                continue
+            bucket = local_storage_by_origin.setdefault(origin, {})
+            for key, value in values.items():
+                if value is not None:
+                    bucket[str(key)] = str(value)
 
-        if storage_by_origin:
-            script_payload = json.dumps(storage_by_origin, ensure_ascii=False)
+        if local_storage_by_origin:
+            script_payload = json.dumps(local_storage_by_origin, ensure_ascii=False)
             await self.browser_context.add_init_script(
                 script=f"""
                 (() => {{
                   const storageByOrigin = {script_payload};
                   const state = storageByOrigin[location.origin];
                   if (!state) return;
-                  for (const [key, value] of Object.entries(state.localStorage || {{}})) {{
+                  for (const [key, value] of Object.entries(state)) {{
                     try {{
                       if (window.localStorage.getItem(key) === null) window.localStorage.setItem(key, value);
                     }} catch (_) {{}}
                   }}
-                  for (const [key, value] of Object.entries(state.sessionStorage || {{}})) {{
+                }})();
+                """
+            )
+            utils.logger.info(
+                f"[XiaoHongShuCrawler] Installed local storage restore init script for {len(local_storage_by_origin)} origins"
+            )
+        session_item: Dict = {}
+        if primary_page is not None:
+            parsed = urlparse(str(getattr(primary_page, "url", "") or ""))
+            primary_origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+            candidates = [item for item in runtime_storage if item.get("origin") == primary_origin]
+            if not candidates:
+                candidates = runtime_storage
+            session_item = next(
+                (item for item in candidates if item.get("page_role") == "primary"),
+                candidates[0] if candidates else {},
+            )
+        session_storage = session_item.get("sessionStorage") or {}
+        if primary_page is not None and isinstance(session_storage, dict) and session_storage:
+            script_payload = json.dumps(
+                {str(key): str(value) for key, value in session_storage.items() if value is not None},
+                ensure_ascii=False,
+            )
+            await primary_page.add_init_script(
+                script=f"""
+                (() => {{
+                  const state = {script_payload};
+                  for (const [key, value] of Object.entries(state)) {{
                     try {{
                       if (window.sessionStorage.getItem(key) === null) window.sessionStorage.setItem(key, value);
                     }} catch (_) {{}}
@@ -854,12 +885,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 }})();
                 """
             )
-            utils.logger.info(
-                f"[XiaoHongShuCrawler] Installed storage restore init script for {len(storage_by_origin)} origins"
-            )
-        return bool(cookies or storage_by_origin)
+            utils.logger.info("[XiaoHongShuCrawler] Installed session storage restore on the primary tab")
+        return bool(cookies or local_storage_by_origin or session_storage)
 
-    async def _write_storage_state(self) -> None:
+    async def _write_storage_state(self, *, session_verified: bool | None = None) -> None:
         snapshot_path = self._storage_state_path()
         if not snapshot_path:
             return
@@ -883,6 +912,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     )
                 except Exception as exc:
                     storage = {"url": url, "error": f"{type(exc).__name__}: {exc}"}
+                storage["page_role"] = "primary" if page is getattr(self, "context_page", None) else "secondary"
                 runtime_storage.append(storage)
             previous_metadata: Dict = {}
             try:
@@ -896,13 +926,20 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 pass
             previous_metadata.update(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "platform": "xhs",
                     "account_id": os.environ.get("TRIPPOSTCOLLECT_XHS_ACCOUNT_ID", "").strip(),
                     "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "runtime_storage": runtime_storage,
                 }
             )
+            if session_verified is not None:
+                previous_metadata["session_verification"] = {
+                    "status": "verified" if session_verified else "invalid",
+                    "run_id": os.environ.get("TRIPPOSTCOLLECT_XHS_RUN_ID", "").strip(),
+                    "source": "xhs_selfinfo",
+                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
             state["trippostcollect"] = previous_metadata
             os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
             temporary_path = f"{snapshot_path}.{os.getpid()}.tmp"
@@ -928,7 +965,75 @@ class XiaoHongShuCrawler(AbstractCrawler):
             url = page.url or ""
             if "xiaohongshu.com" in url or "rednote.com" in url:
                 self.context_page = page
+                client = getattr(self, "xhs_client", None)
+                if client is not None:
+                    client.playwright_page = page
                 return
+
+    @staticmethod
+    def _is_target_closed_error(exc: BaseException) -> bool:
+        text = str(exc).lower()
+        return bool(
+            exc.__class__.__name__ == "TargetClosedError"
+            or "target page, context or browser has been closed" in text
+            or "targetclosederror" in text
+        )
+
+    async def _run_human_behavior_with_page_recovery(self, keyword: str) -> Dict:
+        failed_page = self.context_page
+        try:
+            return await run_required_human_behavior(failed_page, "xhs")
+        except Exception as exc:
+            if not self._is_target_closed_error(exc):
+                raise
+        await self._activate_latest_xhs_page()
+        if self.context_page is failed_page or self._page_is_closed(self.context_page):
+            raise RuntimeError("xhs_behavior_target_closed_without_replacement")
+        utils.logger.warning(
+            "[XiaoHongShuCrawler] Primary page closed during behavior; "
+            f"adopting replacement page: {self.context_page.url}"
+        )
+        await self._confirm_replacement_session()
+        await self._open_behavior_search_page(keyword)
+        return await run_required_human_behavior(self.context_page, "xhs")
+
+    async def _open_behavior_search_page_with_recovery(self, keyword: str) -> None:
+        failed_page = self.context_page
+        try:
+            await self._open_behavior_search_page(keyword)
+            return
+        except Exception as exc:
+            if not self._is_target_closed_error(exc):
+                raise
+        await self._activate_latest_xhs_page()
+        if self.context_page is failed_page or self._page_is_closed(self.context_page):
+            raise RuntimeError("xhs_search_target_closed_without_replacement")
+        utils.logger.warning(
+            "[XiaoHongShuCrawler] Primary page closed during search navigation; "
+            f"adopting replacement page: {self.context_page.url}"
+        )
+        await self._confirm_replacement_session()
+        await self._open_behavior_search_page(keyword)
+
+    async def _confirm_replacement_session(self) -> None:
+        markers = await self._visible_checkpoint_markers()
+        await self.xhs_client.update_cookies(
+            browser_context=self.browser_context,
+            urls=self.cookie_urls,
+        )
+        session_ready = await self.xhs_client.pong()
+        visible_checkpoint = bool(
+            markers.get("security") or markers.get("login_or_qr")
+        )
+        if visible_checkpoint or not session_ready:
+            if not await self._wait_for_manual_checkpoint_if_needed():
+                raise RuntimeError("xhs_replacement_page_login_not_recovered")
+            await self.xhs_client.update_cookies(
+                browser_context=self.browser_context,
+                urls=self.cookie_urls,
+            )
+            if not await self.xhs_client.pong():
+                raise RuntimeError("xhs_replacement_page_session_not_confirmed")
 
     async def _single_page_for_login(self) -> Page:
         """Keep exactly one tab open until the login checkpoint has succeeded."""
@@ -1079,7 +1184,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 raise RuntimeError("xhs_platform_security_limit_300011")
             cookie_markers = await self._cookie_markers()
             profile_ui = await self._profile_ui_visible()
-            if profile_ui:
+            visible_checkpoint = bool(
+                checkpoint_markers.get("security")
+                or checkpoint_markers.get("login_or_qr")
+            )
+            if profile_ui and not visible_checkpoint:
                 utils.logger.info(
                     "[XiaoHongShuCrawler] Login/session markers became ready after manual checkpoint wait: "
                     f"profile_ui={profile_ui}, cookies={cookie_markers}"
@@ -1252,8 +1361,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
         self._install_new_page_guard()
         await install_project_runtime_hints(self.browser_context)
-        await self._restore_storage_state()
         self.context_page = await self._single_page_for_login()
+        await self._restore_storage_state(primary_page=self.context_page)
         await self._goto_with_deadline(
             self.context_page,
             self.explore_url,
@@ -1313,16 +1422,26 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         "after login flow"
                     )
 
-        await self._write_storage_state()
+        await self._write_storage_state(session_verified=True)
         behavior_keyword = next(
             (item.strip() for item in config.KEYWORDS.split(",") if item.strip()),
             "",
         )
         if behavior_keyword:
-            await self._open_behavior_search_page(behavior_keyword)
-        behavior_evidence = await run_required_human_behavior(self.context_page, "xhs")
+            await self._open_behavior_search_page_with_recovery(behavior_keyword)
+        await self._activate_latest_xhs_page()
+        behavior_evidence = await self._run_human_behavior_with_page_recovery(
+            behavior_keyword
+        )
         if behavior_evidence.get("status") != "completed":
             raise RuntimeError("XHS required human behavior stage did not complete")
+        await self.xhs_client.update_cookies(
+            browser_context=self.browser_context,
+            urls=self.cookie_urls,
+        )
+        if not await self.xhs_client.pong():
+            raise RuntimeError("xhs_session_not_confirmed_after_human_behavior")
+        await self._write_storage_state(session_verified=True)
         crawler_type_var.set(config.CRAWLER_TYPE)
         if config.CRAWLER_TYPE == "search":
             await self.search()
