@@ -20,6 +20,7 @@ from media_platform.xhs.core import (
 )
 from media_platform.xhs.exception import DataFetchError, IPBlockError, PlatformRuntimeError
 from media_platform.xhs.manual_wait import XHSManualWaitBudgetExhausted
+from tools.cdp_browser import CDPBrowserLifecycleError
 
 
 class SearchClient:
@@ -65,6 +66,18 @@ class NetworkOutageSearchClient:
                 )
             )
         return {"items": [], "has_more": False}
+
+
+def lifecycle_error(code: str, *, stage: str = "search") -> CDPBrowserLifecycleError:
+    return CDPBrowserLifecycleError(
+        {
+            "code": code,
+            "kind": code,
+            "pid": 4321,
+            "returncode": 23 if code == "xhs_browser_process_exited" else None,
+        },
+        stage=stage,
+    )
 
 
 def valid_note(note_id: str) -> dict:
@@ -664,6 +677,155 @@ async def test_search_disconnect_timeout_preserves_current_recovery_frontier(
     assert stopped["details"]["resume_page"] == 3
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["batch_complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("code", "stop_detail"),
+    [
+        ("xhs_browser_process_exited", "browser_process_exited"),
+        ("xhs_browser_context_closed_unexpected", "browser_context_closed"),
+        ("xhs_cdp_disconnected_unexpected", "cdp_disconnected"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cdp_lifecycle_failure_preserves_frontier_without_retry_or_relaunch(
+    code: str,
+    stop_detail: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, detail_ids, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[],
+    )
+    crawler.xhs_client.get_note_by_keyword = AsyncMock(
+        side_effect=lifecycle_error(code)
+    )
+    crawler.launch_browser = AsyncMock()
+    crawler.launch_browser_with_cdp = AsyncMock()
+
+    await crawler.search()
+
+    assert crawler.xhs_client.get_note_by_keyword.await_count == 1
+    assert detail_ids == []
+    crawler.launch_browser.assert_not_awaited()
+    crawler.launch_browser_with_cdp.assert_not_awaited()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not any(event["type"] == "adaptive_batch_completed" for event in events)
+    stopped = [
+        event for event in events if event["type"] == "adaptive_search_stopped"
+    ][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == stop_detail
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["batch_complete"] is False
+    assert stopped["details"].get("candidate_identities") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_cdp_disconnect_after_transport_pause_preserves_same_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[],
+    )
+    crawler.xhs_client = NetworkOutageSearchClient(recover=False)
+    crawler._pause_for_network_recovery = AsyncMock(
+        side_effect=lifecycle_error(
+            "xhs_cdp_disconnected_unexpected",
+            stage="search:frontier:page=3",
+        )
+    )
+    crawler.launch_browser = AsyncMock()
+    crawler.launch_browser_with_cdp = AsyncMock()
+
+    await crawler.search()
+
+    assert [call["page"] for call in crawler.xhs_client.calls] == [3]
+    assert crawler._pause_for_network_recovery.await_count == 1
+    crawler.launch_browser.assert_not_awaited()
+    crawler.launch_browser_with_cdp.assert_not_awaited()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not any(event["type"] == "adaptive_batch_completed" for event in events)
+    stopped = [
+        event for event in events if event["type"] == "adaptive_search_stopped"
+    ][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == "cdp_disconnected"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["batch_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_cdp_process_exit_from_detail_gather_is_not_candidate_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[{"id": "new-note", "xsec_token": "token"}],
+    )
+    crawler.get_note_detail_async_task = AsyncMock(
+        side_effect=lifecycle_error(
+            "xhs_browser_process_exited",
+            stage="detail:new-note",
+        )
+    )
+
+    await crawler.search()
+
+    assert crawler.get_note_detail_async_task.await_count == 1
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not any(event["type"] == "candidate_skipped" for event in events)
+    assert not any(event["type"] == "adaptive_batch_completed" for event in events)
+    stopped = [
+        event for event in events if event["type"] == "adaptive_search_stopped"
+    ][-1]
+    assert stopped["details"]["stop_detail"] == "browser_process_exited"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+
+
+@pytest.mark.asyncio
+async def test_cdp_context_close_from_creator_is_not_candidate_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[{"id": "new-note", "xsec_token": "token"}],
+    )
+    crawler.enrich_note_creator = AsyncMock(
+        side_effect=lifecycle_error(
+            "xhs_browser_context_closed_unexpected",
+            stage="creator:new-note",
+        )
+    )
+
+    await crawler.search()
+
+    assert crawler.enrich_note_creator.await_count == 1
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    assert not any(event["type"] == "candidate_skipped" for event in events)
+    assert not any(event["type"] == "adaptive_batch_completed" for event in events)
+    stopped = [
+        event for event in events if event["type"] == "adaptive_search_stopped"
+    ][-1]
+    assert stopped["details"]["stop_detail"] == "browser_context_closed"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
 
 
 @pytest.mark.asyncio

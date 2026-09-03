@@ -63,7 +63,7 @@ from tools.trippostcollect_behavior import (
     run_requested_post_interaction,
 )
 from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
-from tools.cdp_browser import CDPBrowserManager
+from tools.cdp_browser import CDPBrowserLifecycleError, CDPBrowserManager
 from trippostcollect.records.topic_relevance import (
     topic_relevant_for_web_post,
 )
@@ -131,6 +131,18 @@ _XHS_RECOVERABLE_NAVIGATION_ERROR_MARKERS = (
     "net::err_proxy_connection_failed",
     "net::err_tunnel_connection_failed",
 )
+_XHS_CDP_LIFECYCLE_STOP_DETAILS = {
+    "xhs_browser_process_exited": "browser_process_exited",
+    "xhs_cdp_disconnected_unexpected": "cdp_disconnected",
+    "xhs_browser_context_closed_unexpected": "browser_context_closed",
+}
+
+
+def xhs_cdp_lifecycle_stop_detail(exc: CDPBrowserLifecycleError) -> str:
+    return _XHS_CDP_LIFECYCLE_STOP_DETAILS.get(
+        str(exc.event.get("code") or ""),
+        "browser_runtime_failed",
+    )
 
 
 def is_recoverable_xhs_navigation_failure(exc: BaseException) -> bool:
@@ -2022,6 +2034,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                             IPBlockError,
                                             PlatformRuntimeError,
                                             XHSNetworkRecoveryTimeout,
+                                            CDPBrowserLifecycleError,
                                         ),
                                     )
                                     or isinstance(note_detail, PlaywrightError)
@@ -2090,7 +2103,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                         break
                                     continue
                                 except RuntimeError as exc:
-                                    if isinstance(exc, XHSNetworkRecoveryTimeout):
+                                    if isinstance(
+                                        exc,
+                                        (
+                                            XHSNetworkRecoveryTimeout,
+                                            CDPBrowserLifecycleError,
+                                        ),
+                                    ):
                                         raise
                                     detail_text = str(exc).lower()
                                     if any(
@@ -2354,6 +2373,21 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         )
                         accumulator.mark_runtime_failed(
                             "search_or_detail_request_failed",
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            resume_page=requested_page,
+                            resume_cursor=search_id,
+                            discovery_phase=discovery_phase,
+                        )
+                        break
+                    except CDPBrowserLifecycleError as exc:
+                        detail = xhs_cdp_lifecycle_stop_detail(exc)
+                        utils.logger.error(
+                            "[XiaoHongShuCrawler.search] CDP lifecycle ended on "
+                            f"page {requested_page}: {exc!r}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            detail,
                             source_page=requested_page,
                             source_cursor=search_id,
                             resume_page=requested_page,
