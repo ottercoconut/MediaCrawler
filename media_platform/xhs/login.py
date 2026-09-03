@@ -36,6 +36,47 @@ from tools import utils
 
 class XiaoHongShuLogin(AbstractLogin):
 
+    @staticmethod
+    def _browser_is_headless() -> bool:
+        if config.ENABLE_CDP_MODE:
+            return bool(config.CDP_HEADLESS)
+        return bool(config.HEADLESS)
+
+    @staticmethod
+    def _consume_qrcode_preview_result(future: asyncio.Future) -> None:
+        try:
+            future.result()
+        except asyncio.CancelledError:
+            utils.logger.warning(
+                "[XiaoHongShuLogin.login_by_qrcode] Headless QR preview was cancelled"
+            )
+        except Exception as exc:
+            utils.logger.warning(
+                "[XiaoHongShuLogin.login_by_qrcode] Headless QR preview failed; "
+                f"keeping the browser login flow active: {type(exc).__name__}: {exc}"
+            )
+
+    def _show_qrcode_for_headless_browser(self, base64_qrcode_img: str) -> None:
+        if not self._browser_is_headless():
+            return
+
+        partial_show_qrcode = functools.partial(
+            utils.show_qrcode,
+            base64_qrcode_img,
+        )
+        try:
+            preview_future = asyncio.get_running_loop().run_in_executor(
+                executor=None,
+                func=partial_show_qrcode,
+            )
+            preview_future.add_done_callback(self._consume_qrcode_preview_result)
+        except Exception as exc:
+            utils.logger.warning(
+                "[XiaoHongShuLogin.login_by_qrcode] Could not schedule headless "
+                "QR preview; keeping the browser login flow active: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
     def __init__(self,
                  login_type: str,
                  browser_context: BrowserContext,
@@ -303,8 +344,7 @@ class XiaoHongShuLogin(AbstractLogin):
             _, cookie_dict = utils.convert_cookies(current_cookie)
             no_logged_in_session = cookie_dict.get("web_session")
 
-            partial_show_qrcode = functools.partial(utils.show_qrcode, base64_qrcode_img)
-            asyncio.get_running_loop().run_in_executor(executor=None, func=partial_show_qrcode)
+            self._show_qrcode_for_headless_browser(base64_qrcode_img)
 
             utils.logger.info(
                 f"[XiaoHongShuLogin.login_by_qrcode] waiting for scan code login, "
