@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import subprocess
 import threading
@@ -586,6 +587,96 @@ async def test_crawler_close_does_not_swallow_cleanup_timeout() -> None:
     crawler._prepare_browser_shutdown = AsyncMock()
 
     with pytest.raises(TimeoutError, match="cleanup deadline exceeded"):
+        await crawler.close(force=True)
+
+    assert crawler.cdp_manager is manager
+    manager.cleanup.assert_awaited_once_with(force=True)
+
+
+@pytest.mark.asyncio
+async def test_crawler_close_rejects_failed_cleanup_result_and_retains_manager(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    crawler = XiaoHongShuCrawler()
+    manager = MagicMock()
+    failed_result = {
+        "status": "failed",
+        "reason": "playwright_context_exit",
+        "context": "closed",
+        "browser": "already_disconnected",
+        "process": {
+            "status": "failed",
+            "error": "process still alive",
+        },
+        "errors": ["process:process still alive"],
+    }
+    manager.cleanup = AsyncMock(return_value=failed_result)
+    crawler.cdp_manager = manager
+    crawler._prepare_browser_shutdown = AsyncMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^xhs_cdp_cleanup_incomplete:",
+    ) as exc_info:
+        await crawler.close(force=True)
+
+    detail = json.loads(str(exc_info.value).split(":", 1)[1])
+    assert detail == {
+        "browser": "already_disconnected",
+        "context": "closed",
+        "errors": ["process:process still alive"],
+        "process": "failed",
+        "status": "failed",
+    }
+    assert crawler.cdp_manager is manager
+    manager.cleanup.assert_awaited_once_with(force=True)
+    assert "retaining lifecycle handles for audit and retry" in caplog.text
+    assert "Browser context closed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_crawler_close_retries_after_incomplete_cleanup() -> None:
+    crawler = XiaoHongShuCrawler()
+    manager = MagicMock()
+    manager.cleanup = AsyncMock(
+        side_effect=[
+            {
+                "status": "failed",
+                "context": "closed",
+                "browser": "closed",
+                "process": {"status": "failed"},
+                "errors": ["process:failed"],
+            },
+            {
+                "status": "completed",
+                "context": "not_present",
+                "browser": "not_present",
+                "process": {"status": "terminated"},
+                "errors": [],
+            },
+        ]
+    )
+    crawler.cdp_manager = manager
+    crawler._prepare_browser_shutdown = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="xhs_cdp_cleanup_incomplete"):
+        await crawler.close(force=True)
+
+    assert crawler.cdp_manager is manager
+    await crawler.close(force=True)
+    assert crawler.cdp_manager is None
+    assert manager.cleanup.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_crawler_close_does_not_swallow_cleanup_exception() -> None:
+    crawler = XiaoHongShuCrawler()
+    manager = MagicMock()
+    manager.cleanup = AsyncMock(side_effect=OSError("cannot signal browser"))
+    crawler.cdp_manager = manager
+    crawler._prepare_browser_shutdown = AsyncMock()
+
+    with pytest.raises(OSError, match="cannot signal browser"):
         await crawler.close(force=True)
 
     assert crawler.cdp_manager is manager

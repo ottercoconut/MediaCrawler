@@ -3111,7 +3111,25 @@ class XiaoHongShuCrawler(AbstractCrawler):
             async with asyncio.timeout(20):
                 # Special handling if using CDP mode
                 if self.cdp_manager:
-                    await self.cdp_manager.cleanup(force=force)
+                    cleanup_result = await self.cdp_manager.cleanup(force=force)
+                    if cleanup_result.get("status") != "completed":
+                        summary = {
+                            "status": cleanup_result.get("status"),
+                            "context": cleanup_result.get("context"),
+                            "browser": cleanup_result.get("browser"),
+                            "process": (
+                                cleanup_result.get("process") or {}
+                            ).get("status"),
+                            "errors": cleanup_result.get("errors") or [],
+                        }
+                        raise RuntimeError(
+                            "xhs_cdp_cleanup_incomplete:"
+                            + json.dumps(
+                                summary,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        )
                     self.cdp_manager = None
                 else:
                     await self.browser_context.close()
@@ -3128,7 +3146,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             raise
         except Exception as exc:
-            utils.logger.warning(f"[XiaoHongShuCrawler.close] Browser cleanup timed out or failed: {exc}")
+            utils.logger.error(
+                "[XiaoHongShuCrawler.close] Browser cleanup failed; "
+                f"retaining lifecycle handles for audit and retry: {exc}"
+            )
+            raise
         else:
             utils.logger.info("[XiaoHongShuCrawler.close] Browser context closed ...")
 
