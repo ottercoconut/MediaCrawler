@@ -1894,6 +1894,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 raise
             else:
                 await self._prepare_browser_shutdown()
+            finally:
+                # Stopping Playwright tears down the CDP transport before
+                # app_runner invokes the later resource cleanup. Mark that
+                # disconnect as planned without closing the browser here.
+                manager = getattr(self, "cdp_manager", None)
+                if manager is not None:
+                    manager.mark_planned_cleanup(
+                        "playwright_context_exit"
+                    )
 
     async def _run_browser_session(
         self,

@@ -278,7 +278,7 @@ def test_repeated_cleanup_does_not_signal_process_twice(monkeypatch) -> None:
     killpg.assert_called_once_with(1010, signal.SIGTERM)
 
 
-def test_unexpected_cdp_disconnect_is_latched_with_process_evidence() -> None:
+def test_driver_disconnect_without_shutdown_latch_is_unexpected() -> None:
     process = FakeProcess(pid=1111)
     manager, browser, _context = _connected_manager(process=process)
 
@@ -328,6 +328,73 @@ async def test_planned_cleanup_does_not_latch_close_or_disconnect() -> None:
     assert browser.close_calls == 1
     assert context.close_calls == 1
     manager.launcher.cleanup.assert_called_once_with(reason="normal_completion")
+
+
+@pytest.mark.asyncio
+async def test_start_latches_driver_disconnect_before_later_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    process = FakeProcess(pid=1353)
+    manager, browser, context = _connected_manager(process=process)
+    manager.launcher.cleanup = MagicMock(
+        return_value={
+            "status": "terminated",
+            "reason": "playwright_context_exit",
+            "pid": 1353,
+            "returncode": -15,
+        }
+    )
+    crawler = XiaoHongShuCrawler()
+    crawler.cdp_manager = manager
+    crawler.browser_context = context
+    crawler._run_browser_session = AsyncMock()
+
+    async def prepare_browser_shutdown() -> None:
+        events.append("prepare")
+
+    crawler._prepare_browser_shutdown = AsyncMock(
+        side_effect=prepare_browser_shutdown
+    )
+
+    class DriverLifecycle:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args) -> None:
+            events.append("driver_disconnect")
+            browser.connected = False
+            browser.emit("disconnected")
+
+    monkeypatch.setattr(
+        "media_platform.xhs.core.async_playwright",
+        DriverLifecycle,
+    )
+    monkeypatch.setattr(
+        "media_platform.xhs.core.config.ENABLE_IP_PROXY",
+        False,
+    )
+
+    await crawler.start()
+
+    assert events == ["prepare", "driver_disconnect"]
+    assert manager.lifecycle_snapshot()["planned_cleanup_reason"] == (
+        "playwright_context_exit"
+    )
+    assert manager.lifecycle_snapshot()["unexpected"] == {}
+    assert manager.last_cleanup_result is None
+    assert context.close_calls == 0
+    assert browser.close_calls == 0
+    assert manager.launcher.browser_process is process
+
+    await crawler.close(force=True)
+
+    assert events == ["prepare", "driver_disconnect", "prepare"]
+    assert manager.lifecycle_snapshot()["unexpected"] == {}
+    assert context.close_calls == 1
+    manager.launcher.cleanup.assert_called_once_with(
+        reason="playwright_context_exit"
+    )
 
 
 @pytest.mark.asyncio
