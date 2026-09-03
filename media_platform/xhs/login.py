@@ -19,7 +19,6 @@
 
 
 import asyncio
-import functools
 import os
 import sys
 import time
@@ -124,47 +123,6 @@ class XiaoHongShuLogin(AbstractLogin):
         "xpath=//img[contains(concat(' ', normalize-space(@class), ' '), "
         "' qrcode-img ')]"
     )
-
-    @staticmethod
-    def _browser_is_headless() -> bool:
-        if config.ENABLE_CDP_MODE:
-            return bool(config.CDP_HEADLESS)
-        return bool(config.HEADLESS)
-
-    @staticmethod
-    def _consume_qrcode_preview_result(future: asyncio.Future) -> None:
-        try:
-            future.result()
-        except asyncio.CancelledError:
-            utils.logger.warning(
-                "[XiaoHongShuLogin.login_by_qrcode] Headless QR preview was cancelled"
-            )
-        except Exception as exc:
-            utils.logger.warning(
-                "[XiaoHongShuLogin.login_by_qrcode] Headless QR preview failed; "
-                f"keeping the browser login flow active: {type(exc).__name__}: {exc}"
-            )
-
-    def _show_qrcode_for_headless_browser(self, base64_qrcode_img: str) -> None:
-        if not self._browser_is_headless():
-            return
-
-        partial_show_qrcode = functools.partial(
-            utils.show_qrcode,
-            base64_qrcode_img,
-        )
-        try:
-            preview_future = asyncio.get_running_loop().run_in_executor(
-                executor=None,
-                func=partial_show_qrcode,
-            )
-            preview_future.add_done_callback(self._consume_qrcode_preview_result)
-        except Exception as exc:
-            utils.logger.warning(
-                "[XiaoHongShuLogin.login_by_qrcode] Could not schedule headless "
-                "QR preview; keeping the browser login flow active: "
-                f"{type(exc).__name__}: {exc}"
-            )
 
     def __init__(self,
                  login_type: str,
@@ -814,14 +772,10 @@ class XiaoHongShuLogin(AbstractLogin):
                         )
                         ticket.raise_if_exhausted()
                     if base64_qrcode_img and not observation.get("qr_expired"):
-                        # The 8b9 callback wrapper makes headed mode a strict no-op
-                        # and isolates headless preview worker/scheduling failures.
-                        self._show_qrcode_for_headless_browser(base64_qrcode_img)
                         qrcode_displayed = True
                         next_refresh_at = budget.now() + refresh_seconds
                         utils.logger.info(
-                            "[XiaoHongShuLogin.login_by_qrcode] QR code ready in "
-                            f"{'headless preview' if self._browser_is_headless() else 'browser'}; "
+                            "[XiaoHongShuLogin.login_by_qrcode] QR code ready in browser; "
                             "automatic page reload is not allowed before "
                             f"{refresh_seconds}s."
                         )

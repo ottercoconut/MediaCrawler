@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -24,18 +25,6 @@ class FakeClock:
 
     async def sleep(self, seconds: float) -> None:
         self.now += seconds
-
-
-class ImmediateFuture:
-    def __init__(self, error: BaseException | None = None) -> None:
-        self.error = error
-
-    def add_done_callback(self, callback) -> None:
-        callback(self)
-
-    def result(self) -> None:
-        if self.error is not None:
-            raise self.error
 
 
 def make_login() -> tuple[XiaoHongShuLogin, SimpleNamespace]:
@@ -96,7 +85,7 @@ def configure_qrcode_flow(
         (False, True, False),
     ],
 )
-async def test_headed_qrcode_never_schedules_initial_or_refreshed_preview(
+async def test_qrcode_never_schedules_initial_or_refreshed_os_preview(
     monkeypatch: pytest.MonkeyPatch,
     enable_cdp: bool,
     cdp_headless: bool,
@@ -111,13 +100,13 @@ async def test_headed_qrcode_never_schedules_initial_or_refreshed_preview(
     monkeypatch.setattr(login_module.config, "ENABLE_CDP_MODE", enable_cdp)
     monkeypatch.setattr(login_module.config, "CDP_HEADLESS", cdp_headless)
     monkeypatch.setattr(login_module.config, "HEADLESS", playwright_headless)
-    run_in_executor = MagicMock(
-        side_effect=AssertionError("headed login must not open an OS preview")
+    get_running_loop = MagicMock(
+        side_effect=AssertionError("XHS login must not schedule an OS preview")
     )
     monkeypatch.setattr(
         login_module.asyncio,
         "get_running_loop",
-        lambda: SimpleNamespace(run_in_executor=run_in_executor),
+        get_running_loop,
     )
 
     with pytest.raises(XHSManualWaitBudgetExhausted):
@@ -127,7 +116,7 @@ async def test_headed_qrcode_never_schedules_initial_or_refreshed_preview(
     assert page.reload.await_args_list == [
         call(wait_until="domcontentloaded", timeout=30_000)
     ]
-    run_in_executor.assert_not_called()
+    get_running_loop.assert_not_called()
     show_qrcode.assert_not_called()
 
 
@@ -139,7 +128,7 @@ async def test_headed_qrcode_never_schedules_initial_or_refreshed_preview(
         (False, False, True),
     ],
 )
-async def test_headless_qrcode_still_schedules_required_preview(
+async def test_headless_qrcode_stays_in_browser_without_os_preview(
     monkeypatch: pytest.MonkeyPatch,
     enable_cdp: bool,
     cdp_headless: bool,
@@ -152,19 +141,16 @@ async def test_headless_qrcode_still_schedules_required_preview(
         wait_seconds=2,
     )
 
-    def run_in_executor(*, executor, func):
-        assert executor is None
-        func()
-        return ImmediateFuture()
-
-    executor = MagicMock(side_effect=run_in_executor)
+    get_running_loop = MagicMock(
+        side_effect=AssertionError("headless XHS login must not open an OS preview")
+    )
     monkeypatch.setattr(login_module.config, "ENABLE_CDP_MODE", enable_cdp)
     monkeypatch.setattr(login_module.config, "CDP_HEADLESS", cdp_headless)
     monkeypatch.setattr(login_module.config, "HEADLESS", playwright_headless)
     monkeypatch.setattr(
         login_module.asyncio,
         "get_running_loop",
-        lambda: SimpleNamespace(run_in_executor=executor),
+        get_running_loop,
     )
 
     with pytest.raises(XHSManualWaitBudgetExhausted):
@@ -172,12 +158,12 @@ async def test_headless_qrcode_still_schedules_required_preview(
 
     find_qrcode.assert_awaited_once()
     page.reload.assert_not_awaited()
-    executor.assert_called_once()
-    show_qrcode.assert_called_once_with("qr-image")
+    get_running_loop.assert_not_called()
+    show_qrcode.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_headless_preview_failure_does_not_restart_or_abort_login(
+async def test_removed_preview_hooks_cannot_abort_headless_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     login, page = make_login()
@@ -186,29 +172,34 @@ async def test_headless_preview_failure_does_not_restart_or_abort_login(
         login,
         wait_seconds=2,
     )
-    show_qrcode.side_effect = RuntimeError("preview unavailable")
-
-    def run_in_executor(*, executor, func):
-        assert executor is None
-        try:
-            func()
-        except Exception as exc:
-            return ImmediateFuture(exc)
-        return ImmediateFuture()
-
-    executor = MagicMock(side_effect=run_in_executor)
+    show_qrcode.side_effect = AssertionError("legacy OS preview invoked")
+    get_running_loop = MagicMock(
+        side_effect=AssertionError("legacy preview scheduling invoked")
+    )
     monkeypatch.setattr(login_module.config, "ENABLE_CDP_MODE", True)
     monkeypatch.setattr(login_module.config, "CDP_HEADLESS", True)
     monkeypatch.setattr(login_module.config, "HEADLESS", False)
     monkeypatch.setattr(
         login_module.asyncio,
         "get_running_loop",
-        lambda: SimpleNamespace(run_in_executor=executor),
+        get_running_loop,
     )
 
     with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     find_qrcode.assert_awaited_once()
-    show_qrcode.assert_called_once_with("qr-image")
+    get_running_loop.assert_not_called()
+    show_qrcode.assert_not_called()
     page.reload.assert_not_awaited()
+
+
+def test_xhs_login_class_has_no_os_qrcode_preview_path() -> None:
+    source = inspect.getsource(XiaoHongShuLogin)
+
+    assert "show_qrcode" not in source
+    assert "run_in_executor" not in source
+    assert "startfile" not in source
+    assert "xdg-open" not in source
+    assert "subprocess" not in source
+    assert not hasattr(XiaoHongShuLogin, "_show_qrcode_for_headless_browser")
