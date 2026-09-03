@@ -13,6 +13,7 @@ from tenacity import Future, RetryError
 from media_platform.xhs.core import (
     XiaoHongShuCrawler,
     XHSNetworkRecoveryTimeout,
+    is_recoverable_xhs_navigation_failure,
 )
 from media_platform.xhs.exception import DataFetchError
 
@@ -374,3 +375,294 @@ async def test_creator_network_timeout_never_opens_browser_fallback(
 
     crawler._get_creator_info_from_browser.assert_not_awaited()
     crawler._guarded_pause.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PlaywrightError("page.goto: net::ERR_INTERNET_DISCONNECTED"),
+        PlaywrightError("page.goto: net::ERR_NETWORK_CHANGED"),
+        PlaywrightError("page.goto: net::ERR_NAME_NOT_RESOLVED"),
+        PlaywrightError("page.goto: net::ERR_CONNECTION_RESET"),
+        PlaywrightError("page.goto: net::ERR_CONNECTION_CLOSED"),
+        PlaywrightError("page.goto: net::ERR_CONNECTION_REFUSED"),
+        PlaywrightError("page.goto: net::ERR_TIMED_OUT"),
+        PlaywrightError("page.goto: net::ERR_ADDRESS_UNREACHABLE"),
+        PlaywrightError("page.goto: net::ERR_PROXY_CONNECTION_FAILED"),
+        PlaywrightError("page.goto: net::ERR_TUNNEL_CONNECTION_FAILED"),
+        TimeoutError("outer navigation deadline"),
+    ],
+)
+def test_navigation_classifier_accepts_only_explicit_recoverable_failures(
+    error: BaseException,
+) -> None:
+    assert is_recoverable_xhs_navigation_failure(error) is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PlaywrightError("page.goto: net::ERR_ABORTED"),
+        PlaywrightError("page.goto: net::ERR_FAILED"),
+        PlaywrightError("page.goto: net::ERR_CERT_AUTHORITY_INVALID"),
+        PlaywrightError("Target page, context or browser has been closed"),
+        PlaywrightError(
+            "Target page, context or browser has been closed after "
+            "net::ERR_CONNECTION_RESET"
+        ),
+        DataFetchError("invalid response schema"),
+    ],
+)
+def test_navigation_classifier_rejects_ambiguous_or_terminal_failures(
+    error: BaseException,
+) -> None:
+    assert is_recoverable_xhs_navigation_failure(error) is False
+
+
+def test_navigation_classifier_rejects_target_closed_class_before_net_marker() -> None:
+    target_closed_type = type("TargetClosedError", (PlaywrightError,), {})
+    error = target_closed_type("net::ERR_CONNECTION_RESET")
+
+    assert is_recoverable_xhs_navigation_failure(error) is False
+
+
+def _navigation_page(*, url: str, side_effect) -> SimpleNamespace:
+    page = SimpleNamespace(
+        url=url,
+        is_closed=lambda: False,
+        goto=AsyncMock(side_effect=side_effect),
+        on=lambda *_args: None,
+    )
+    return page
+
+
+@pytest.mark.asyncio
+async def test_navigation_network_error_retries_same_page_and_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler, context, _primary, sleeps = _crawler_with_clock(monkeypatch)
+    response = SimpleNamespace(status=200)
+    page = _navigation_page(
+        url="https://www.xiaohongshu.com/explore",
+        side_effect=[
+            PlaywrightError("page.goto: net::ERR_INTERNET_DISCONNECTED"),
+            response,
+        ],
+    )
+    context.pages.append(page)
+    crawler._record_navigation_diagnostic = AsyncMock(return_value={})
+
+    await crawler._goto_with_deadline(
+        page,
+        "https://www.xiaohongshu.com/user/profile/author",
+        stage="creator_profile_browser",
+    )
+
+    assert page.goto.await_count == 2
+    assert [call.args[0] for call in page.goto.await_args_list] == [
+        "https://www.xiaohongshu.com/user/profile/author",
+        "https://www.xiaohongshu.com/user/profile/author",
+    ]
+    assert sleeps == [2.0]
+    context.new_page.assert_not_awaited()
+    assert crawler.context_page is not page
+    assert crawler.browser_context is context
+
+
+@pytest.mark.asyncio
+async def test_navigation_network_error_then_target_close_is_aborted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler, context, _primary, sleeps = _crawler_with_clock(monkeypatch)
+    page = _navigation_page(
+        url="https://www.xiaohongshu.com/explore",
+        side_effect=[
+            PlaywrightError("page.goto: net::ERR_INTERNET_DISCONNECTED"),
+            PlaywrightError("Target page, context or browser has been closed"),
+        ],
+    )
+    context.pages.append(page)
+    crawler._record_navigation_diagnostic = AsyncMock(return_value={})
+
+    with pytest.raises(PlaywrightError, match="context or browser has been closed"):
+        await crawler._goto_with_deadline(
+            page,
+            "https://www.xiaohongshu.com/user/profile/author",
+            stage="creator_profile_browser",
+        )
+
+    assert page.goto.await_count == 2
+    assert sleeps == [2.0]
+    assert [
+        call.kwargs["outcome"]
+        for call in crawler._record_network_recovery_event.await_args_list
+    ] == ["network_paused", "network_recovery_aborted"]
+
+
+@pytest.mark.asyncio
+async def test_uncommitted_navigation_timeout_retries_but_committed_search_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler, context, _primary, sleeps = _crawler_with_clock(monkeypatch)
+    response = SimpleNamespace(status=204)
+    uncommitted = _navigation_page(
+        url="https://www.xiaohongshu.com/explore",
+        side_effect=[TimeoutError("deadline"), response],
+    )
+    committed = _navigation_page(
+        url="https://www.xiaohongshu.com/search_result?keyword=test",
+        side_effect=TimeoutError("deadline after commit"),
+    )
+    context.pages.extend([uncommitted, committed])
+    crawler._record_navigation_diagnostic = AsyncMock(return_value={})
+
+    await crawler._goto_with_deadline(
+        uncommitted,
+        "https://www.xiaohongshu.com/explore",
+        stage="initial_explore",
+    )
+    await crawler._goto_with_deadline(
+        committed,
+        "https://www.xiaohongshu.com/search_result?keyword=test",
+        stage="behavior_search",
+    )
+
+    assert uncommitted.goto.await_count == 2
+    assert committed.goto.await_count == 1
+    assert sleeps == [2.0]
+    outcomes = [
+        call.kwargs["outcome"]
+        for call in crawler._record_navigation_diagnostic.await_args_list
+    ]
+    assert outcomes == [
+        "navigation_network_error",
+        "navigation_committed",
+        "commit_timeout_deferred",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_old_search_url_does_not_fake_commit_of_new_search_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler, context, _primary, sleeps = _crawler_with_clock(monkeypatch)
+    page = _navigation_page(
+        url="https://www.xiaohongshu.com/search_result?keyword=old",
+        side_effect=[TimeoutError("new search never committed"), SimpleNamespace(status=200)],
+    )
+    context.pages.append(page)
+    crawler._record_navigation_diagnostic = AsyncMock(return_value={})
+
+    await crawler._goto_with_deadline(
+        page,
+        "https://www.xiaohongshu.com/search_result?keyword=new",
+        stage="behavior_search",
+    )
+
+    assert page.goto.await_count == 2
+    assert sleeps == [2.0]
+    outcomes = [
+        call.kwargs["outcome"]
+        for call in crawler._record_navigation_diagnostic.await_args_list
+    ]
+    assert outcomes == ["navigation_network_error", "navigation_committed"]
+
+
+@pytest.mark.asyncio
+async def test_committed_timeout_after_network_pause_is_deferred_not_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler, context, _primary, sleeps = _crawler_with_clock(monkeypatch)
+    target = "https://www.xiaohongshu.com/search_result?keyword=new"
+    page = _navigation_page(
+        url="https://www.xiaohongshu.com/explore",
+        side_effect=None,
+    )
+    calls = 0
+
+    async def goto(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PlaywrightError("page.goto: net::ERR_NETWORK_CHANGED")
+        page.url = target
+        raise TimeoutError("timed out after URL commit")
+
+    page.goto = AsyncMock(side_effect=goto)
+    context.pages.append(page)
+    crawler._record_navigation_diagnostic = AsyncMock(return_value={})
+
+    await crawler._goto_with_deadline(page, target, stage="behavior_search")
+
+    assert page.goto.await_count == 2
+    assert sleeps == [2.0]
+    assert [
+        call.kwargs["outcome"]
+        for call in crawler._record_network_recovery_event.await_args_list
+    ] == [
+        "network_paused",
+        "network_recovery_deferred_to_visible_readiness",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        PlaywrightError("page.goto: net::ERR_ABORTED"),
+        PlaywrightError("Target page, context or browser has been closed"),
+    ],
+)
+async def test_terminal_navigation_error_never_retries_or_creates_page(
+    monkeypatch: pytest.MonkeyPatch,
+    error: PlaywrightError,
+) -> None:
+    crawler, context, _primary, sleeps = _crawler_with_clock(monkeypatch)
+    page = _navigation_page(
+        url="https://www.xiaohongshu.com/explore",
+        side_effect=error,
+    )
+    context.pages.append(page)
+    crawler._record_navigation_diagnostic = AsyncMock(return_value={})
+
+    with pytest.raises(PlaywrightError, match=str(error)):
+        await crawler._goto_with_deadline(
+            page,
+            "https://www.xiaohongshu.com/user/profile/author",
+            stage="creator_profile_browser",
+        )
+
+    assert page.goto.await_count == 1
+    assert sleeps == []
+    context.new_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_navigation_recovery_timeout_keeps_original_page_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler, context, _primary, sleeps = _crawler_with_clock(
+        monkeypatch,
+        wait_seconds=5.0,
+    )
+    page = _navigation_page(
+        url="https://www.xiaohongshu.com/explore",
+        side_effect=PlaywrightError("page.goto: net::ERR_NAME_NOT_RESOLVED"),
+    )
+    context.pages.append(page)
+    crawler._record_navigation_diagnostic = AsyncMock(return_value={})
+
+    with pytest.raises(XHSNetworkRecoveryTimeout) as exc_info:
+        await crawler._goto_with_deadline(
+            page,
+            "https://www.xiaohongshu.com/user/profile/author",
+            stage="creator_profile_browser",
+        )
+
+    assert exc_info.value.stage == "navigation:creator_profile_browser"
+    assert exc_info.value.elapsed_seconds == pytest.approx(5.0)
+    assert page.goto.await_count == 3
+    assert sleeps == [2.0, 3.0]
+    assert page.is_closed() is False
+    assert page in context.pages
+    context.new_page.assert_not_awaited()

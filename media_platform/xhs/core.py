@@ -27,7 +27,7 @@ from asyncio import Task
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlparse
 
 from playwright.async_api import (
     BrowserContext,
@@ -113,6 +113,42 @@ _XHS_MANUAL_CHECKPOINT_SELECTORS = (
     "[class*='geetest']",
     "iframe[src*='captcha']",
 )
+_XHS_RECOVERABLE_NAVIGATION_ERROR_MARKERS = (
+    "net::err_internet_disconnected",
+    "net::err_network_changed",
+    "net::err_name_not_resolved",
+    "net::err_connection_reset",
+    "net::err_connection_closed",
+    "net::err_connection_refused",
+    "net::err_timed_out",
+    "net::err_address_unreachable",
+    "net::err_proxy_connection_failed",
+    "net::err_tunnel_connection_failed",
+)
+
+
+def is_recoverable_xhs_navigation_failure(exc: BaseException) -> bool:
+    detail = str(exc).casefold()
+    if exc.__class__.__name__ == "TargetClosedError" or any(
+        marker in detail
+        for marker in (
+            "target page, context or browser has been closed",
+            "context or browser has been closed",
+            "browser has been closed",
+            "browser has disconnected",
+            "browser disconnected",
+            "playwright connection closed",
+            "connection closed while reading from the driver",
+        )
+    ):
+        return False
+    if isinstance(exc, (PlaywrightTimeoutError, TimeoutError)):
+        return True
+    if not isinstance(exc, PlaywrightError):
+        return False
+    return any(
+        marker in detail for marker in _XHS_RECOVERABLE_NAVIGATION_ERROR_MARKERS
+    )
 
 
 class XHSImageDownloadError(RuntimeError):
@@ -387,6 +423,19 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
         return seconds
 
+    @staticmethod
+    def _navigation_target_matches(target_url: str, current_url: str) -> bool:
+        def normalized(url: str) -> tuple[str, str, str, tuple[tuple[str, str], ...]]:
+            parsed = urlparse(str(url or ""))
+            return (
+                parsed.scheme.casefold(),
+                parsed.netloc.casefold(),
+                parsed.path.rstrip("/") or "/",
+                tuple(sorted(parse_qsl(parsed.query, keep_blank_values=True))),
+            )
+
+        return bool(current_url) and normalized(target_url) == normalized(current_url)
+
     async def _goto_with_deadline(
         self,
         page: Page,
@@ -398,42 +447,110 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self._install_navigation_observers(page)
         timeout_seconds = self._env_float("TRIPPOSTCOLLECT_XHS_NAVIGATION_DEADLINE_SECONDS", 60.0)
         timeout_seconds = max(5.0, timeout_seconds)
-        response_status: Optional[int] = None
-        try:
-            async with asyncio.timeout(timeout_seconds + 2.0):
-                response = await page.goto(
-                    url,
-                    wait_until=wait_until,
-                    timeout=int(timeout_seconds * 1000),
-                )
-                response_status = response.status if response is not None else None
-        except (PlaywrightTimeoutError, TimeoutError) as exc:
-            current_url = page.url or ""
-            if "/search_result" in url and "/search_result" in current_url:
+        recovery_stage = f"navigation:{stage}"
+        recovery_state: Dict[str, object] = {}
+        while True:
+            response_status: Optional[int] = None
+            try:
+                async with asyncio.timeout(timeout_seconds + 2.0):
+                    response = await page.goto(
+                        url,
+                        wait_until=wait_until,
+                        timeout=int(timeout_seconds * 1000),
+                    )
+                    response_status = (
+                        response.status if response is not None else None
+                    )
+            except (PlaywrightTimeoutError, TimeoutError) as exc:
+                try:
+                    current_url = page.url or ""
+                except Exception:
+                    current_url = ""
+                if (
+                    "/search_result" in url
+                    and self._navigation_target_matches(url, current_url)
+                ):
+                    await self._abort_network_recovery(
+                        stage=recovery_stage,
+                        state=recovery_state,
+                        error=exc,
+                        page=page,
+                        outcome="network_recovery_deferred_to_visible_readiness",
+                    )
+                    await self._record_navigation_diagnostic(
+                        page,
+                        stage=stage,
+                        outcome="commit_timeout_deferred",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    utils.logger.warning(
+                        "[XiaoHongShuCrawler] Navigation event timed out after URL "
+                        "commit; continuing with visible readiness gate: "
+                        f"stage={stage}, url={current_url}"
+                    )
+                    return
                 await self._record_navigation_diagnostic(
                     page,
                     stage=stage,
-                    outcome="commit_timeout_deferred",
+                    outcome="navigation_network_error",
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                utils.logger.warning(
-                    "[XiaoHongShuCrawler] Navigation event timed out after URL commit; "
-                    f"continuing with visible readiness gate: stage={stage}, url={current_url}"
+                if await self._pause_for_network_recovery(
+                    exc,
+                    stage=recovery_stage,
+                    state=recovery_state,
+                    page=page,
+                ):
+                    continue
+                started_at = float(
+                    recovery_state.get("started_at") or self._popup_monotonic()
                 )
-                return
+                raise XHSNetworkRecoveryTimeout(
+                    recovery_stage,
+                    self._popup_monotonic() - started_at,
+                ) from exc
+            except PlaywrightError as exc:
+                if not is_recoverable_xhs_navigation_failure(exc):
+                    await self._abort_network_recovery(
+                        stage=recovery_stage,
+                        state=recovery_state,
+                        error=exc,
+                        page=page,
+                    )
+                    raise
+                await self._record_navigation_diagnostic(
+                    page,
+                    stage=stage,
+                    outcome="navigation_network_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                if await self._pause_for_network_recovery(
+                    exc,
+                    stage=recovery_stage,
+                    state=recovery_state,
+                    page=page,
+                ):
+                    continue
+                started_at = float(
+                    recovery_state.get("started_at") or self._popup_monotonic()
+                )
+                raise XHSNetworkRecoveryTimeout(
+                    recovery_stage,
+                    self._popup_monotonic() - started_at,
+                ) from exc
+
+            await self._finish_network_recovery(
+                stage=recovery_stage,
+                state=recovery_state,
+                page=page,
+            )
             await self._record_navigation_diagnostic(
                 page,
                 stage=stage,
-                outcome="navigation_timeout",
-                error=f"{type(exc).__name__}: {exc}",
+                outcome="navigation_committed",
+                response_status=response_status,
             )
-            raise RuntimeError(f"xhs_navigation_timeout:{stage}:{current_url}") from exc
-        await self._record_navigation_diagnostic(
-            page,
-            stage=stage,
-            outcome="navigation_committed",
-            response_status=response_status,
-        )
+            return
 
     @staticmethod
     def _utc_now() -> str:
@@ -1393,7 +1510,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     def _assert_network_recovery_session(self, state: Dict[str, object]) -> None:
         context = getattr(self, "browser_context", None)
-        page = state.get("context_page")
+        page = state.get("operation_page")
         if context is None:
             raise PlaywrightError("xhs_network_recovery_context_missing")
         if page is None:
@@ -1404,7 +1521,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
         expected_context = state.get("browser_context")
         if expected_context is not context:
             raise PlaywrightError("xhs_network_recovery_context_replaced")
-        if getattr(self, "context_page", None) is not page:
+        if state.get("track_primary_page") and getattr(
+            self,
+            "context_page",
+            None,
+        ) is not page:
             raise PlaywrightError("xhs_network_recovery_page_replaced")
 
         page_context = getattr(page, "context", context)
@@ -1429,8 +1550,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
         stage: str,
         outcome: str,
         error: str = "",
+        page: Optional[Page] = None,
     ) -> None:
-        page = getattr(self, "context_page", None)
+        page = page or getattr(self, "context_page", None)
         if page is None:
             return
         try:
@@ -1454,8 +1576,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
         *,
         stage: str,
         state: Dict[str, object],
+        page: Optional[Page] = None,
     ) -> bool:
-        if not is_recoverable_xhs_transport_failure(exc):
+        if not (
+            is_recoverable_xhs_transport_failure(exc)
+            or is_recoverable_xhs_navigation_failure(exc)
+        ):
             return False
 
         wait_seconds = self._env_float(
@@ -1480,13 +1606,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
         )
 
         if not state:
+            operation_page = page or getattr(self, "context_page", None)
             state.update(
                 {
                     "stage": stage,
                     "started_at": self._popup_monotonic(),
                     "failures": 0,
                     "browser_context": getattr(self, "browser_context", None),
-                    "context_page": getattr(self, "context_page", None),
+                    "operation_page": operation_page,
+                    "track_primary_page": operation_page
+                    is getattr(self, "context_page", None),
                 }
             )
         elif state.get("stage") != stage:
@@ -1500,6 +1629,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 stage=stage,
                 outcome="network_recovery_timeout",
                 error=f"{type(unwrap_xhs_request_failure(exc)).__name__}: {exc}",
+                page=page,
             )
             return False
 
@@ -1521,6 +1651,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             stage=stage,
             outcome="network_paused",
             error=f"{type(nested).__name__}: {nested}"[:500],
+            page=page,
         )
         await self._popup_sleep(delay)
         self._assert_network_recovery_session(state)
@@ -1531,11 +1662,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
         *,
         stage: str,
         state: Dict[str, object],
+        page: Optional[Page] = None,
     ) -> None:
         if not state:
             return
         if state.get("stage") != stage:
             raise RuntimeError("xhs_network_recovery_state_stage_mismatch")
+        operation_page = page or state.get("operation_page")
         started_at = float(state.get("started_at") or self._popup_monotonic())
         elapsed = max(0.0, self._popup_monotonic() - started_at)
         state.clear()
@@ -1546,6 +1679,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         await self._record_network_recovery_event(
             stage=stage,
             outcome="network_recovered",
+            page=operation_page,
         )
 
     async def _abort_network_recovery(
@@ -1554,12 +1688,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
         stage: str,
         state: Dict[str, object],
         error: BaseException,
+        page: Optional[Page] = None,
         outcome: str = "network_recovery_aborted",
     ) -> None:
         if not state:
             return
         if state.get("stage") != stage:
             raise RuntimeError("xhs_network_recovery_state_stage_mismatch")
+        operation_page = page or state.get("operation_page")
         state.clear()
         utils.logger.warning(
             "[XiaoHongShuCrawler] Network recovery aborted by a non-network "
@@ -1569,6 +1705,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             stage=stage,
             outcome=outcome,
             error=f"{type(error).__name__}: {error}"[:500],
+            page=operation_page,
         )
 
     async def _run_with_network_recovery(self, operation, *, stage: str):
