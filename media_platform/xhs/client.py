@@ -58,6 +58,31 @@ from .extractor import XiaoHongShuExtractor
 from .playwright_sign import sign_with_xhshow
 
 
+def unwrap_xhs_request_failure(exc: BaseException) -> BaseException:
+    """Expose the final request failure hidden by tenacity."""
+    if not isinstance(exc, RetryError):
+        return exc
+    try:
+        nested = exc.last_attempt.exception()
+    except Exception:
+        nested = None
+    return nested if isinstance(nested, BaseException) else exc
+
+
+def is_recoverable_xhs_transport_failure(exc: BaseException) -> bool:
+    """Return whether a failure is a temporary client/network transport outage."""
+    nested = unwrap_xhs_request_failure(exc)
+    return isinstance(
+        nested,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.ProxyError,
+            httpx.RemoteProtocolError,
+        ),
+    )
+
+
 class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
 
     def __init__(
@@ -308,8 +333,36 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 timeout=min(self.timeout, 15),
             )
             if response.status_code == 200:
-                return response.json()
-        return None
+                data = response.json()
+                response_code = (
+                    str(data.get("code", "")).strip()
+                    if isinstance(data, dict)
+                    else ""
+                )
+                if response_code == str(self.IP_ERROR_CODE):
+                    raise IPBlockError(self.IP_ERROR_STR)
+                if response_code == str(self.SECURITY_LIMIT_CODE):
+                    raise PlatformRuntimeError(
+                        f"XHS platform security limit, code {self.SECURITY_LIMIT_CODE}",
+                        code=f"platform_security_limit_{self.SECURITY_LIMIT_CODE}",
+                    )
+                return data
+            if response.status_code in {401, 403}:
+                return None
+            if response.status_code == 429:
+                raise PlatformRuntimeError(
+                    "XHS self-info HTTP 429",
+                    code="rate_limited",
+                )
+            if response.status_code in {461, 471}:
+                raise PlatformRuntimeError(
+                    f"XHS self-info HTTP {response.status_code}",
+                    code="verification_required",
+                )
+            response.raise_for_status()
+            raise DataFetchError(
+                f"Unexpected XHS self-info HTTP {response.status_code}"
+            )
 
     async def pong(self) -> bool:
         """
@@ -318,16 +371,18 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             bool: True if logged in, False otherwise
         """
         utils.logger.info("[XiaoHongShuClient.pong] Begin to check login state...")
-        ping_flag = False
         try:
             self_info: Dict = await self.query_self()
-            if self_info and self_info.get("data", {}).get("result", {}).get("success"):
-                ping_flag = True
-        except Exception as e:
+        except Exception as exc:
             utils.logger.error(
-                f"[XiaoHongShuClient.pong] Check login state failed: {e}, and try to login again..."
+                "[XiaoHongShuClient.pong] Login probe was inconclusive; "
+                f"propagating {type(exc).__name__}: {exc}"
             )
-            ping_flag = False
+            raise
+        ping_flag = bool(
+            self_info
+            and self_info.get("data", {}).get("result", {}).get("success")
+        )
         utils.logger.info(f"[XiaoHongShuClient.pong] Login state result: {ping_flag}")
         return ping_flag
 
