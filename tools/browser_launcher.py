@@ -44,7 +44,9 @@ class BrowserLauncher:
         self.last_process_exit: Optional[Dict[str, Any]] = None
         self.last_cleanup_result: Optional[Dict[str, Any]] = None
         self._launch_in_progress = False
+        self._launch_attempted = False
         self._cleanup_requested = False
+        self._cleanup_request_reason = ""
         self._cleanup_in_progress = False
         # Launch and cleanup normally run on the main thread, but cleanup can
         # also be entered from a signal/atexit handler.  Keep state transitions
@@ -274,6 +276,11 @@ class BrowserLauncher:
         utils.logger.info(f"[BrowserLauncher] Headless mode: {headless}")
 
         with self._state_lock:
+            if self._cleanup_requested:
+                raise RuntimeError(
+                    "browser_process_cleanup_already_requested:"
+                    f"reason={self._cleanup_request_reason or 'requested'}"
+                )
             if self._cleanup_in_progress:
                 raise RuntimeError("browser_process_cleanup_in_progress")
             if self._launch_in_progress:
@@ -295,10 +302,15 @@ class BrowserLauncher:
                 if self.browser_process is existing:
                     self.browser_process = None
 
+            if self._launch_attempted:
+                raise RuntimeError("browser_process_launch_already_attempted")
+
             # Claim the only launch slot before Popen.  This closes the window
             # where two callers could both observe browser_process == None.
             self._launch_in_progress = True
+            self._launch_attempted = True
 
+        process = None
         try:
             # On Windows, use CREATE_NEW_PROCESS_GROUP to prevent Ctrl+C from affecting subprocess
             if self.system == "Windows":
@@ -319,10 +331,33 @@ class BrowserLauncher:
             with self._state_lock:
                 self.browser_process = process
                 self.debug_port = debug_port
-                self._cleanup_requested = False
+                cleanup_requested = self._cleanup_requested
+                cleanup_reason = self._cleanup_request_reason or "requested"
+
+            if cleanup_requested:
+                cleanup_result = self.cleanup(reason=cleanup_reason)
+                raise RuntimeError(
+                    "browser_process_cleanup_requested_during_launch:"
+                    f"reason={cleanup_reason}:"
+                    f"status={cleanup_result.get('status')}:"
+                    f"pid={self._process_pid(process)}"
+                )
             return process
 
         except Exception as e:
+            if process is None:
+                with self._state_lock:
+                    if self._cleanup_requested:
+                        cleanup_reason = (
+                            self._cleanup_request_reason or "requested"
+                        )
+                        self.last_cleanup_result = {
+                            "status": "launch_failed",
+                            "reason": cleanup_reason,
+                            "pid": None,
+                            "returncode": None,
+                            "error": f"{type(e).__name__}: {e}",
+                        }
             utils.logger.error(f"[BrowserLauncher] Failed to launch browser: {e}")
             raise
         finally:
@@ -400,28 +435,42 @@ class BrowserLauncher:
         Cleanup resources, close browser process
         """
         with self._state_lock:
+            if not self._cleanup_requested:
+                self._cleanup_requested = True
+                self._cleanup_request_reason = str(reason or "requested")[:160]
+            cleanup_reason = self._cleanup_request_reason
             if self._cleanup_in_progress:
                 return dict(
                     self.last_cleanup_result
                     or {
                         "status": "in_progress",
-                        "reason": reason,
+                        "reason": cleanup_reason,
                         "pid": self._process_pid(self.browser_process)
                         if self.browser_process is not None
                         else None,
                     }
                 )
             if self.browser_process is None:
+                if self._launch_in_progress:
+                    if not self.last_cleanup_result or self.last_cleanup_result.get(
+                        "status"
+                    ) != "pending_launch":
+                        self.last_cleanup_result = {
+                            "status": "pending_launch",
+                            "reason": cleanup_reason,
+                            "pid": None,
+                            "returncode": None,
+                        }
+                    return dict(self.last_cleanup_result)
                 if self.last_cleanup_result is not None:
                     return dict(self.last_cleanup_result)
                 self.last_cleanup_result = {
                     "status": "not_started",
-                    "reason": reason,
+                    "reason": cleanup_reason,
                     "pid": None,
                     "returncode": None,
                 }
                 return dict(self.last_cleanup_result)
-            self._cleanup_requested = True
             self._cleanup_in_progress = True
             process = self.browser_process
 
@@ -435,7 +484,7 @@ class BrowserLauncher:
             )
             result = {
                 "status": "already_exited",
-                "reason": reason,
+                "reason": cleanup_reason,
                 "pid": pid,
                 "returncode": returncode,
                 "exit": exit_record,
@@ -447,13 +496,13 @@ class BrowserLauncher:
                 self._cleanup_in_progress = False
             utils.logger.info(
                 "[BrowserLauncher] Browser process already exited; "
-                f"pid={pid}, returncode={returncode}, reason={reason}"
+                f"pid={pid}, returncode={returncode}, reason={cleanup_reason}"
             )
             return dict(result)
 
         utils.logger.info(
             "[BrowserLauncher] Closing browser process; "
-            f"pid={pid}, reason={reason}"
+            f"pid={pid}, reason={cleanup_reason}"
         )
 
         status = "terminated"
@@ -503,12 +552,12 @@ class BrowserLauncher:
                 normalized_returncode = self._process_returncode(process)
             exit_record = self._record_process_exit(
                 process,
-                reason=f"planned_cleanup:{reason}",
+                reason=f"planned_cleanup:{cleanup_reason}",
                 returncode=normalized_returncode,
             )
             result = {
                 "status": status,
-                "reason": reason,
+                "reason": cleanup_reason,
                 "pid": pid,
                 "returncode": normalized_returncode,
                 "exit": exit_record,
@@ -520,12 +569,12 @@ class BrowserLauncher:
             utils.logger.info(
                 "[BrowserLauncher] Browser process closed; "
                 f"pid={pid}, returncode={normalized_returncode}, "
-                f"status={status}, reason={reason}"
+                f"status={status}, reason={cleanup_reason}"
             )
         except Exception as e:
             result = {
                 "status": "failed",
-                "reason": reason,
+                "reason": cleanup_reason,
                 "pid": pid,
                 "returncode": self._process_returncode(process),
                 "error": f"{type(e).__name__}: {e}",
@@ -534,7 +583,8 @@ class BrowserLauncher:
                 self.last_cleanup_result = result
             utils.logger.warning(
                 "[BrowserLauncher] Error closing browser process; "
-                f"pid={pid}, reason={reason}, error={type(e).__name__}: {e}"
+                f"pid={pid}, reason={cleanup_reason}, "
+                f"error={type(e).__name__}: {e}"
             )
         finally:
             with self._state_lock:

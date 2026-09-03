@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import subprocess
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -143,6 +144,152 @@ def test_launcher_rejects_a_second_call_while_popen_is_in_progress(
 
     assert launcher.launch_browser("/fake/chrome", 9444) is process
     assert launcher.browser_process is process
+    assert popen.call_count == 1
+
+
+def test_cleanup_during_popen_is_latched_and_launch_never_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = BrowserLauncher()
+    launcher.system = "Darwin"
+    process = FakeProcess(pid=5353, wait_results=[-15])
+    popen_entered = threading.Barrier(2)
+    release_popen = threading.Barrier(2)
+    returned: list[FakeProcess] = []
+    errors: list[BaseException] = []
+
+    def blocked_popen(*_args, **_kwargs):
+        popen_entered.wait(timeout=2)
+        release_popen.wait(timeout=2)
+        return process
+
+    popen = MagicMock(side_effect=blocked_popen)
+    killpg = MagicMock()
+    monkeypatch.setattr("tools.browser_launcher.subprocess.Popen", popen)
+    monkeypatch.setattr("tools.browser_launcher.os.getpgid", lambda _pid: 5353)
+    monkeypatch.setattr("tools.browser_launcher.os.killpg", killpg)
+
+    def launch() -> None:
+        try:
+            returned.append(launcher.launch_browser("/fake/chrome", 9444))
+        except BaseException as exc:
+            errors.append(exc)
+
+    launch_thread = threading.Thread(target=launch)
+    launch_thread.start()
+    popen_entered.wait(timeout=2)
+
+    pending = launcher.cleanup(reason="signal_15")
+
+    assert pending == {
+        "status": "pending_launch",
+        "reason": "signal_15",
+        "pid": None,
+        "returncode": None,
+    }
+    assert launcher.cleanup_requested is True
+    assert launcher.browser_process is None
+
+    release_popen.wait(timeout=2)
+    launch_thread.join(timeout=2)
+
+    assert not launch_thread.is_alive()
+    assert returned == []
+    assert len(errors) == 1
+    assert str(errors[0]) == (
+        "browser_process_cleanup_requested_during_launch:"
+        "reason=signal_15:status=terminated:pid=5353"
+    )
+    assert launcher.browser_process is None
+    assert launcher.last_cleanup_result["status"] == "terminated"
+    assert launcher.last_cleanup_result["reason"] == "signal_15"
+    killpg.assert_called_once_with(5353, signal.SIGTERM)
+
+    repeated = launcher.cleanup(reason="duplicate_cleanup")
+
+    assert repeated == launcher.last_cleanup_result
+    assert repeated["reason"] == "signal_15"
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"^browser_process_cleanup_already_requested:"
+            r"reason=signal_15$"
+        ),
+    ):
+        launcher.launch_browser("/fake/chrome", 9555)
+    assert popen.call_count == 1
+
+
+def test_cleanup_during_failing_popen_keeps_stable_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = BrowserLauncher()
+    popen_entered = threading.Barrier(2)
+    release_popen = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def failing_popen(*_args, **_kwargs):
+        popen_entered.wait(timeout=2)
+        release_popen.wait(timeout=2)
+        raise OSError("popen failed")
+
+    popen = MagicMock(side_effect=failing_popen)
+    monkeypatch.setattr("tools.browser_launcher.subprocess.Popen", popen)
+
+    def launch() -> None:
+        try:
+            launcher.launch_browser("/fake/chrome", 9444)
+        except BaseException as exc:
+            errors.append(exc)
+
+    launch_thread = threading.Thread(target=launch)
+    launch_thread.start()
+    popen_entered.wait(timeout=2)
+    pending = launcher.cleanup(reason="signal_2")
+    release_popen.wait(timeout=2)
+    launch_thread.join(timeout=2)
+
+    assert not launch_thread.is_alive()
+    assert pending["status"] == "pending_launch"
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert str(errors[0]) == "popen failed"
+    assert launcher.browser_process is None
+    assert launcher.last_cleanup_result == {
+        "status": "launch_failed",
+        "reason": "signal_2",
+        "pid": None,
+        "returncode": None,
+        "error": "OSError: popen failed",
+    }
+
+    repeated = launcher.cleanup(reason="duplicate_cleanup")
+
+    assert repeated == launcher.last_cleanup_result
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"^browser_process_cleanup_already_requested:"
+            r"reason=signal_2$"
+        ),
+    ):
+        launcher.launch_browser("/fake/chrome", 9555)
+    assert popen.call_count == 1
+
+
+def test_popen_failure_consumes_the_only_launch_attempt(monkeypatch) -> None:
+    launcher = BrowserLauncher()
+    popen = MagicMock(side_effect=OSError("popen failed"))
+    monkeypatch.setattr("tools.browser_launcher.subprocess.Popen", popen)
+
+    with pytest.raises(OSError, match="popen failed"):
+        launcher.launch_browser("/fake/chrome", 9444)
+    with pytest.raises(
+        RuntimeError,
+        match=r"^browser_process_launch_already_attempted$",
+    ):
+        launcher.launch_browser("/fake/chrome", 9555)
+
     assert popen.call_count == 1
 
 
