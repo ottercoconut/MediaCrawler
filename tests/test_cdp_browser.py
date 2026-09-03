@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -145,3 +146,143 @@ async def test_failed_cdp_launch_is_force_cleaned_once_by_owning_manager(
     manager._register_cleanup_handlers.assert_called_once_with()
     manager.cleanup.assert_awaited_once_with(force=True)
     manager._create_browser_context.assert_not_awaited()
+
+
+def _ready_cdp_launch_manager(monkeypatch: pytest.MonkeyPatch) -> CDPBrowserManager:
+    manager = CDPBrowserManager()
+    manager.debug_port = 9444
+    manager.launcher.launch_browser = MagicMock(return_value=object())
+    manager.launcher.wait_for_browser_ready = MagicMock(return_value=True)
+    manager._test_cdp_connection = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    manager._clean_session_restore_tabs = MagicMock()  # type: ignore[method-assign]
+    monkeypatch.setattr("tools.cdp_browser.asyncio.sleep", AsyncMock())
+    return manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("save_login_state", [True, False])
+async def test_xhs_cdp_launch_always_uses_the_run_scoped_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    save_login_state: bool,
+) -> None:
+    profile_dir = tmp_path / "empty-run-profile"
+    profile_dir.mkdir()
+    monkeypatch.setattr(config, "PLATFORM", "xhs")
+    monkeypatch.setattr(config, "SAVE_LOGIN_STATE", save_login_state)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", str(profile_dir))
+    manager = _ready_cdp_launch_manager(monkeypatch)
+
+    await manager._launch_browser("/fake/chrome", False)
+
+    manager.launcher.launch_browser.assert_called_once_with(
+        browser_path="/fake/chrome",
+        debug_port=9444,
+        headless=False,
+        user_data_dir=str(profile_dir),
+    )
+    manager._clean_session_restore_tabs.assert_called_once_with(str(profile_dir))
+    manager.launcher.wait_for_browser_ready.assert_called_once_with(
+        9444,
+        config.BROWSER_LAUNCH_TIMEOUT,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("save_login_state", [True, False])
+@pytest.mark.parametrize("profile_value", [None, "", " \t "])
+async def test_xhs_cdp_launch_rejects_missing_profile_before_chrome(
+    monkeypatch: pytest.MonkeyPatch,
+    save_login_state: bool,
+    profile_value: str | None,
+) -> None:
+    monkeypatch.setattr(config, "PLATFORM", "xhs")
+    monkeypatch.setattr(config, "SAVE_LOGIN_STATE", save_login_state)
+    if profile_value is None:
+        monkeypatch.delenv("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", raising=False)
+    else:
+        monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", profile_value)
+    manager = _ready_cdp_launch_manager(monkeypatch)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^XHS requires TRIPPOSTCOLLECT_XHS_PROFILE_DIR from xhs_runner.py$",
+    ):
+        await manager._launch_browser("/fake/chrome", False)
+
+    manager.launcher.launch_browser.assert_not_called()
+    manager.launcher.wait_for_browser_ready.assert_not_called()
+    manager._test_cdp_connection.assert_not_awaited()
+    manager._clean_session_restore_tabs.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("save_login_state", "expected_profile"),
+    [
+        (False, None),
+        (True, "browser_data/cdp_zhihu_user_data_dir"),
+    ],
+)
+async def test_non_xhs_cdp_profile_behavior_is_unchanged_and_ignores_xhs_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    save_login_state: bool,
+    expected_profile: str | None,
+) -> None:
+    xhs_only_path = tmp_path / "must-not-be-used"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "PLATFORM", "zhihu")
+    monkeypatch.setattr(config, "SAVE_LOGIN_STATE", save_login_state)
+    monkeypatch.setattr(config, "USER_DATA_DIR", "%s_user_data_dir")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", str(xhs_only_path))
+    monkeypatch.delenv("TRIPPOSTCOLLECT_SHARE_CDP_PROFILE", raising=False)
+    manager = _ready_cdp_launch_manager(monkeypatch)
+
+    await manager._launch_browser("/fake/chrome", True)
+
+    resolved_profile = (
+        str(tmp_path / expected_profile) if expected_profile is not None else None
+    )
+    manager.launcher.launch_browser.assert_called_once_with(
+        browser_path="/fake/chrome",
+        debug_port=9444,
+        headless=True,
+        user_data_dir=resolved_profile,
+    )
+    assert not xhs_only_path.exists()
+    if resolved_profile is None:
+        manager._clean_session_restore_tabs.assert_not_called()
+    else:
+        manager._clean_session_restore_tabs.assert_called_once_with(
+            resolved_profile
+        )
+
+
+@pytest.mark.asyncio
+async def test_xhs_cdp_rejects_existing_browser_without_a_retry_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "empty-run-profile"
+    profile_dir.mkdir()
+    monkeypatch.setattr(config, "PLATFORM", "xhs")
+    monkeypatch.setattr(config, "CDP_CONNECT_EXISTING", True)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", str(profile_dir))
+    manager = CDPBrowserManager()
+    manager._connect_existing_browser = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("XHS must not attach to an unrelated profile")
+    )
+    manager._get_browser_path = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("forbidden mode must not launch Chrome")
+    )
+    manager.cleanup = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="^xhs_cdp_connect_existing_forbidden$"):
+        await manager.launch_and_connect(MagicMock())
+    with pytest.raises(RuntimeError, match="^cdp_browser_manager_already_started$"):
+        await manager.launch_and_connect(MagicMock())
+
+    manager._connect_existing_browser.assert_not_awaited()
+    manager._get_browser_path.assert_not_awaited()
+    manager.cleanup.assert_awaited_once_with(force=True)

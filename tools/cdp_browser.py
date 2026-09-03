@@ -312,6 +312,8 @@ class CDPBrowserManager:
             self._launch_started = True
             self._owns_browser_process = not config.CDP_CONNECT_EXISTING
         try:
+            if config.PLATFORM == "xhs" and config.CDP_CONNECT_EXISTING:
+                raise RuntimeError("xhs_cdp_connect_existing_forbidden")
             if config.CDP_CONNECT_EXISTING:
                 # Connect to an existing browser that already has remote debugging enabled
                 return await self._connect_existing_browser(playwright, playwright_proxy, user_agent)
@@ -499,23 +501,27 @@ class CDPBrowserManager:
         """
         Launch browser process
         """
-        # Set user data directory (if save login state is enabled)
-        user_data_dir = None
-        if config.SAVE_LOGIN_STATE:
+        # XHS formal runs always use the run-scoped empty profile supplied by
+        # xhs_runner.  SAVE_LOGIN_STATE is a generic cross-run persistence
+        # switch and must never be allowed to detach XHS from that profile.
+        if config.PLATFORM == "xhs":
             explicit_profile = os.environ.get("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", "").strip()
-            if config.PLATFORM == "xhs" and not explicit_profile:
+            if not explicit_profile:
                 raise RuntimeError("XHS requires TRIPPOSTCOLLECT_XHS_PROFILE_DIR from xhs_runner.py")
-            if config.PLATFORM == "xhs":
-                user_data_dir = os.path.abspath(os.path.expanduser(explicit_profile))
-            else:
-                profile_name = config.USER_DATA_DIR % config.PLATFORM
-                if not os.environ.get("TRIPPOSTCOLLECT_SHARE_CDP_PROFILE"):
-                    profile_name = f"cdp_{profile_name}"
-                user_data_dir = os.path.join(
-                    os.getcwd(),
-                    "browser_data",
-                    profile_name,
-                )
+            user_data_dir = os.path.abspath(os.path.expanduser(explicit_profile))
+        elif config.SAVE_LOGIN_STATE:
+            profile_name = config.USER_DATA_DIR % config.PLATFORM
+            if not os.environ.get("TRIPPOSTCOLLECT_SHARE_CDP_PROFILE"):
+                profile_name = f"cdp_{profile_name}"
+            user_data_dir = os.path.join(
+                os.getcwd(),
+                "browser_data",
+                profile_name,
+            )
+        else:
+            user_data_dir = None
+
+        if user_data_dir is not None:
             os.makedirs(user_data_dir, exist_ok=True)
             utils.logger.info(f"[CDPBrowserManager] User data directory: {user_data_dir}")
             self._clean_session_restore_tabs(user_data_dir)

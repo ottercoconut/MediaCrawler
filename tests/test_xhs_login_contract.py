@@ -168,6 +168,88 @@ def test_current_qrcode_contract_and_temporary_profile_remain_supported(
     assert XiaoHongShuCrawler._profile_dir() == str(profile_dir)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("save_login_state", [True, False])
+async def test_standard_xhs_launch_always_uses_the_run_scoped_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    save_login_state: bool,
+) -> None:
+    profile_dir = tmp_path / "empty-run-profile"
+    profile_dir.mkdir()
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", str(profile_dir))
+    monkeypatch.setattr(
+        xhs_core.config,
+        "SAVE_LOGIN_STATE",
+        save_login_state,
+    )
+    context = object()
+    chromium = SimpleNamespace(
+        launch_persistent_context=AsyncMock(return_value=context),
+        launch=AsyncMock(
+            side_effect=AssertionError("XHS must not launch a profile-less browser")
+        ),
+    )
+
+    crawler = XiaoHongShuCrawler()
+    result = await crawler.launch_browser(
+        chromium,
+        {"server": "http://proxy.invalid"},
+        "XHS test agent",
+        headless=False,
+    )
+
+    assert result is context
+    chromium.launch_persistent_context.assert_awaited_once()
+    launch_kwargs = chromium.launch_persistent_context.await_args.kwargs
+    assert launch_kwargs["user_data_dir"] == str(profile_dir)
+    assert launch_kwargs["headless"] is False
+    assert launch_kwargs["proxy"] == {"server": "http://proxy.invalid"}
+    assert launch_kwargs["user_agent"] == "XHS test agent"
+    chromium.launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("save_login_state", [True, False])
+@pytest.mark.parametrize("profile_value", [None, "", " \t "])
+async def test_standard_xhs_launch_rejects_missing_profile_before_chrome(
+    monkeypatch: pytest.MonkeyPatch,
+    save_login_state: bool,
+    profile_value: str | None,
+) -> None:
+    if profile_value is None:
+        monkeypatch.delenv("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", raising=False)
+    else:
+        monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", profile_value)
+    monkeypatch.setattr(
+        xhs_core.config,
+        "SAVE_LOGIN_STATE",
+        save_login_state,
+    )
+    chromium = SimpleNamespace(
+        launch_persistent_context=AsyncMock(
+            side_effect=AssertionError("missing profile must fail before Chrome")
+        ),
+        launch=AsyncMock(
+            side_effect=AssertionError("missing profile must fail before Chrome")
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^XHS requires TRIPPOSTCOLLECT_XHS_PROFILE_DIR from xhs_runner.py$",
+    ):
+        await XiaoHongShuCrawler().launch_browser(
+            chromium,
+            None,
+            None,
+            headless=False,
+        )
+
+    chromium.launch_persistent_context.assert_not_awaited()
+    chromium.launch.assert_not_awaited()
+
+
 def test_xhs_crawler_has_no_storage_state_compatibility_surface() -> None:
     source = inspect.getsource(XiaoHongShuCrawler)
 
