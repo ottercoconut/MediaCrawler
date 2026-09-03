@@ -82,6 +82,33 @@ from .login import XiaoHongShuLogin
 
 
 XHS_NEW_PAGE_MIN_HOLD_SECONDS = 30.0
+_XHS_MANUAL_CHECKPOINT_TEXTS = (
+    "扫码登录",
+    "二维码",
+    "打开小红书扫一扫",
+    "确认登录",
+    "登录确认",
+    "手机号登录",
+    "验证码",
+    "请通过验证",
+    "安全验证",
+    "身份验证",
+    "人机验证",
+    "滑块验证",
+    "拖动滑块",
+    "security verification",
+    "sms verification",
+    "parameter error",
+    "captcha",
+    "geetest",
+)
+_XHS_MANUAL_CHECKPOINT_SELECTORS = (
+    "img.qrcode-img",
+    "input[placeholder*='验证码']",
+    "[class*='captcha']",
+    "[class*='geetest']",
+    "iframe[src*='captcha']",
+)
 
 
 class XHSImageDownloadError(RuntimeError):
@@ -1240,6 +1267,110 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
         )
 
+    async def _popup_checkpoint_state(self, page: Page) -> Dict[str, object]:
+        """Classify only visible login, verification, and terminal evidence."""
+        if self._page_is_closed(page):
+            return {
+                "closed": True,
+                "visible_text": "",
+                "visible_markers": {},
+                "manual_markers": [],
+                "terminal": "",
+            }
+
+        visible_text = ""
+        visible_markers: Dict[str, bool] = {}
+        try:
+            visible_text, visible_markers = await inspect_visible_page_state(page)
+        except Exception:
+            try:
+                locator = getattr(page, "locator", None)
+                if callable(locator):
+                    visible_text = await locator("body").inner_text(timeout=2_000)
+                else:
+                    visible_text = await page.content()
+            except Exception:
+                visible_text = ""
+            visible_text = " ".join(str(visible_text).split())[:2_000]
+
+        selector_markers: List[str] = []
+        locator = getattr(page, "locator", None)
+        if callable(locator):
+            for selector in _XHS_MANUAL_CHECKPOINT_SELECTORS:
+                try:
+                    candidate = locator(selector)
+                    first = getattr(candidate, "first", candidate)
+                    if await first.is_visible(timeout=250):
+                        selector_markers.append(selector)
+                except Exception:
+                    continue
+
+        normalized = str(visible_text or "")
+        lowered = normalized.casefold()
+        text_markers = sorted(
+            {
+                marker
+                for marker in _XHS_MANUAL_CHECKPOINT_TEXTS
+                if marker.casefold() in lowered
+            }
+        )
+        manual_markers = sorted(set(text_markers) | set(selector_markers))
+        if visible_markers.get("captcha_or_verify"):
+            manual_markers.append("captcha_or_verify")
+        if visible_markers.get("login_required"):
+            manual_markers.append("login_required")
+        manual_markers = sorted(set(manual_markers))
+
+        terminal = ""
+        if visible_markers.get("platform_security_limit"):
+            terminal = "platform_security_limit_300011"
+        elif visible_markers.get("rate_limited"):
+            terminal = "rate_limited"
+        elif visible_markers.get("blocked"):
+            terminal = "blocked"
+
+        if re.search(
+            r"安全限制|账号异常|account exception|\b300011\b",
+            normalized,
+            re.I,
+        ):
+            terminal = "platform_security_limit_300011"
+        elif re.search(
+            r"访问(?:过于)?频繁|请求(?:过于)?频繁|操作频繁|"
+            r"too many requests|rate limit|requests? (?:are )?too frequent",
+            normalized,
+            re.I,
+        ):
+            terminal = "rate_limited"
+        elif re.search(r"拒绝访问|access denied|forbidden|访问受限", normalized, re.I):
+            terminal = "blocked"
+
+        page_url = str(getattr(page, "url", "") or "")
+        if "/website-login/error" in page_url:
+            terminal = "platform_security_limit_300011"
+
+        return {
+            "closed": False,
+            "url": page_url,
+            "visible_text": normalized[:360],
+            "visible_markers": visible_markers,
+            "manual_markers": manual_markers,
+            "terminal": terminal,
+        }
+
+    @staticmethod
+    def _raise_for_terminal_popup_state(
+        state: Dict[str, object],
+        *,
+        reason: str,
+    ) -> None:
+        terminal = str(state.get("terminal") or "")
+        if not terminal:
+            return
+        if terminal == "platform_security_limit_300011":
+            raise RuntimeError("xhs_platform_security_limit_300011")
+        raise RuntimeError(f"xhs_{terminal}_during_page_guard:{reason}")
+
     async def _wait_for_midrun_login_recovery(self, keyword: str) -> bool:
         """Keep the headed browser open while the operator restores an expired login."""
         wait_seconds = self._env_int("TRIPPOSTCOLLECT_XHS_LOGIN_WAIT_SECONDS", 0)
@@ -1256,26 +1387,40 @@ class XiaoHongShuCrawler(AbstractCrawler):
             await self.context_page.bring_to_front()
         except Exception:
             pass
-        try:
-            await self.context_page.reload(wait_until="domcontentloaded", timeout=30_000)
-        except Exception as exc:
-            utils.logger.warning(
-                "[XiaoHongShuCrawler] Could not refresh the visible page before "
-                f"manual login recovery; leaving it open: {type(exc).__name__}: {exc}"
-            )
 
-        started = time.monotonic()
+        started = self._popup_monotonic()
         last_print = 0.0
         last_pong = -10.0
-        while time.monotonic() - started < wait_seconds:
+        manual_latched = False
+        clear_observations = 0
+        while self._popup_monotonic() - started < wait_seconds:
             await self._activate_latest_xhs_page()
             try:
                 await self.context_page.bring_to_front()
             except Exception:
                 pass
 
-            elapsed = time.monotonic() - started
-            profile_ui = await self._profile_ui_visible()
+            state = await self._popup_checkpoint_state(self.context_page)
+            self._raise_for_terminal_popup_state(
+                state,
+                reason="midrun_login_recovery",
+            )
+            manual_markers = list(state.get("manual_markers") or [])
+            visible_text = str(state.get("visible_text") or "").strip()
+            if manual_markers:
+                manual_latched = True
+                clear_observations = 0
+            elif manual_latched:
+                # A blank/loading DOM is not evidence that an SMS or CAPTCHA
+                # flow completed. Require two consecutive rendered, clear
+                # observations before probing the apparently signed-in shell.
+                clear_observations = clear_observations + 1 if visible_text else 0
+
+            elapsed = self._popup_monotonic() - started
+            session_probe_allowed = not manual_latched or clear_observations >= 2
+            profile_ui = (
+                await self._profile_ui_visible() if session_probe_allowed else False
+            )
             if profile_ui and elapsed - last_pong >= 5.0:
                 last_pong = elapsed
                 await self.xhs_client.update_cookies(
@@ -1283,6 +1428,21 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     urls=self.cookie_urls,
                 )
                 if await self.xhs_client.pong():
+                    confirmed_state = await self._popup_checkpoint_state(
+                        self.context_page
+                    )
+                    self._raise_for_terminal_popup_state(
+                        confirmed_state,
+                        reason="midrun_login_recovery_confirmation",
+                    )
+                    if confirmed_state.get("manual_markers") or not str(
+                        confirmed_state.get("visible_text") or ""
+                    ).strip():
+                        if confirmed_state.get("manual_markers"):
+                            manual_latched = True
+                        clear_observations = 0
+                        await self._popup_sleep(2.0)
+                        continue
                     search_url = f"{self.index_url}/search_result?keyword={quote(keyword)}"
                     await self._goto_with_deadline(
                         self.context_page,
@@ -1293,7 +1453,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         browser_context=self.browser_context,
                         urls=self.cookie_urls,
                     )
-                    await self._write_storage_state()
                     utils.logger.info(
                         "[XiaoHongShuCrawler] Mid-run login recovery confirmed; "
                         "retrying the same search page."
@@ -1301,13 +1460,17 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     return True
 
             if elapsed - last_print >= 10.0:
-                checkpoint_markers = await self._visible_checkpoint_markers()
                 utils.logger.info(
                     "[XiaoHongShuCrawler] Waiting for mid-run Xiaohongshu login "
-                    f"recovery: profile_ui={profile_ui}, visible={checkpoint_markers}"
+                    f"recovery: profile_ui={profile_ui}, "
+                    f"manual_latched={manual_latched}, "
+                    f"clear_observations={clear_observations}, "
+                    f"visible={manual_markers}"
                 )
                 last_print = elapsed
-            await asyncio.sleep(2)
+            remaining = wait_seconds - (self._popup_monotonic() - started)
+            if remaining > 0:
+                await self._popup_sleep(min(2.0, remaining))
 
         utils.logger.error(
             "[XiaoHongShuCrawler] Mid-run login/security verification timed out; "
