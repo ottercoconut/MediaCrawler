@@ -1201,31 +1201,25 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 raise RuntimeError("xhs_replacement_page_session_not_confirmed")
 
     async def _single_page_for_login(self) -> Page:
-        """Keep exactly one tab open until the login checkpoint has succeeded."""
+        """Select a login tab without closing any verification companion tab."""
         try:
             pages = [page for page in self.browser_context.pages if not page.is_closed()]
-        except Exception:
-            pages = []
+        except Exception as exc:
+            raise RuntimeError("xhs_login_browser_context_unavailable") from exc
+
+        if not pages:
+            raise RuntimeError("xhs_login_browser_pages_closed")
 
         current_page = getattr(self, "context_page", None)
         page = (
             current_page
             if current_page in pages
-            else (pages[0] if pages else await self._new_guarded_page())
+            else pages[-1]
         )
-        closed_count = 0
-        for other_page in pages:
-            if other_page is page:
-                continue
-            await self._close_page_with_deadline(
-                other_page,
-                reason="login_tab_normalization",
-            )
-            closed_count += 1
-        if closed_count:
+        if len(pages) > 1:
             utils.logger.info(
-                "[XiaoHongShuCrawler] Login stage retained one tab and closed "
-                f"{closed_count} stale tab(s)."
+                "[XiaoHongShuCrawler] Login stage is preserving all current "
+                f"BrowserContext tabs: {len(pages)} open tab(s)."
             )
         self.context_page = page
         return page

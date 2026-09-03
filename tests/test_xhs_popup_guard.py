@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -70,7 +70,7 @@ def install_fake_clock(crawler: XiaoHongShuCrawler, events: list[tuple[str, obje
 
 
 @pytest.mark.asyncio
-async def test_unexpected_xhs_tab_waits_30_seconds_before_login_cleanup() -> None:
+async def test_unexpected_xhs_tab_is_held_and_preserved_for_login() -> None:
     events: list[tuple[str, object]] = []
     primary = FakePage("search", events)
     popup = FakePage("security-popup", events)
@@ -83,13 +83,14 @@ async def test_unexpected_xhs_tab_waits_30_seconds_before_login_cleanup() -> Non
 
     context.emit_page(popup)
     selected = await crawler._single_page_for_login()
+    await asyncio.sleep(0)
 
     assert selected is primary
-    assert popup.closed is True
+    assert popup.closed is False
     assert events[0] == ("front", "security-popup")
     assert events[1][0] == "sleep"
     assert events[1][1] == pytest.approx(30.0)
-    assert events[2] == ("close", "security-popup")
+    assert len(events) == 2
 
 
 @pytest.mark.asyncio
@@ -105,13 +106,14 @@ async def test_extra_tab_present_at_guard_install_is_also_protected() -> None:
 
     crawler._install_new_page_guard()
     await crawler._single_page_for_login()
+    await asyncio.sleep(0)
 
     assert crawler._new_pages[id(popup)][2] == "preexisting_extra"
     assert events == [
         ("front", "startup-security-popup"),
         ("sleep", pytest.approx(30.0)),
-        ("close", "startup-security-popup"),
     ]
+    assert popup.closed is False
 
 
 @pytest.mark.asyncio
@@ -214,7 +216,7 @@ async def test_xhs_behavior_adopts_replacement_page_after_target_closed(
 
 
 @pytest.mark.asyncio
-async def test_standalone_xhs_login_waits_before_closing_extra_tab(
+async def test_standalone_xhs_login_preserves_extra_verification_tab(
     monkeypatch,
 ) -> None:
     events: list[tuple[str, object]] = []
@@ -235,11 +237,26 @@ async def test_standalone_xhs_login_waits_before_closing_extra_tab(
     selected = await login._single_login_page()
 
     assert selected is primary
-    assert events == [
-        ("front", "verification"),
-        ("sleep", 30),
-        ("close", "verification"),
-    ]
+    assert events == []
+    assert popup.is_closed() is False
+
+
+@pytest.mark.asyncio
+async def test_crawler_login_selection_does_not_replace_closed_pages() -> None:
+    events: list[tuple[str, object]] = []
+    closed = FakePage("closed", events)
+    closed.closed = True
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = FakeContext([closed], events)
+    crawler.context_page = closed
+    crawler._new_guarded_page = AsyncMock(
+        side_effect=AssertionError("must not create a replacement login page")
+    )
+
+    with pytest.raises(RuntimeError, match="xhs_login_browser_pages_closed"):
+        await crawler._single_page_for_login()
+
+    crawler._new_guarded_page.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -247,18 +264,21 @@ async def test_standalone_xhs_login_stops_on_platform_security_limit() -> None:
     class SecurityLimitPage:
         url = "https://www.xiaohongshu.com/website-login/error"
 
+        def is_closed(self) -> bool:
+            return False
+
         async def is_visible(self, selector: str, timeout: int) -> bool:
             return True
 
         async def content(self) -> str:
             return ""
 
+    page = SecurityLimitPage()
     login = XiaoHongShuLogin(
         login_type="qrcode",
-        browser_context=object(),
-        context_page=SecurityLimitPage(),
+        browser_context=SimpleNamespace(pages=[page]),
+        context_page=page,
     )
-    login._single_login_page = AsyncMock(return_value=login.context_page)
 
     with pytest.raises(RuntimeError, match="xhs_platform_security_limit_300011"):
         await login._check_login_state_once("")

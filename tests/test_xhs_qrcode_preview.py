@@ -14,6 +14,17 @@ class FakeContext:
         return [{"name": "web_session", "value": "before"}]
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class ImmediateFuture:
     def __init__(self, error: BaseException | None = None) -> None:
         self.error = error
@@ -38,15 +49,41 @@ def make_login() -> tuple[XiaoHongShuLogin, SimpleNamespace]:
 
 def configure_qrcode_flow(
     monkeypatch: pytest.MonkeyPatch,
+    login: XiaoHongShuLogin,
     *,
-    attempts: int,
+    wait_seconds: int,
 ) -> tuple[AsyncMock, MagicMock]:
+    clock = FakeClock()
     find_qrcode = AsyncMock(return_value="qr-image")
     show_qrcode = MagicMock()
     monkeypatch.setattr(login_module.utils, "find_login_qrcode", find_qrcode)
     monkeypatch.setattr(login_module.utils, "show_qrcode", show_qrcode)
-    monkeypatch.setattr(login_module.asyncio, "sleep", AsyncMock())
-    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_QR_ATTEMPTS", str(attempts))
+    monkeypatch.setattr(login_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(login_module.asyncio, "sleep", clock.sleep)
+    monkeypatch.setenv(
+        "TRIPPOSTCOLLECT_XHS_LOGIN_WAIT_SECONDS",
+        str(wait_seconds),
+    )
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_QR_REFRESH_SECONDS", "180")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_LOGIN_POLL_SECONDS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_STABLE_LOGIN_SECONDS", "5")
+
+    def observe_qr() -> dict[str, object]:
+        return {
+            "terminal_security": [],
+            "terminal_login_error": [],
+            "manual_in_progress": False,
+            "profile_visible": False,
+            "qr_visible": True,
+            "qr_expired": False,
+            "pages": [{"login_or_qr": ["扫码登录"]}],
+        }
+
+    async def check_login_state(_session: str) -> bool:
+        login._last_login_observation = observe_qr()
+        return False
+
+    login._check_login_state_once = AsyncMock(side_effect=check_login_state)
     return find_qrcode, show_qrcode
 
 
@@ -65,8 +102,11 @@ async def test_headed_qrcode_never_schedules_initial_or_refreshed_preview(
     playwright_headless: bool,
 ) -> None:
     login, page = make_login()
-    find_qrcode, show_qrcode = configure_qrcode_flow(monkeypatch, attempts=2)
-    login.wait_login_state = AsyncMock(side_effect=[False, True])
+    find_qrcode, show_qrcode = configure_qrcode_flow(
+        monkeypatch,
+        login,
+        wait_seconds=182,
+    )
     monkeypatch.setattr(login_module.config, "ENABLE_CDP_MODE", enable_cdp)
     monkeypatch.setattr(login_module.config, "CDP_HEADLESS", cdp_headless)
     monkeypatch.setattr(login_module.config, "HEADLESS", playwright_headless)
@@ -79,10 +119,10 @@ async def test_headed_qrcode_never_schedules_initial_or_refreshed_preview(
         lambda: SimpleNamespace(run_in_executor=run_in_executor),
     )
 
-    await login.login_by_qrcode()
+    with pytest.raises(RuntimeError, match="within 182s"):
+        await login.login_by_qrcode()
 
     assert find_qrcode.await_count == 2
-    assert login.wait_login_state.await_count == 2
     assert page.reload.await_args_list == [
         call(wait_until="domcontentloaded", timeout=30_000)
     ]
@@ -105,8 +145,11 @@ async def test_headless_qrcode_still_schedules_required_preview(
     playwright_headless: bool,
 ) -> None:
     login, page = make_login()
-    find_qrcode, show_qrcode = configure_qrcode_flow(monkeypatch, attempts=1)
-    login.wait_login_state = AsyncMock(return_value=True)
+    find_qrcode, show_qrcode = configure_qrcode_flow(
+        monkeypatch,
+        login,
+        wait_seconds=2,
+    )
 
     def run_in_executor(*, executor, func):
         assert executor is None
@@ -123,10 +166,10 @@ async def test_headless_qrcode_still_schedules_required_preview(
         lambda: SimpleNamespace(run_in_executor=executor),
     )
 
-    await login.login_by_qrcode()
+    with pytest.raises(RuntimeError, match="within 2s"):
+        await login.login_by_qrcode()
 
     find_qrcode.assert_awaited_once()
-    login.wait_login_state.assert_awaited_once()
     page.reload.assert_not_awaited()
     executor.assert_called_once()
     show_qrcode.assert_called_once_with("qr-image")
@@ -137,9 +180,12 @@ async def test_headless_preview_failure_does_not_restart_or_abort_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     login, page = make_login()
-    find_qrcode, show_qrcode = configure_qrcode_flow(monkeypatch, attempts=1)
+    find_qrcode, show_qrcode = configure_qrcode_flow(
+        monkeypatch,
+        login,
+        wait_seconds=2,
+    )
     show_qrcode.side_effect = RuntimeError("preview unavailable")
-    login.wait_login_state = AsyncMock(return_value=True)
 
     def run_in_executor(*, executor, func):
         assert executor is None
@@ -159,9 +205,9 @@ async def test_headless_preview_failure_does_not_restart_or_abort_login(
         lambda: SimpleNamespace(run_in_executor=executor),
     )
 
-    await login.login_by_qrcode()
+    with pytest.raises(RuntimeError, match="within 2s"):
+        await login.login_by_qrcode()
 
     find_qrcode.assert_awaited_once()
     show_qrcode.assert_called_once_with("qr-image")
-    login.wait_login_state.assert_awaited_once()
     page.reload.assert_not_awaited()
