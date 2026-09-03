@@ -19,6 +19,7 @@
 
 import asyncio
 import json
+import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 from urllib.parse import quote
 
@@ -55,6 +56,7 @@ from .exception import (
 from .field import SearchNoteType, SearchSortType
 from .help import get_search_id
 from .extractor import XiaoHongShuExtractor
+from .manual_wait import XHSManualWaitBudget
 from .playwright_sign import sign_with_xhshow
 
 
@@ -94,6 +96,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         playwright_page: Page,
         cookie_dict: Dict[str, str],
         proxy_ip_pool: Optional["ProxyIpPool"] = None,
+        manual_wait_budget: Optional[XHSManualWaitBudget] = None,
     ):
         self.proxy = proxy
         self.timeout = timeout
@@ -114,8 +117,16 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
         self._extractor = XiaoHongShuExtractor()
+        self._manual_wait_budget = manual_wait_budget
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
+
+    def _get_manual_wait_budget(self) -> XHSManualWaitBudget:
+        if self._manual_wait_budget is None:
+            self._manual_wait_budget = XHSManualWaitBudget.from_environment(
+                monotonic=lambda: time.monotonic(),
+            )
+        return self._manual_wait_budget
 
     async def _pre_headers(self, url: str, params: Optional[Dict] = None, payload: Optional[Dict] = None) -> Dict:
         """请求头参数签名 (使用 xhshow 纯算法)
@@ -198,12 +209,26 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 "[XiaoHongShuClient.request] API CAPTCHA requires operator verification: "
                 f"Verifytype={verify_type}, Verifyuuid={verify_uuid}, status={response.status_code}"
             )
-            await run_required_api_captcha_verification(
-                self.playwright_page,
-                verify_type=verify_type,
-                verify_uuid=verify_uuid,
-                verify_biz=response.status_code,
-            )
+            budget = self._get_manual_wait_budget()
+            ticket = budget.start("api_captcha_verification")
+            try:
+                try:
+                    await run_required_api_captcha_verification(
+                        self.playwright_page,
+                        verify_type=verify_type,
+                        verify_uuid=verify_uuid,
+                        verify_biz=response.status_code,
+                        timeout_seconds=ticket.remaining_seconds,
+                    )
+                except Exception:
+                    # The shared terminal reason wins whenever the operator
+                    # budget elapsed during CAPTCHA navigation or observation,
+                    # even if the bridge surfaced a different final error.
+                    ticket.raise_if_exhausted()
+                    raise
+                ticket.raise_if_exhausted()
+            finally:
+                ticket.close()
             await self.update_cookies(
                 browser_context=self.playwright_page.context,
                 urls=self.cookie_urls,

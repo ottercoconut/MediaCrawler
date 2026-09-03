@@ -5,6 +5,10 @@ import pytest
 from media_platform.xhs.core import XiaoHongShuCrawler, XHSCreatorProfileUnavailable
 from media_platform.xhs.exception import IPBlockError, PlatformRuntimeError
 from media_platform.xhs.extractor import XiaoHongShuExtractor
+from media_platform.xhs.manual_wait import (
+    XHSManualWaitBudget,
+    XHSManualWaitBudgetExhausted,
+)
 
 
 class _CreatorClient:
@@ -327,7 +331,6 @@ async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
         "media_platform.xhs.core.inspect_visible_page_state",
         inspect_state,
     )
-    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_WAIT_SECONDS", "30")
     monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_POLL_SECONDS", "0")
 
     result = await crawler._get_creator_info_from_browser("author-qr")
@@ -338,6 +341,73 @@ async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
     assert page.content_calls == 1
     assert page.mouse.move_calls == 0
     assert page.mouse.wheel_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_creator_verification_popups_share_one_remaining_budget(
+    crawler,
+    monkeypatch,
+) -> None:
+    clock = {"now": 0.0}
+
+    def monotonic() -> float:
+        return clock["now"]
+
+    async def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    class VerificationPage:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.inspections = 0
+            self.bring_to_front = AsyncMock()
+
+        async def content(self) -> str:
+            return "creator" if self.name == "first" else ""
+
+    class CreatorHtmlClient:
+        @staticmethod
+        def extract_creator_info_from_html(html: str):
+            return {"userId": "first"} if html == "creator" else None
+
+    first = VerificationPage("first")
+    second = VerificationPage("second")
+
+    async def inspect_state(page: VerificationPage):
+        page.inspections += 1
+        verified = page is first and page.inspections >= 2
+        return "", {"captcha_or_verify": not verified}
+
+    crawler._popup_monotonic = monotonic
+    crawler._popup_sleep = sleep
+    crawler._manual_wait_budget = XHSManualWaitBudget(
+        limit_seconds=5.0,
+        monotonic=monotonic,
+    )
+    crawler.xhs_client = CreatorHtmlClient()
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_POLL_SECONDS", "1")
+    monkeypatch.setattr(
+        "media_platform.xhs.core.inspect_visible_page_state",
+        inspect_state,
+    )
+
+    result = await crawler._wait_for_creator_profile_verification(
+        first,
+        "first",
+    )
+    assert result == {"userId": "first"}
+    assert crawler._manual_wait_budget.manual_elapsed_seconds == 1.0
+
+    clock["now"] += 1000.0
+    with pytest.raises(XHSManualWaitBudgetExhausted):
+        await crawler._wait_for_creator_profile_verification(
+            second,
+            "second",
+        )
+
+    assert crawler._manual_wait_budget.manual_elapsed_seconds == 5.0
+    assert first.bring_to_front.await_count == 1
+    assert second.bring_to_front.await_count == 1
 
 
 @pytest.mark.asyncio

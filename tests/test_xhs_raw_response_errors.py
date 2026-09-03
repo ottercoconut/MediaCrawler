@@ -17,6 +17,10 @@ from media_platform.xhs.exception import (
     IPBlockError,
     PlatformRuntimeError,
 )
+from media_platform.xhs.manual_wait import (
+    XHSManualWaitBudget,
+    XHSManualWaitBudgetExhausted,
+)
 
 
 class FakeAsyncClient:
@@ -36,14 +40,26 @@ class FakeAsyncClient:
         return await self.request_impl("GET", *args, **kwargs)
 
 
-def make_client():
+def make_client(*, manual_wait_budget=None):
     client = XiaoHongShuClient(
         headers={"Cookie": "web_session=test; a1=test"},
-        playwright_page=object(),
+        playwright_page=Mock(),
         cookie_dict={},
+        manual_wait_budget=manual_wait_budget,
     )
     client._refresh_proxy_if_expired = AsyncMock()
     return client
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 @pytest.mark.asyncio
@@ -170,6 +186,92 @@ async def test_successful_json_keeps_raw_and_parsed_return_modes(monkeypatch):
     assert json.loads(raw_result) == {"success": True, "data": {"id": "test"}}
     assert parsed_result == {"id": "test"}
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_api_captcha_popups_share_the_crawler_manual_budget(monkeypatch):
+    clock = FakeClock()
+    budget = XHSManualWaitBudget(
+        limit_seconds=10.0,
+        monotonic=clock.monotonic,
+    )
+    client = make_client(manual_wait_budget=budget)
+    client.update_cookies = AsyncMock()
+    verification_timeouts: list[float] = []
+
+    async def request_impl(method, url, **kwargs):
+        return httpx.Response(
+            461,
+            headers={"Verifytype": "216", "Verifyuuid": "uuid"},
+            request=httpx.Request(method, url),
+        )
+
+    async def verify(_page, **kwargs):
+        verification_timeouts.append(kwargs["timeout_seconds"])
+        clock.advance(4.0 if len(verification_timeouts) == 1 else 6.0)
+        return {"status": "completed"}
+
+    monkeypatch.setattr(
+        "media_platform.xhs.client.make_async_client",
+        lambda **kwargs: FakeAsyncClient(request_impl),
+    )
+    monkeypatch.setattr(
+        "media_platform.xhs.client.run_required_api_captcha_verification",
+        verify,
+    )
+    raw_request = XiaoHongShuClient.request.__wrapped__.__wrapped__
+
+    with pytest.raises(DataFetchError, match="retrying the original request"):
+        await raw_request(client, "GET", "https://edith.xiaohongshu.com/api/test")
+
+    assert budget.manual_elapsed_seconds == 4.0
+    assert budget.remaining_seconds == 6.0
+
+    with pytest.raises(XHSManualWaitBudgetExhausted):
+        await raw_request(client, "GET", "https://edith.xiaohongshu.com/api/test")
+
+    assert verification_timeouts == [10.0, 6.0]
+    assert budget.manual_elapsed_seconds == 10.0
+    assert client.update_cookies.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_api_captcha_error_after_budget_boundary_uses_fixed_terminal_reason(
+    monkeypatch,
+):
+    clock = FakeClock()
+    budget = XHSManualWaitBudget(
+        limit_seconds=3.0,
+        monotonic=clock.monotonic,
+    )
+    client = make_client(manual_wait_budget=budget)
+
+    async def request_impl(method, url, **kwargs):
+        return httpx.Response(
+            461,
+            headers={"Verifytype": "216", "Verifyuuid": "uuid"},
+            request=httpx.Request(method, url),
+        )
+
+    async def failed_verification(_page, **_kwargs):
+        clock.advance(3.0)
+        raise RuntimeError("xhs_api_captcha_page_unavailable")
+
+    monkeypatch.setattr(
+        "media_platform.xhs.client.make_async_client",
+        lambda **kwargs: FakeAsyncClient(request_impl),
+    )
+    monkeypatch.setattr(
+        "media_platform.xhs.client.run_required_api_captcha_verification",
+        failed_verification,
+    )
+    raw_request = XiaoHongShuClient.request.__wrapped__.__wrapped__
+
+    with pytest.raises(
+        XHSManualWaitBudgetExhausted,
+        match="^xhs_manual_checkpoint_budget_exhausted$",
+    ):
+        await raw_request(client, "GET", "https://edith.xiaohongshu.com/api/test")
 
 
 @pytest.mark.asyncio

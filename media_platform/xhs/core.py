@@ -83,6 +83,7 @@ from .exception import (
 from .field import SearchSortType
 from .help import parse_note_info_from_note_url, parse_creator_info_from_url, get_search_id
 from .login import XiaoHongShuLogin
+from .manual_wait import XHSManualWaitBudget, XHSManualWaitBudgetExhausted
 
 
 XHS_NEW_PAGE_MIN_HOLD_SECONDS = 30.0
@@ -227,6 +228,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self._navigation_observed_pages: set[int] = set()
         self._navigation_page_errors: List[Dict] = []
         self._navigation_request_failures: List[Dict] = []
+        self._manual_wait_budget: Optional[XHSManualWaitBudget] = None
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -256,6 +258,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
     @staticmethod
     async def _popup_sleep(seconds: float) -> None:
         await asyncio.sleep(seconds)
+
+    def _get_manual_wait_budget(self) -> XHSManualWaitBudget:
+        if self._manual_wait_budget is None:
+            self._manual_wait_budget = XHSManualWaitBudget.from_environment(
+                monotonic=lambda: self._popup_monotonic(),
+            )
+        return self._manual_wait_budget
 
     def _install_new_page_guard(self) -> None:
         """Protect every page appearing after browser launch for at least 30 seconds."""
@@ -1323,46 +1332,53 @@ class XiaoHongShuCrawler(AbstractCrawler):
         await self._activate_latest_xhs_page()
 
     async def _wait_for_manual_checkpoint_if_needed(self) -> bool:
-        wait_seconds = self._env_int("TRIPPOSTCOLLECT_XHS_LOGIN_WAIT_SECONDS", 0)
-        if wait_seconds <= 0:
-            return False
-
-        utils.logger.info(
-            f"[XiaoHongShuCrawler] Login state is not ready; waiting up to {wait_seconds}s "
-            "for visible security/login confirmation ..."
-        )
-        started = time.monotonic()
-        last_print = 0.0
-        while time.monotonic() - started < wait_seconds:
-            await self._single_page_for_login()
-            checkpoint_markers = await self._visible_checkpoint_markers()
-            security_markers = set(checkpoint_markers.get("security") or [])
-            if security_markers.intersection(
-                {"安全限制", "账号异常", "Account exception", "300011", "website-login/error"}
-            ):
-                raise RuntimeError("xhs_platform_security_limit_300011")
-            cookie_markers = await self._cookie_markers()
-            profile_ui = await self._profile_ui_visible()
-            visible_checkpoint = bool(
-                checkpoint_markers.get("security")
-                or checkpoint_markers.get("login_or_qr")
+        budget = self._get_manual_wait_budget()
+        ticket = budget.start("startup_manual_checkpoint")
+        try:
+            utils.logger.info(
+                "[XiaoHongShuCrawler] Login state is not ready; waiting within "
+                f"the shared manual budget ({ticket.remaining_seconds:.1f}s left) "
+                "for visible security/login confirmation ..."
             )
-            if profile_ui and not visible_checkpoint:
-                utils.logger.info(
-                    "[XiaoHongShuCrawler] Login/session markers became ready after manual checkpoint wait: "
-                    f"profile_ui={profile_ui}, cookies={cookie_markers}"
+            last_print = 0.0
+            while True:
+                ticket.raise_if_exhausted()
+                await self._single_page_for_login()
+                checkpoint_markers = await self._visible_checkpoint_markers()
+                security_markers = set(checkpoint_markers.get("security") or [])
+                if security_markers.intersection(
+                    {"安全限制", "账号异常", "Account exception", "300011", "website-login/error"}
+                ):
+                    raise RuntimeError("xhs_platform_security_limit_300011")
+                cookie_markers = await self._cookie_markers()
+                profile_ui = await self._profile_ui_visible()
+                ticket.raise_if_exhausted()
+                visible_checkpoint = bool(
+                    checkpoint_markers.get("security")
+                    or checkpoint_markers.get("login_or_qr")
                 )
-                return True
+                if profile_ui and not visible_checkpoint:
+                    utils.logger.info(
+                        "[XiaoHongShuCrawler] Login/session markers became ready "
+                        "after manual checkpoint wait: "
+                        f"profile_ui={profile_ui}, cookies={cookie_markers}"
+                    )
+                    return True
 
-            now = time.monotonic()
-            if now - last_print >= 10:
-                utils.logger.info(
-                    "[XiaoHongShuCrawler] Waiting for Xiaohongshu checkpoint: "
-                    f"profile_ui={profile_ui}, cookies={cookie_markers}, visible={checkpoint_markers}"
-                )
-                last_print = now
-            await asyncio.sleep(2)
-        return False
+                elapsed = ticket.manual_elapsed_seconds
+                if elapsed - last_print >= 10:
+                    utils.logger.info(
+                        "[XiaoHongShuCrawler] Waiting for Xiaohongshu checkpoint: "
+                        f"profile_ui={profile_ui}, cookies={cookie_markers}, "
+                        f"visible={checkpoint_markers}"
+                    )
+                    last_print = elapsed
+                remaining = ticket.remaining_seconds
+                if remaining <= 0:
+                    ticket.raise_if_exhausted()
+                await self._popup_sleep(min(2.0, remaining))
+        finally:
+            ticket.close()
 
     @staticmethod
     def _request_failure_exception(exc: BaseException) -> BaseException:
@@ -1752,112 +1768,130 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def _wait_for_midrun_login_recovery(self, keyword: str) -> bool:
         """Keep the headed browser open while the operator restores an expired login."""
-        wait_seconds = self._env_int("TRIPPOSTCOLLECT_XHS_LOGIN_WAIT_SECONDS", 0)
-        if wait_seconds <= 0:
-            return False
-
-        utils.logger.warning(
-            "[XiaoHongShuCrawler] Xiaohongshu login expired during search; "
-            f"keeping every browser tab open for up to {wait_seconds}s so the "
-            "operator can complete login/security verification."
-        )
-        await self._activate_latest_xhs_page()
+        budget = self._get_manual_wait_budget()
+        ticket = budget.start("midrun_login_recovery")
+        recovered = False
         try:
-            await self.context_page.bring_to_front()
-        except Exception:
-            pass
-
-        started = self._popup_monotonic()
-        last_print = 0.0
-        last_pong = -10.0
-        manual_latched = False
-        clear_observations = 0
-        while self._popup_monotonic() - started < wait_seconds:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] Xiaohongshu login expired during search; "
+                "keeping every browser tab open within the shared manual budget "
+                f"({ticket.remaining_seconds:.1f}s left) so the operator can "
+                "complete login/security verification."
+            )
             await self._activate_latest_xhs_page()
             try:
                 await self.context_page.bring_to_front()
             except Exception:
                 pass
 
-            state = await self._popup_checkpoint_state(self.context_page)
-            self._raise_for_terminal_popup_state(
-                state,
-                reason="midrun_login_recovery",
-            )
-            manual_markers = list(state.get("manual_markers") or [])
-            visible_text = str(state.get("visible_text") or "").strip()
-            if manual_markers:
-                manual_latched = True
-                clear_observations = 0
-            elif manual_latched:
-                # A blank/loading DOM is not evidence that an SMS or CAPTCHA
-                # flow completed. Require two consecutive rendered, clear
-                # observations before probing the apparently signed-in shell.
-                clear_observations = clear_observations + 1 if visible_text else 0
+            stage_started_elapsed = ticket.manual_elapsed_seconds
+            last_print = 0.0
+            last_pong = stage_started_elapsed - 10.0
+            manual_latched = False
+            clear_observations = 0
+            while True:
+                ticket.raise_if_exhausted()
+                await self._activate_latest_xhs_page()
+                try:
+                    await self.context_page.bring_to_front()
+                except Exception:
+                    pass
 
-            elapsed = self._popup_monotonic() - started
-            session_probe_allowed = not manual_latched or clear_observations >= 2
-            profile_ui = (
-                await self._profile_ui_visible() if session_probe_allowed else False
-            )
-            if profile_ui and elapsed - last_pong >= 5.0:
-                last_pong = elapsed
-                await self.xhs_client.update_cookies(
-                    browser_context=self.browser_context,
-                    urls=self.cookie_urls,
+                state = await self._popup_checkpoint_state(self.context_page)
+                self._raise_for_terminal_popup_state(
+                    state,
+                    reason="midrun_login_recovery",
                 )
-                if await self._pong_with_network_recovery(
-                    stage="midrun_login_confirmation",
-                ):
-                    confirmed_state = await self._popup_checkpoint_state(
-                        self.context_page
+                manual_markers = list(state.get("manual_markers") or [])
+                visible_text = str(state.get("visible_text") or "").strip()
+                if manual_markers:
+                    manual_latched = True
+                    clear_observations = 0
+                elif manual_latched:
+                    # A blank/loading DOM is not evidence that an SMS or CAPTCHA
+                    # flow completed. Require two consecutive rendered, clear
+                    # observations before probing the apparently signed-in shell.
+                    clear_observations = (
+                        clear_observations + 1 if visible_text else 0
                     )
-                    self._raise_for_terminal_popup_state(
-                        confirmed_state,
-                        reason="midrun_login_recovery_confirmation",
-                    )
-                    if confirmed_state.get("manual_markers") or not str(
-                        confirmed_state.get("visible_text") or ""
-                    ).strip():
-                        if confirmed_state.get("manual_markers"):
-                            manual_latched = True
-                        clear_observations = 0
-                        await self._popup_sleep(2.0)
-                        continue
-                    search_url = f"{self.index_url}/search_result?keyword={quote(keyword)}"
-                    await self._goto_with_deadline(
-                        self.context_page,
-                        search_url,
-                        stage="midrun_login_recovered",
-                    )
-                    await self.xhs_client.update_cookies(
-                        browser_context=self.browser_context,
-                        urls=self.cookie_urls,
-                    )
+
+                session_probe_allowed = (
+                    not manual_latched or clear_observations >= 2
+                )
+                profile_ui = (
+                    await self._profile_ui_visible()
+                    if session_probe_allowed
+                    else False
+                )
+                manual_elapsed = ticket.manual_elapsed_seconds
+                stage_elapsed = manual_elapsed - stage_started_elapsed
+                if profile_ui and manual_elapsed - last_pong >= 5.0:
+                    ticket.raise_if_exhausted()
+                    last_pong = manual_elapsed
+                    with ticket.paused():
+                        await self.xhs_client.update_cookies(
+                            browser_context=self.browser_context,
+                            urls=self.cookie_urls,
+                        )
+                        session_ready = await self._pong_with_network_recovery(
+                            stage="midrun_login_confirmation",
+                        )
+                    ticket.raise_if_exhausted()
+                    if session_ready:
+                        confirmed_state = await self._popup_checkpoint_state(
+                            self.context_page
+                        )
+                        self._raise_for_terminal_popup_state(
+                            confirmed_state,
+                            reason="midrun_login_recovery_confirmation",
+                        )
+                        if confirmed_state.get("manual_markers") or not str(
+                            confirmed_state.get("visible_text") or ""
+                        ).strip():
+                            if confirmed_state.get("manual_markers"):
+                                manual_latched = True
+                            clear_observations = 0
+                            remaining = ticket.remaining_seconds
+                            if remaining <= 0:
+                                ticket.raise_if_exhausted()
+                            await self._popup_sleep(min(2.0, remaining))
+                            continue
+                        recovered = True
+                        break
+
+                if stage_elapsed - last_print >= 10.0:
                     utils.logger.info(
-                        "[XiaoHongShuCrawler] Mid-run login recovery confirmed; "
-                        "retrying the same search page."
+                        "[XiaoHongShuCrawler] Waiting for mid-run Xiaohongshu login "
+                        f"recovery: profile_ui={profile_ui}, "
+                        f"manual_latched={manual_latched}, "
+                        f"clear_observations={clear_observations}, "
+                        f"visible={manual_markers}"
                     )
-                    return True
-
-            if elapsed - last_print >= 10.0:
-                utils.logger.info(
-                    "[XiaoHongShuCrawler] Waiting for mid-run Xiaohongshu login "
-                    f"recovery: profile_ui={profile_ui}, "
-                    f"manual_latched={manual_latched}, "
-                    f"clear_observations={clear_observations}, "
-                    f"visible={manual_markers}"
-                )
-                last_print = elapsed
-            remaining = wait_seconds - (self._popup_monotonic() - started)
-            if remaining > 0:
+                    last_print = stage_elapsed
+                remaining = ticket.remaining_seconds
+                if remaining <= 0:
+                    ticket.raise_if_exhausted()
                 await self._popup_sleep(min(2.0, remaining))
+        finally:
+            ticket.close()
 
-        utils.logger.error(
-            "[XiaoHongShuCrawler] Mid-run login/security verification timed out; "
-            "the current source page will remain the recovery frontier."
+        if not recovered:
+            raise RuntimeError("xhs_midrun_login_recovery_incomplete")
+        search_url = f"{self.index_url}/search_result?keyword={quote(keyword)}"
+        await self._goto_with_deadline(
+            self.context_page,
+            search_url,
+            stage="midrun_login_recovered",
         )
-        return False
+        await self.xhs_client.update_cookies(
+            browser_context=self.browser_context,
+            urls=self.cookie_urls,
+        )
+        utils.logger.info(
+            "[XiaoHongShuCrawler] Mid-run login recovery confirmed; "
+            "retrying the same search page."
+        )
+        return True
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -1984,6 +2018,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     cookie_str=config.COOKIES,
                     close_page=self._close_page_with_deadline,
                     new_page=self._new_guarded_page,
+                    manual_wait_budget=self._get_manual_wait_budget(),
                 )
                 await login_obj.begin()
                 await self.xhs_client.update_cookies(
@@ -2490,7 +2525,23 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             )
                             break
                         if self._is_login_expired_failure(exc):
-                            if await self._wait_for_midrun_login_recovery(keyword):
+                            try:
+                                recovered = (
+                                    await self._wait_for_midrun_login_recovery(
+                                        keyword
+                                    )
+                                )
+                            except XHSManualWaitBudgetExhausted as budget_exc:
+                                accumulator.mark_runtime_failed(
+                                    budget_exc.code,
+                                    source_page=requested_page,
+                                    source_cursor=search_id,
+                                    resume_page=requested_page,
+                                    resume_cursor=search_id,
+                                    discovery_phase=discovery_phase,
+                                )
+                                break
+                            if recovered:
                                 continue
                             utils.logger.error(
                                 "[XiaoHongShuCrawler.search] Login remained expired "
@@ -2793,61 +2844,70 @@ class XiaoHongShuCrawler(AbstractCrawler):
         user_id: str,
     ) -> Optional[Dict]:
         """Keep a creator page open until manual login or security verification completes."""
-        timeout_seconds = max(
-            30.0,
-            self._env_float("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_WAIT_SECONDS", 600.0),
-        )
         poll_seconds = max(
             1.0,
             self._env_float("TRIPPOSTCOLLECT_XHS_CREATOR_VERIFY_POLL_SECONDS", 2.0),
         )
-        deadline = time.monotonic() + timeout_seconds
-        await page.bring_to_front()
-        utils.logger.warning(
-            "[XiaoHongShuCrawler] Manual login or security verification required for creator profile; "
-            f"keeping page open for up to {timeout_seconds:.0f}s: {user_id}"
-        )
-
-        while True:
-            if time.monotonic() >= deadline:
-                raise RuntimeError("xhs_creator_profile_verification_timeout")
-
-            text_sample, markers = await inspect_visible_page_state(page)
-            if markers.get("platform_security_limit"):
-                await record_platform_security_limit(
-                    page,
-                    stage=f"creator_profile:{user_id}:verification_wait",
-                    visible_text_sample=text_sample,
-                    visible_markers=markers,
-                )
-                raise PlatformRuntimeError(
-                    "XHS creator profile is blocked by a platform security limit",
-                    code="platform_security_limit_300011",
-                )
-            challenge = next(
-                (
-                    key
-                    for key in ("platform_security_limit", "rate_limited", "blocked")
-                    if markers.get(key)
-                ),
-                "",
+        budget = self._get_manual_wait_budget()
+        ticket = budget.start(f"creator_profile_verification:{user_id}")
+        try:
+            await page.bring_to_front()
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] Manual login or security verification "
+                "required for creator profile; keeping the page open within "
+                f"the shared manual budget ({ticket.remaining_seconds:.1f}s left): "
+                f"{user_id}"
             )
-            if challenge:
-                raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
-            if not markers.get("captcha_or_verify"):
-                html_content = await page.content()
-                creator_info = self.xhs_client.extract_creator_info_from_html(html_content)
-                if creator_info:
-                    utils.logger.info(
-                        "[XiaoHongShuCrawler] Manual creator-profile verification completed: "
-                        f"{user_id}"
+
+            while True:
+                ticket.raise_if_exhausted()
+                text_sample, markers = await inspect_visible_page_state(page)
+                if markers.get("platform_security_limit"):
+                    await record_platform_security_limit(
+                        page,
+                        stage=f"creator_profile:{user_id}:verification_wait",
+                        visible_text_sample=text_sample,
+                        visible_markers=markers,
                     )
-                    return creator_info
+                    raise PlatformRuntimeError(
+                        "XHS creator profile is blocked by a platform security limit",
+                        code="platform_security_limit_300011",
+                    )
+                challenge = next(
+                    (
+                        key
+                        for key in (
+                            "platform_security_limit",
+                            "rate_limited",
+                            "blocked",
+                        )
+                        if markers.get(key)
+                    ),
+                    "",
+                )
+                if challenge:
+                    raise RuntimeError(
+                        f"xhs_creator_profile_visible_block:{challenge}"
+                    )
+                if not markers.get("captcha_or_verify"):
+                    ticket.raise_if_exhausted()
+                    html_content = await page.content()
+                    creator_info = self.xhs_client.extract_creator_info_from_html(
+                        html_content
+                    )
+                    if creator_info:
+                        utils.logger.info(
+                            "[XiaoHongShuCrawler] Manual creator-profile "
+                            f"verification completed: {user_id}"
+                        )
+                        return creator_info
 
-            remaining_seconds = deadline - time.monotonic()
-            await page.wait_for_timeout(
-                int(min(poll_seconds, max(0.1, remaining_seconds)) * 1000)
-            )
+                remaining = ticket.remaining_seconds
+                if remaining <= 0:
+                    ticket.raise_if_exhausted()
+                await self._popup_sleep(min(poll_seconds, remaining))
+        finally:
+            ticket.close()
 
     @staticmethod
     def is_video_note(note_detail: Dict) -> bool:
@@ -3040,6 +3100,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             playwright_page=self.context_page,
             cookie_dict=cookie_dict,
             proxy_ip_pool=self.ip_proxy_pool,  # Pass proxy pool for automatic refresh
+            manual_wait_budget=self._get_manual_wait_budget(),
         )
         return xhs_client_obj
 

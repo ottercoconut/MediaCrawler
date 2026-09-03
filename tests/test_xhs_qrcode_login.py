@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from media_platform.xhs import login as login_module
+from media_platform.xhs.core import XiaoHongShuCrawler
 from media_platform.xhs.login import XiaoHongShuLogin
+from media_platform.xhs.manual_wait import (
+    XHSManualWaitBudget,
+    XHSManualWaitBudgetExhausted,
+)
 
 
 class FakeClock:
@@ -179,10 +185,36 @@ async def test_qrcode_reload_is_clamped_to_at_least_180_seconds(
         refresh_seconds=90,
     )
 
-    with pytest.raises(RuntimeError, match="xhs_qrcode_login_timeout"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert page.reload_times == [pytest.approx(180.0)]
+
+
+@pytest.mark.asyncio
+async def test_zero_budget_is_terminal_before_any_login_page_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    page = FakePage(clock)
+    page.visible_text = "扫码登录"
+    page.visible_selectors.add(XiaoHongShuLogin._QRCODE_SELECTOR)
+    context = FakeContext([page])
+    login = XiaoHongShuLogin(
+        login_type="qrcode",
+        browser_context=context,
+        context_page=page,
+    )
+    configure_virtual_login(monkeypatch, clock, wait_seconds=0)
+
+    with pytest.raises(XHSManualWaitBudgetExhausted):
+        await login.login_by_qrcode()
+
+    assert clock.now == 0.0
+    assert page.reload_times == []
+    assert page.click_times == []
+    assert page.close_calls == 0
+    assert context.new_page_calls == 0
 
 
 @pytest.mark.asyncio
@@ -204,7 +236,7 @@ async def test_visible_verification_latches_and_prevents_later_reload(
 
     clock.on_sleep = advance_state
 
-    with pytest.raises(RuntimeError, match="within 190s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert login._last_login_observation["manual_in_progress"] is True
@@ -222,7 +254,7 @@ async def test_sms_verification_without_error_latches_despite_background_qr(
     login = make_login(page)
     configure_virtual_login(monkeypatch, clock, wait_seconds=181)
 
-    with pytest.raises(RuntimeError, match="within 181s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert login._last_login_observation["manual_in_progress"] is True
@@ -295,7 +327,7 @@ async def test_verification_appearing_at_refresh_boundary_cancels_reload(
 
     page.inner_text_hook = on_inner_text
 
-    with pytest.raises(RuntimeError, match="xhs_qrcode_login_timeout"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert observations_at_boundary >= 2
@@ -337,7 +369,7 @@ async def test_expired_pure_qr_uses_component_refresh_before_reload_floor(
     clock.on_sleep = advance_state
     page.click_hook = refresh_component
 
-    with pytest.raises(RuntimeError, match="within 220s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert page.click_times == [pytest.approx(60.0)]
@@ -364,7 +396,7 @@ async def test_initial_expired_qr_only_clicks_component_refresh(
 
     page.click_hook = refresh_component
 
-    with pytest.raises(RuntimeError, match="within 2s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert page.events == [("click", refresh_selector)]
@@ -404,7 +436,7 @@ async def test_scan_transition_during_expiry_confirmation_cancels_click(
     clock.on_sleep = advance_state
     page.inner_text_hook = transition
 
-    with pytest.raises(RuntimeError, match="within 185s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert expiry_observations >= 2
@@ -437,7 +469,7 @@ async def test_manual_latch_blocks_later_expired_qr_refresh(
 
     clock.on_sleep = advance_state
 
-    with pytest.raises(RuntimeError, match="within 190s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert page.click_times == []
@@ -597,7 +629,7 @@ async def test_transient_page_text_failure_does_not_close_or_reload(
 
     clock.on_sleep = recover_page
 
-    with pytest.raises(RuntimeError, match="within 3s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert login.context_page is page
@@ -606,3 +638,76 @@ async def test_transient_page_text_failure_does_not_close_or_reload(
     assert login._last_login_observation["manual_in_progress"] is True
     assert page.close_calls == 0
     assert page.reload_times == []
+
+
+@pytest.mark.asyncio
+async def test_initial_login_usage_leaves_only_remainder_for_midrun_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    page = FakePage(clock)
+    page.visible_text = "扫码登录"
+    page.visible_selectors.add(XiaoHongShuLogin._QRCODE_SELECTOR)
+    context = FakeContext([page])
+    budget = XHSManualWaitBudget(
+        limit_seconds=10.0,
+        monotonic=clock.monotonic,
+    )
+    login = XiaoHongShuLogin(
+        login_type="qrcode",
+        browser_context=context,
+        context_page=page,
+        manual_wait_budget=budget,
+    )
+    configure_virtual_login(
+        monkeypatch,
+        clock,
+        wait_seconds=600,
+        stable_seconds=3,
+    )
+
+    def finish_scan(now: float) -> None:
+        if now >= 1:
+            page.visible_text = "首页 我"
+            page.visible_selectors.discard(XiaoHongShuLogin._QRCODE_SELECTOR)
+            page.visible_selectors.add(XiaoHongShuLogin._PROFILE_SELECTORS[0])
+
+    clock.on_sleep = finish_scan
+
+    await login.login_by_qrcode()
+
+    assert budget.manual_elapsed_seconds == pytest.approx(4.0)
+    assert budget.remaining_seconds == pytest.approx(6.0)
+
+    crawler = XiaoHongShuCrawler()
+    crawler._manual_wait_budget = budget
+    crawler.context_page = page
+    crawler.browser_context = context
+    crawler.cookie_urls = [crawler.index_url]
+    crawler._popup_monotonic = clock.monotonic
+    crawler._popup_sleep = clock.sleep
+    crawler._activate_latest_xhs_page = AsyncMock()
+    crawler._profile_ui_visible = AsyncMock(return_value=False)
+    crawler._popup_checkpoint_state = AsyncMock(
+        return_value={
+            "closed": False,
+            "visible_text": "SMS Verification",
+            "manual_markers": ["SMS Verification"],
+            "terminal": "",
+        }
+    )
+    crawler.xhs_client = SimpleNamespace(
+        update_cookies=AsyncMock(),
+        pong=AsyncMock(return_value=False),
+    )
+    crawler._goto_with_deadline = AsyncMock()
+
+    with pytest.raises(XHSManualWaitBudgetExhausted):
+        await crawler._wait_for_midrun_login_recovery("青岛旅游")
+
+    assert clock.now == pytest.approx(10.0)
+    assert budget.manual_elapsed_seconds == pytest.approx(10.0)
+    assert page.reload_times == []
+    assert page.close_calls == 0
+    assert context.new_page_calls == 0
+    crawler._goto_with_deadline.assert_not_awaited()

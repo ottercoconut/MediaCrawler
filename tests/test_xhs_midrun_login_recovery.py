@@ -7,6 +7,10 @@ import pytest
 
 import media_platform.xhs.core as xhs_core
 from media_platform.xhs.core import XiaoHongShuCrawler
+from media_platform.xhs.manual_wait import (
+    XHSManualWaitBudget,
+    XHSManualWaitBudgetExhausted,
+)
 
 
 def _state(
@@ -67,7 +71,10 @@ def _crawler(
 
     crawler._popup_monotonic = monotonic
     crawler._popup_sleep = sleep
-    monkeypatch.setattr(crawler, "_env_int", lambda *_args: wait_seconds)
+    crawler._manual_wait_budget = XHSManualWaitBudget(
+        limit_seconds=wait_seconds,
+        monotonic=monotonic,
+    )
     return crawler, page.bring_to_front, goto, sleeps
 
 
@@ -106,9 +113,9 @@ async def test_sms_checkpoint_with_stale_profile_never_probes_or_navigates(
         pong_results=[True],
     )
 
-    recovered = await crawler._wait_for_midrun_login_recovery("青岛太平角旅游")
+    with pytest.raises(XHSManualWaitBudgetExhausted):
+        await crawler._wait_for_midrun_login_recovery("青岛太平角旅游")
 
-    assert recovered is False
     assert crawler._profile_ui_visible.await_count == 0
     assert crawler.xhs_client.pong.await_count == 0
     assert goto.await_count == 0
@@ -181,9 +188,9 @@ async def test_checkpoint_race_after_pong_blocks_navigation(
         pong_results=[True],
     )
 
-    recovered = await crawler._wait_for_midrun_login_recovery("青岛太平角旅游")
+    with pytest.raises(XHSManualWaitBudgetExhausted):
+        await crawler._wait_for_midrun_login_recovery("青岛太平角旅游")
 
-    assert recovered is False
     assert crawler.xhs_client.pong.await_count == 1
     assert goto.await_count == 0
 
@@ -200,9 +207,9 @@ async def test_profile_shell_without_self_info_never_navigates(
         pong_results=[False, False],
     )
 
-    recovered = await crawler._wait_for_midrun_login_recovery("青岛太平角旅游")
+    with pytest.raises(XHSManualWaitBudgetExhausted):
+        await crawler._wait_for_midrun_login_recovery("青岛太平角旅游")
 
-    assert recovered is False
     assert crawler.xhs_client.pong.await_count == 2
     assert goto.await_count == 0
 
@@ -243,3 +250,32 @@ async def test_recovered_session_does_not_hide_navigation_failure(
         await crawler._wait_for_midrun_login_recovery("青岛太平角旅游")
 
     goto.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_midrun_network_confirmation_and_navigation_do_not_use_manual_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler, _foreground, goto, sleeps = _crawler(
+        monkeypatch,
+        [_state(text="signed-in shell")],
+        wait_seconds=6,
+        profile_results=[True],
+    )
+
+    async def delayed_network_confirmation(*, stage: str) -> bool:
+        assert stage == "midrun_login_confirmation"
+        await crawler._popup_sleep(100.0)
+        return True
+
+    async def delayed_navigation(*_args, **_kwargs) -> None:
+        await crawler._popup_sleep(1000.0)
+
+    crawler._pong_with_network_recovery = delayed_network_confirmation
+    goto.side_effect = delayed_navigation
+
+    assert await crawler._wait_for_midrun_login_recovery("青岛太平角旅游")
+
+    assert sleeps == [100.0, 1000.0]
+    assert crawler._manual_wait_budget.manual_elapsed_seconds == 0.0
+    assert crawler._manual_wait_budget.remaining_seconds == 6.0

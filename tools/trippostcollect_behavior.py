@@ -111,6 +111,7 @@ async def run_required_api_captcha_verification(
     verify_type: str,
     verify_uuid: str,
     verify_biz: int,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     if not _enabled():
         raise RuntimeError("required TripPostCollect API captcha verification is disabled")
@@ -124,13 +125,15 @@ async def run_required_api_captcha_verification(
         sys.path.insert(0, scripts_value)
     from mediacrawler_behavior import run_xhs_api_captcha_verification
 
-    return await run_xhs_api_captcha_verification(
-        page,
-        evidence_path=evidence_path,
-        verify_type=verify_type,
-        verify_uuid=verify_uuid,
-        verify_biz=verify_biz,
-    )
+    kwargs: dict[str, Any] = {
+        "evidence_path": evidence_path,
+        "verify_type": verify_type,
+        "verify_uuid": verify_uuid,
+        "verify_biz": verify_biz,
+    }
+    if timeout_seconds is not None:
+        kwargs["timeout_seconds"] = timeout_seconds
+    return await run_xhs_api_captcha_verification(page, **kwargs)
 
 
 async def inspect_visible_page_state(page: Page) -> tuple[str, dict[str, bool]]:

@@ -7,6 +7,7 @@ import pytest
 
 from media_platform.xhs import login as login_module
 from media_platform.xhs.login import XiaoHongShuLogin
+from media_platform.xhs.manual_wait import XHSManualWaitBudgetExhausted
 
 
 class FakeContext:
@@ -119,7 +120,7 @@ async def test_headed_qrcode_never_schedules_initial_or_refreshed_preview(
         lambda: SimpleNamespace(run_in_executor=run_in_executor),
     )
 
-    with pytest.raises(RuntimeError, match="within 182s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     assert find_qrcode.await_count == 2
@@ -166,7 +167,7 @@ async def test_headless_qrcode_still_schedules_required_preview(
         lambda: SimpleNamespace(run_in_executor=executor),
     )
 
-    with pytest.raises(RuntimeError, match="within 2s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     find_qrcode.assert_awaited_once()
@@ -205,7 +206,7 @@ async def test_headless_preview_failure_does_not_restart_or_abort_login(
         lambda: SimpleNamespace(run_in_executor=executor),
     )
 
-    with pytest.raises(RuntimeError, match="within 2s"):
+    with pytest.raises(XHSManualWaitBudgetExhausted):
         await login.login_by_qrcode()
 
     find_qrcode.assert_awaited_once()

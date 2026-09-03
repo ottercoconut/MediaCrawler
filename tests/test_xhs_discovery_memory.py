@@ -19,6 +19,7 @@ from media_platform.xhs.core import (
     XHSNoteDetailUnavailable,
 )
 from media_platform.xhs.exception import DataFetchError, IPBlockError, PlatformRuntimeError
+from media_platform.xhs.manual_wait import XHSManualWaitBudgetExhausted
 
 
 class SearchClient:
@@ -549,6 +550,39 @@ async def test_wrapped_login_expiry_timeout_keeps_current_page_as_frontier(
     stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
     assert stopped["details"]["stop_reason"] == "runtime_failed"
     assert stopped["details"]["stop_detail"] == "login_required"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["batch_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_shared_manual_budget_exhaustion_is_a_fixed_runtime_stop(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[],
+    )
+    crawler.xhs_client = LoginExpiredSearchClient(recover=False)
+    crawler._wait_for_midrun_login_recovery = AsyncMock(
+        side_effect=XHSManualWaitBudgetExhausted()
+    )
+
+    await crawler.search()
+
+    assert [call["page"] for call in crawler.xhs_client.calls] == [3]
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    stopped = [
+        event for event in events if event["type"] == "adaptive_search_stopped"
+    ][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert (
+        stopped["details"]["stop_detail"]
+        == "xhs_manual_checkpoint_budget_exhausted"
+    )
     assert stopped["details"]["resume_page"] == 3
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["batch_complete"] is False
