@@ -69,7 +69,11 @@ from trippostcollect.records.topic_relevance import (
 )
 from var import crawler_type_var, source_keyword_var
 
-from .client import XiaoHongShuClient
+from .client import (
+    XiaoHongShuClient,
+    is_recoverable_xhs_transport_failure,
+    unwrap_xhs_request_failure,
+)
 from .exception import (
     DataFetchError,
     IPBlockError,
@@ -147,6 +151,18 @@ class XHSCreatorProfileUnavailable(RuntimeError):
         )
         self.user_id = user_id
         self.attempts = max(1, int(attempts))
+
+
+class XHSNetworkRecoveryTimeout(RuntimeError):
+    """A recoverable transport outage outlived the configured same-run wait."""
+
+    def __init__(self, stage: str, elapsed_seconds: float):
+        super().__init__(
+            "xhs_network_recovery_timeout:"
+            f"stage={stage}:elapsed={max(0.0, elapsed_seconds):.1f}s"
+        )
+        self.stage = stage
+        self.elapsed_seconds = max(0.0, elapsed_seconds)
 
 
 class XiaoHongShuCrawler(AbstractCrawler):
@@ -1048,7 +1064,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
             browser_context=self.browser_context,
             urls=self.cookie_urls,
         )
-        session_ready = await self.xhs_client.pong()
+        session_ready = await self._pong_with_network_recovery(
+            stage="replacement_session_confirmation",
+        )
         visible_checkpoint = bool(
             markers.get("security") or markers.get("login_or_qr")
         )
@@ -1059,7 +1077,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 browser_context=self.browser_context,
                 urls=self.cookie_urls,
             )
-            if not await self.xhs_client.pong():
+            if not await self._pong_with_network_recovery(
+                stage="replacement_session_after_manual_checkpoint",
+            ):
                 raise RuntimeError("xhs_replacement_page_session_not_confirmed")
 
     async def _single_page_for_login(self) -> Page:
@@ -1371,6 +1391,188 @@ class XiaoHongShuCrawler(AbstractCrawler):
             raise RuntimeError("xhs_platform_security_limit_300011")
         raise RuntimeError(f"xhs_{terminal}_during_page_guard:{reason}")
 
+    def _network_recovery_state(self) -> Dict[str, object]:
+        state = getattr(self, "_active_network_recovery", None)
+        if not isinstance(state, dict):
+            state = {}
+            self._active_network_recovery = state
+        return state
+
+    def _assert_network_recovery_session(self, state: Dict[str, object]) -> None:
+        context = getattr(self, "browser_context", None)
+        page = getattr(self, "context_page", None)
+        if context is None or page is None:
+            return
+        if self._page_is_closed(page):
+            raise PlaywrightError("xhs_network_recovery_page_closed")
+
+        expected_context = state.get("browser_context")
+        expected_page = state.get("context_page")
+        if expected_context is not None and expected_context is not context:
+            raise PlaywrightError("xhs_network_recovery_context_replaced")
+        if expected_page is not None and expected_page is not page:
+            raise PlaywrightError("xhs_network_recovery_page_replaced")
+
+        try:
+            context_pages = list(context.pages)
+        except AttributeError:
+            return
+        except Exception as exc:
+            raise PlaywrightError(
+                f"xhs_network_recovery_context_unavailable:{type(exc).__name__}"
+            ) from exc
+        if page not in context_pages:
+            raise PlaywrightError("xhs_network_recovery_page_left_context")
+
+    async def _record_network_recovery_event(
+        self,
+        *,
+        stage: str,
+        outcome: str,
+        error: str = "",
+    ) -> None:
+        page = getattr(self, "context_page", None)
+        if page is None:
+            return
+        try:
+            await self._record_navigation_diagnostic(
+                page,
+                stage=stage,
+                outcome=outcome,
+                error=error,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] Could not persist network recovery event: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    async def _pause_for_network_recovery(
+        self,
+        exc: BaseException,
+        *,
+        stage: str,
+    ) -> bool:
+        if not is_recoverable_xhs_transport_failure(exc):
+            return False
+
+        wait_seconds = self._env_float(
+            "TRIPPOSTCOLLECT_XHS_NETWORK_WAIT_SECONDS",
+            600.0,
+        )
+        if wait_seconds <= 0:
+            return False
+        minimum_delay = max(
+            0.1,
+            self._env_float(
+                "TRIPPOSTCOLLECT_XHS_NETWORK_RETRY_MIN_SECONDS",
+                2.0,
+            ),
+        )
+        maximum_delay = max(
+            minimum_delay,
+            self._env_float(
+                "TRIPPOSTCOLLECT_XHS_NETWORK_RETRY_MAX_SECONDS",
+                30.0,
+            ),
+        )
+
+        state = self._network_recovery_state()
+        if state.get("stage") != stage:
+            state.clear()
+            state.update(
+                {
+                    "stage": stage,
+                    "started_at": self._popup_monotonic(),
+                    "failures": 0,
+                    "browser_context": getattr(self, "browser_context", None),
+                    "context_page": getattr(self, "context_page", None),
+                }
+            )
+        self._assert_network_recovery_session(state)
+
+        started_at = float(state["started_at"])
+        elapsed = self._popup_monotonic() - started_at
+        if elapsed >= wait_seconds:
+            await self._record_network_recovery_event(
+                stage=stage,
+                outcome="network_recovery_timeout",
+                error=f"{type(unwrap_xhs_request_failure(exc)).__name__}: {exc}",
+            )
+            return False
+
+        failures = int(state.get("failures") or 0) + 1
+        state["failures"] = failures
+        delay = min(
+            maximum_delay,
+            minimum_delay * (2 ** min(failures - 1, 6)),
+            wait_seconds - elapsed,
+        )
+        nested = unwrap_xhs_request_failure(exc)
+        utils.logger.warning(
+            "[XiaoHongShuCrawler] Temporary network outage; preserving the "
+            "current browser session and retrying the same operation: "
+            f"stage={stage}, failure={type(nested).__name__}, "
+            f"elapsed={elapsed:.1f}s, retry_in={delay:.1f}s"
+        )
+        await self._record_network_recovery_event(
+            stage=stage,
+            outcome="network_paused",
+            error=f"{type(nested).__name__}: {nested}"[:500],
+        )
+        await self._popup_sleep(delay)
+        self._assert_network_recovery_session(state)
+        return True
+
+    async def _finish_network_recovery(self, *, stage: str) -> None:
+        state = self._network_recovery_state()
+        if state.get("stage") != stage:
+            return
+        started_at = float(state.get("started_at") or self._popup_monotonic())
+        elapsed = max(0.0, self._popup_monotonic() - started_at)
+        state.clear()
+        utils.logger.info(
+            "[XiaoHongShuCrawler] Network recovered in the current browser "
+            f"session: stage={stage}, elapsed={elapsed:.1f}s"
+        )
+        await self._record_network_recovery_event(
+            stage=stage,
+            outcome="network_recovered",
+        )
+
+    async def _run_with_network_recovery(self, operation, *, stage: str):
+        while True:
+            try:
+                result = await operation()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not is_recoverable_xhs_transport_failure(exc):
+                    await self._finish_network_recovery(stage=stage)
+                    raise
+                if await self._pause_for_network_recovery(exc, stage=stage):
+                    continue
+                state = self._network_recovery_state()
+                started_at = float(
+                    state.get("started_at") or self._popup_monotonic()
+                )
+                raise XHSNetworkRecoveryTimeout(
+                    stage,
+                    self._popup_monotonic() - started_at,
+                ) from unwrap_xhs_request_failure(exc)
+            await self._finish_network_recovery(stage=stage)
+            return result
+
+    async def _pong_with_network_recovery(self, *, stage: str) -> bool:
+        return bool(
+            await self._run_with_network_recovery(
+                self.xhs_client.pong,
+                stage=stage,
+            )
+        )
+
     async def _wait_for_midrun_login_recovery(self, keyword: str) -> bool:
         """Keep the headed browser open while the operator restores an expired login."""
         wait_seconds = self._env_int("TRIPPOSTCOLLECT_XHS_LOGIN_WAIT_SECONDS", 0)
@@ -1427,7 +1629,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
-                if await self.xhs_client.pong():
+                if await self._pong_with_network_recovery(
+                    stage="midrun_login_confirmation",
+                ):
                     confirmed_state = await self._popup_checkpoint_state(
                         self.context_page
                     )
@@ -1567,7 +1771,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 raise RuntimeError("xhs_initial_explore_not_rendered")
 
         self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
-        if not await self.xhs_client.pong():
+        if not await self._pong_with_network_recovery(stage="startup_login_probe"):
             await self._single_page_for_login()
             checkpoint_ready = False
             if await self._wait_for_manual_checkpoint_if_needed():
@@ -1575,7 +1779,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
-                checkpoint_ready = await self.xhs_client.pong()
+                checkpoint_ready = await self._pong_with_network_recovery(
+                    stage="startup_manual_checkpoint_probe",
+                )
             if not checkpoint_ready:
                 await self._single_page_for_login()
                 login_obj = XiaoHongShuLogin(
@@ -1592,7 +1798,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
-                if not await self.xhs_client.pong():
+                if not await self._pong_with_network_recovery(
+                    stage="startup_post_login_probe",
+                ):
                     raise RuntimeError(
                         "[XiaoHongShuCrawler] Xiaohongshu login state not confirmed "
                         "after login flow"
@@ -1615,7 +1823,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
             browser_context=self.browser_context,
             urls=self.cookie_urls,
         )
-        if not await self.xhs_client.pong():
+        if not await self._pong_with_network_recovery(
+            stage="post_behavior_login_probe",
+        ):
             raise RuntimeError("xhs_session_not_confirmed_after_human_behavior")
         await self._write_storage_state(session_verified=True)
         crawler_type_var.set(config.CRAWLER_TYPE)
@@ -1666,14 +1876,20 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             "[XiaoHongShuCrawler.search] search Xiaohongshu "
                             f"keyword: {keyword}, page: {requested_page}, phase: {discovery_phase}"
                         )
-                        notes_res = await self.xhs_client.get_note_by_keyword(
-                            keyword=keyword,
-                            search_id=search_id,
-                            page=requested_page,
-                            sort=(
-                                SearchSortType(config.SORT_TYPE)
-                                if config.SORT_TYPE != ""
-                                else SearchSortType.GENERAL
+                        notes_res = await self._run_with_network_recovery(
+                            lambda: self.xhs_client.get_note_by_keyword(
+                                keyword=keyword,
+                                search_id=search_id,
+                                page=requested_page,
+                                sort=(
+                                    SearchSortType(config.SORT_TYPE)
+                                    if config.SORT_TYPE != ""
+                                    else SearchSortType.GENERAL
+                                ),
+                            ),
+                            stage=(
+                                f"search:{discovery_phase}:"
+                                f"page={requested_page}:cursor={search_id}"
                             ),
                         )
                         if not notes_res:
@@ -1783,7 +1999,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                 if (
                                     isinstance(
                                         request_failure,
-                                        (IPBlockError, PlatformRuntimeError),
+                                        (
+                                            IPBlockError,
+                                            PlatformRuntimeError,
+                                            XHSNetworkRecoveryTimeout,
+                                        ),
                                     )
                                     or isinstance(note_detail, PlaywrightError)
                                     or self._is_login_expired_failure(note_detail)
@@ -1851,6 +2071,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
                                         break
                                     continue
                                 except RuntimeError as exc:
+                                    if isinstance(exc, XHSNetworkRecoveryTimeout):
+                                        raise
                                     detail_text = str(exc).lower()
                                     if any(
                                         marker in detail_text
@@ -2001,6 +2223,20 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         page = requested_page + 1
                         phase_batches += 1
                         await self._guarded_pause("search_page", 12.0, 30.0)
+                    except XHSNetworkRecoveryTimeout as exc:
+                        utils.logger.error(
+                            "[XiaoHongShuCrawler.search] Network recovery budget "
+                            f"expired on page {requested_page}: {exc}"
+                        )
+                        accumulator.mark_runtime_failed(
+                            "network_recovery_timeout",
+                            source_page=requested_page,
+                            source_cursor=search_id,
+                            resume_page=requested_page,
+                            resume_cursor=search_id,
+                            discovery_phase=discovery_phase,
+                        )
+                        break
                     except XHSNoteDetailUnavailable as exc:
                         utils.logger.error(
                             "[XiaoHongShuCrawler.search] Note detail remained unavailable "
@@ -2136,10 +2372,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 user_id = creator_info.user_id
 
                 # get creator detail info from web html content
-                createor_info: Dict = await self.xhs_client.get_creator_info(
-                    user_id=user_id,
-                    xsec_token=creator_info.xsec_token,
-                    xsec_source=creator_info.xsec_source
+                createor_info: Dict = await self._run_with_network_recovery(
+                    lambda: self.xhs_client.get_creator_info(
+                        user_id=user_id,
+                        xsec_token=creator_info.xsec_token,
+                        xsec_source=creator_info.xsec_source,
+                    ),
+                    stage=f"creator_mode_profile:user={user_id}",
                 )
                 if createor_info:
                     await xhs_store.save_creator(user_id, creator=createor_info)
@@ -2150,12 +2389,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
             # Use fixed crawling interval
             crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
             # Get all note information of the creator
-            all_notes_list = await self.xhs_client.get_all_notes_by_creator(
-                user_id=user_id,
-                crawl_interval=crawl_interval,
-                callback=self.fetch_creator_notes_detail,
-                xsec_token=creator_info.xsec_token,
-                xsec_source=creator_info.xsec_source,
+            all_notes_list = await self._run_with_network_recovery(
+                lambda: self.xhs_client.get_all_notes_by_creator(
+                    user_id=user_id,
+                    crawl_interval=crawl_interval,
+                    callback=self.fetch_creator_notes_detail,
+                    xsec_token=creator_info.xsec_token,
+                    xsec_source=creator_info.xsec_source,
+                ),
+                stage=f"creator_mode_notes:user={user_id}",
             )
 
             note_ids = []
@@ -2239,7 +2481,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
         creator_info = None
         attempts = 0
         try:
-            creator_info = await self.xhs_client.get_creator_info(user_id=user_id)
+            creator_info = await self._run_with_network_recovery(
+                lambda: self.xhs_client.get_creator_info(user_id=user_id),
+                stage=f"creator_profile_api:user={user_id}",
+            )
             attempts += 1
         except Exception as exc:
             attempts += self._request_failure_attempts(exc)
@@ -2466,7 +2711,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
         async with semaphore:
             try:
                 try:
-                    note_detail = await self.xhs_client.get_note_by_id(note_id, xsec_source, xsec_token)
+                    note_detail = await self._run_with_network_recovery(
+                        lambda: self.xhs_client.get_note_by_id(
+                            note_id,
+                            xsec_source,
+                            xsec_token,
+                        ),
+                        stage=f"note_detail_api:note={note_id}",
+                    )
                     attempts += 1
                 except RetryError as exc:
                     attempts += self._request_failure_attempts(exc)
@@ -2476,11 +2728,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
                 if not note_detail:
                     try:
-                        note_detail = await self.xhs_client.get_note_by_id_from_html(
-                            note_id,
-                            xsec_source,
-                            xsec_token,
-                            enable_cookie=True,
+                        note_detail = await self._run_with_network_recovery(
+                            lambda: self.xhs_client.get_note_by_id_from_html(
+                                note_id,
+                                xsec_source,
+                                xsec_token,
+                                enable_cookie=True,
+                            ),
+                            stage=f"note_detail_html:note={note_id}",
                         )
                         attempts += 1
                     except RetryError as exc:
@@ -2549,12 +2804,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
             utils.logger.info(f"[XiaoHongShuCrawler.get_comments] Begin get note id comments {note_id}")
             # Use fixed crawling interval
             crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
-            await self.xhs_client.get_note_all_comments(
-                note_id=note_id,
-                xsec_token=xsec_token,
-                crawl_interval=crawl_interval,
-                callback=xhs_store.batch_update_xhs_note_comments,
-                max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
+            await self._run_with_network_recovery(
+                lambda: self.xhs_client.get_note_all_comments(
+                    note_id=note_id,
+                    xsec_token=xsec_token,
+                    crawl_interval=crawl_interval,
+                    callback=xhs_store.batch_update_xhs_note_comments,
+                    max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
+                ),
+                stage=f"note_comments:note={note_id}",
             )
 
             # Sleep after fetching comments

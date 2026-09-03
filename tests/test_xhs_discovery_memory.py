@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 import config
@@ -39,6 +41,28 @@ class LoginExpiredSearchClient:
         if not self.recover or len(self.calls) == 1:
             failure = DataFetchError("登录已过期")
             raise RetryError(Future.construct(3, failure, has_exception=True))
+        return {"items": [], "has_more": False}
+
+
+class NetworkOutageSearchClient:
+    def __init__(self, *, recover: bool):
+        self.recover = recover
+        self.calls = []
+
+    async def get_note_by_keyword(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.recover or len(self.calls) == 1:
+            request = httpx.Request(
+                "GET",
+                "https://edith.xiaohongshu.com/api/sns/web/v1/search/notes",
+            )
+            raise RetryError(
+                Future.construct(
+                    3,
+                    httpx.ReadTimeout("temporary disconnect", request=request),
+                    has_exception=True,
+                )
+            )
         return {"items": [], "has_more": False}
 
 
@@ -99,6 +123,41 @@ def prepare_crawler(monkeypatch, tmp_path, *, items, start_page=3):
         lambda user_id, profile: {"fans_count": profile["fans_count"]},
     )
     return crawler, detail_ids, state_path
+
+
+def attach_network_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    crawler: XiaoHongShuCrawler,
+    *,
+    wait_seconds: float,
+) -> tuple[object, object, list[float]]:
+    page = SimpleNamespace(is_closed=lambda: False, url="https://www.xiaohongshu.com")
+    context = SimpleNamespace(pages=[page], new_page=AsyncMock())
+    crawler.context_page = page
+    crawler.browser_context = context
+    crawler._record_network_recovery_event = AsyncMock()
+    crawler.launch_browser = AsyncMock()
+    crawler.launch_browser_with_cdp = AsyncMock()
+
+    clock = {"now": 50.0}
+    sleeps: list[float] = []
+
+    def monotonic() -> float:
+        return clock["now"]
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    crawler._popup_monotonic = monotonic
+    crawler._popup_sleep = sleep
+    monkeypatch.setenv(
+        "TRIPPOSTCOLLECT_XHS_NETWORK_WAIT_SECONDS",
+        str(wait_seconds),
+    )
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_NETWORK_RETRY_MIN_SECONDS", "2")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_NETWORK_RETRY_MAX_SECONDS", "4")
+    return context, page, sleeps
 
 
 @pytest.mark.asyncio
@@ -493,3 +552,116 @@ async def test_wrapped_login_expiry_timeout_keeps_current_page_as_frontier(
     assert stopped["details"]["resume_page"] == 3
     assert stopped["details"]["resume_cursor"] == "saved-search-id"
     assert stopped["details"]["batch_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_disconnect_retries_same_page_cursor_and_browser_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[],
+    )
+    crawler.xhs_client = NetworkOutageSearchClient(recover=True)
+    context, page, sleeps = attach_network_clock(
+        monkeypatch,
+        crawler,
+        wait_seconds=10.0,
+    )
+
+    await crawler.search()
+
+    assert [call["page"] for call in crawler.xhs_client.calls] == [3, 3]
+    assert [call["search_id"] for call in crawler.xhs_client.calls] == [
+        "saved-search-id",
+        "saved-search-id",
+    ]
+    assert crawler.browser_context is context
+    assert crawler.context_page is page
+    assert sleeps == [2.0]
+    context.new_page.assert_not_awaited()
+    crawler.launch_browser.assert_not_awaited()
+    crawler.launch_browser_with_cdp.assert_not_awaited()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "source_exhausted"
+    assert stopped["details"]["stop_detail"] == "has_more_false"
+
+
+@pytest.mark.asyncio
+async def test_search_disconnect_timeout_preserves_current_recovery_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("TRIPPOSTCOLLECT_DB_PATH", raising=False)
+    crawler, _, state_path = prepare_crawler(
+        monkeypatch,
+        tmp_path,
+        items=[],
+    )
+    crawler.xhs_client = NetworkOutageSearchClient(recover=False)
+    context, page, sleeps = attach_network_clock(
+        monkeypatch,
+        crawler,
+        wait_seconds=5.0,
+    )
+
+    await crawler.search()
+
+    assert [call["page"] for call in crawler.xhs_client.calls] == [3, 3, 3]
+    assert [call["search_id"] for call in crawler.xhs_client.calls] == [
+        "saved-search-id",
+        "saved-search-id",
+        "saved-search-id",
+    ]
+    assert sleeps == [2.0, 3.0]
+    assert crawler.browser_context is context
+    assert crawler.context_page is page
+    context.new_page.assert_not_awaited()
+    crawler.launch_browser.assert_not_awaited()
+    crawler.launch_browser_with_cdp.assert_not_awaited()
+    events = json.loads(state_path.read_text(encoding="utf-8"))["events"]
+    stopped = [event for event in events if event["type"] == "adaptive_search_stopped"][-1]
+    assert stopped["details"]["stop_reason"] == "runtime_failed"
+    assert stopped["details"]["stop_detail"] == "network_recovery_timeout"
+    assert stopped["details"]["resume_page"] == 3
+    assert stopped["details"]["resume_cursor"] == "saved-search-id"
+    assert stopped["details"]["batch_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_detail_transport_outage_retries_same_detail_without_html_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler = XiaoHongShuCrawler()
+    attach_network_clock(monkeypatch, crawler, wait_seconds=10.0)
+    request = httpx.Request(
+        "GET",
+        "https://edith.xiaohongshu.com/api/sns/web/v1/feed",
+    )
+    crawler.xhs_client = AsyncMock()
+    crawler.xhs_client.get_note_by_id.side_effect = [
+        RetryError(
+            Future.construct(
+                3,
+                httpx.ConnectError("temporary disconnect", request=request),
+                has_exception=True,
+            )
+        ),
+        valid_note("network-detail"),
+    ]
+    crawler._guarded_pause = AsyncMock(return_value=0.0)
+
+    result = await crawler.get_note_detail_async_task(
+        note_id="network-detail",
+        xsec_source="pc_search",
+        xsec_token="token",
+        semaphore=xhs_core.asyncio.Semaphore(1),
+    )
+
+    assert result and result["note_id"] == "network-detail"
+    assert crawler.xhs_client.get_note_by_id.await_count == 2
+    crawler.xhs_client.get_note_by_id_from_html.assert_not_awaited()
