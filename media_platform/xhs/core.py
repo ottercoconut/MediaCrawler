@@ -1329,7 +1329,20 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     playwright_proxy_format,
                     httpx_proxy_format,
                 )
-            finally:
+            except BaseException as primary_error:
+                try:
+                    await self._prepare_browser_shutdown()
+                except BaseException as cleanup_error:
+                    cleanup_detail = (
+                        "XHS browser shutdown also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    utils.logger.error(
+                        "[XiaoHongShuCrawler.start] " + cleanup_detail
+                    )
+                    primary_error.add_note(cleanup_detail)
+                raise
+            else:
                 await self._prepare_browser_shutdown()
 
     async def _run_browser_session(
