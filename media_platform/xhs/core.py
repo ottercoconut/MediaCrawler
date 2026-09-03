@@ -1391,35 +1391,34 @@ class XiaoHongShuCrawler(AbstractCrawler):
             raise RuntimeError("xhs_platform_security_limit_300011")
         raise RuntimeError(f"xhs_{terminal}_during_page_guard:{reason}")
 
-    def _network_recovery_state(self) -> Dict[str, object]:
-        state = getattr(self, "_active_network_recovery", None)
-        if not isinstance(state, dict):
-            state = {}
-            self._active_network_recovery = state
-        return state
-
     def _assert_network_recovery_session(self, state: Dict[str, object]) -> None:
         context = getattr(self, "browser_context", None)
-        page = getattr(self, "context_page", None)
-        if context is None or page is None:
-            return
+        page = state.get("context_page")
+        if context is None:
+            raise PlaywrightError("xhs_network_recovery_context_missing")
+        if page is None:
+            raise PlaywrightError("xhs_network_recovery_page_missing")
         if self._page_is_closed(page):
             raise PlaywrightError("xhs_network_recovery_page_closed")
 
         expected_context = state.get("browser_context")
-        expected_page = state.get("context_page")
-        if expected_context is not None and expected_context is not context:
+        if expected_context is not context:
             raise PlaywrightError("xhs_network_recovery_context_replaced")
-        if expected_page is not None and expected_page is not page:
+        if getattr(self, "context_page", None) is not page:
             raise PlaywrightError("xhs_network_recovery_page_replaced")
+
+        page_context = getattr(page, "context", context)
+        if page_context is not context:
+            raise PlaywrightError("xhs_network_recovery_page_has_foreign_context")
 
         try:
             context_pages = list(context.pages)
-        except AttributeError:
-            return
+        except PlaywrightError:
+            raise
         except Exception as exc:
             raise PlaywrightError(
-                f"xhs_network_recovery_context_unavailable:{type(exc).__name__}"
+                "xhs_network_recovery_context_unavailable:"
+                f"{type(exc).__name__}:{exc}"
             ) from exc
         if page not in context_pages:
             raise PlaywrightError("xhs_network_recovery_page_left_context")
@@ -1454,6 +1453,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         exc: BaseException,
         *,
         stage: str,
+        state: Dict[str, object],
     ) -> bool:
         if not is_recoverable_xhs_transport_failure(exc):
             return False
@@ -1479,9 +1479,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             ),
         )
 
-        state = self._network_recovery_state()
-        if state.get("stage") != stage:
-            state.clear()
+        if not state:
             state.update(
                 {
                     "stage": stage,
@@ -1491,6 +1489,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     "context_page": getattr(self, "context_page", None),
                 }
             )
+        elif state.get("stage") != stage:
+            raise RuntimeError("xhs_network_recovery_state_stage_mismatch")
         self._assert_network_recovery_session(state)
 
         started_at = float(state["started_at"])
@@ -1526,10 +1526,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self._assert_network_recovery_session(state)
         return True
 
-    async def _finish_network_recovery(self, *, stage: str) -> None:
-        state = self._network_recovery_state()
-        if state.get("stage") != stage:
+    async def _finish_network_recovery(
+        self,
+        *,
+        stage: str,
+        state: Dict[str, object],
+    ) -> None:
+        if not state:
             return
+        if state.get("stage") != stage:
+            raise RuntimeError("xhs_network_recovery_state_stage_mismatch")
         started_at = float(state.get("started_at") or self._popup_monotonic())
         elapsed = max(0.0, self._popup_monotonic() - started_at)
         state.clear()
@@ -1542,7 +1548,31 @@ class XiaoHongShuCrawler(AbstractCrawler):
             outcome="network_recovered",
         )
 
+    async def _abort_network_recovery(
+        self,
+        *,
+        stage: str,
+        state: Dict[str, object],
+        error: BaseException,
+        outcome: str = "network_recovery_aborted",
+    ) -> None:
+        if not state:
+            return
+        if state.get("stage") != stage:
+            raise RuntimeError("xhs_network_recovery_state_stage_mismatch")
+        state.clear()
+        utils.logger.warning(
+            "[XiaoHongShuCrawler] Network recovery aborted by a non-network "
+            f"failure: stage={stage}, failure={type(error).__name__}"
+        )
+        await self._record_network_recovery_event(
+            stage=stage,
+            outcome=outcome,
+            error=f"{type(error).__name__}: {error}"[:500],
+        )
+
     async def _run_with_network_recovery(self, operation, *, stage: str):
+        state: Dict[str, object] = {}
         while True:
             try:
                 result = await operation()
@@ -1550,11 +1580,18 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 raise
             except Exception as exc:
                 if not is_recoverable_xhs_transport_failure(exc):
-                    await self._finish_network_recovery(stage=stage)
+                    await self._abort_network_recovery(
+                        stage=stage,
+                        state=state,
+                        error=exc,
+                    )
                     raise
-                if await self._pause_for_network_recovery(exc, stage=stage):
+                if await self._pause_for_network_recovery(
+                    exc,
+                    stage=stage,
+                    state=state,
+                ):
                     continue
-                state = self._network_recovery_state()
                 started_at = float(
                     state.get("started_at") or self._popup_monotonic()
                 )
@@ -1562,7 +1599,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     stage,
                     self._popup_monotonic() - started_at,
                 ) from unwrap_xhs_request_failure(exc)
-            await self._finish_network_recovery(stage=stage)
+            await self._finish_network_recovery(
+                stage=stage,
+                state=state,
+            )
             return result
 
     async def _pong_with_network_recovery(self, *, stage: str) -> bool:
@@ -2486,6 +2526,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 stage=f"creator_profile_api:user={user_id}",
             )
             attempts += 1
+        except XHSNetworkRecoveryTimeout:
+            raise
         except Exception as exc:
             attempts += self._request_failure_attempts(exc)
             request_failure = self._request_failure_exception(exc)

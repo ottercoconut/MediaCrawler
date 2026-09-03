@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -234,3 +235,142 @@ async def test_disabled_network_wait_fails_without_hidden_sleep(
     assert exc_info.value.elapsed_seconds == 0.0
     assert operation.await_count == 1
     assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recovery_stages_keep_independent_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler = XiaoHongShuCrawler()
+    page = SimpleNamespace(is_closed=lambda: False)
+    crawler.context_page = page
+    crawler.browser_context = SimpleNamespace(pages=[page])
+    crawler._record_network_recovery_event = AsyncMock()
+    crawler._popup_monotonic = time.monotonic
+    crawler._popup_sleep = asyncio.sleep
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_NETWORK_WAIT_SECONDS", "0.03")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_NETWORK_RETRY_MIN_SECONDS", "0.01")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_NETWORK_RETRY_MAX_SECONDS", "0.01")
+    request = httpx.Request("GET", "https://edith.xiaohongshu.com/api/test")
+    calls = {"a": 0, "b": 0}
+
+    async def fail(name: str) -> None:
+        calls[name] += 1
+        raise httpx.ConnectError(f"offline-{name}", request=request)
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            crawler._run_with_network_recovery(
+                lambda: fail("a"),
+                stage="note_detail_api:note=a",
+            ),
+            crawler._run_with_network_recovery(
+                lambda: fail("b"),
+                stage="note_detail_api:note=b",
+            ),
+            return_exceptions=True,
+        ),
+        timeout=0.5,
+    )
+
+    assert all(isinstance(result, XHSNetworkRecoveryTimeout) for result in results)
+    assert calls == {"a": 2, "b": 2}
+    assert all(result.elapsed_seconds >= 0.03 for result in results)
+
+
+@pytest.mark.asyncio
+async def test_transport_then_nontransport_error_is_aborted_not_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler, _context, _page, sleeps = _crawler_with_clock(monkeypatch)
+    request = httpx.Request("GET", "https://edith.xiaohongshu.com/api/search")
+    operation = AsyncMock(
+        side_effect=[
+            httpx.ReadTimeout("offline", request=request),
+            DataFetchError("bad response after reconnect"),
+        ]
+    )
+
+    with pytest.raises(DataFetchError, match="bad response after reconnect"):
+        await crawler._run_with_network_recovery(
+            operation,
+            stage="search:frontier:page=3",
+        )
+
+    assert operation.await_count == 2
+    assert sleeps == [2.0]
+    assert [
+        call.kwargs["outcome"]
+        for call in crawler._record_network_recovery_event.await_args_list
+    ] == ["network_paused", "network_recovery_aborted"]
+
+
+@pytest.mark.asyncio
+async def test_missing_browser_context_is_terminal_before_network_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler = XiaoHongShuCrawler()
+    crawler._record_network_recovery_event = AsyncMock()
+    crawler._popup_sleep = AsyncMock()
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_NETWORK_WAIT_SECONDS", "10")
+    request = httpx.Request("GET", "https://edith.xiaohongshu.com/api/search")
+    operation = AsyncMock(
+        side_effect=httpx.ConnectError("offline", request=request)
+    )
+
+    with pytest.raises(PlaywrightError, match="context_missing"):
+        await crawler._run_with_network_recovery(
+            operation,
+            stage="search:frontier:page=3",
+        )
+
+    assert operation.await_count == 1
+    crawler._popup_sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_fault", ["closed", "removed", "foreign"])
+async def test_invalid_operation_page_is_terminal_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    session_fault: str,
+) -> None:
+    crawler, context, page, sleeps = _crawler_with_clock(monkeypatch)
+    if session_fault == "closed":
+        page.is_closed = lambda: True
+    elif session_fault == "removed":
+        context.pages.clear()
+    else:
+        page.context = SimpleNamespace(pages=[page])
+    request = httpx.Request("GET", "https://edith.xiaohongshu.com/api/search")
+    operation = AsyncMock(
+        side_effect=httpx.ReadTimeout("offline", request=request)
+    )
+
+    with pytest.raises(PlaywrightError, match="xhs_network_recovery"):
+        await crawler._run_with_network_recovery(
+            operation,
+            stage="search:frontier:page=3",
+        )
+
+    assert operation.await_count == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_creator_network_timeout_never_opens_browser_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler = XiaoHongShuCrawler()
+    crawler._run_with_network_recovery = AsyncMock(
+        side_effect=XHSNetworkRecoveryTimeout("creator_profile_api:user=author", 600)
+    )
+    crawler._get_creator_info_from_browser = AsyncMock()
+    crawler._guarded_pause = AsyncMock()
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_ENRICH_CREATORS", "1")
+    note = {"user": {"user_id": "author"}}
+
+    with pytest.raises(XHSNetworkRecoveryTimeout):
+        await crawler.enrich_note_creator(note)
+
+    crawler._get_creator_info_from_browser.assert_not_awaited()
+    crawler._guarded_pause.assert_not_awaited()
