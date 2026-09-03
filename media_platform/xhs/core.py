@@ -62,7 +62,11 @@ from tools.trippostcollect_behavior import (
     run_required_request_pause,
     run_requested_post_interaction,
 )
-from tools.trippostcollect_adaptive import AdaptiveAccumulator, env_int
+from tools.trippostcollect_adaptive import (
+    AdaptiveAccumulator,
+    append_execution_event,
+    env_int,
+)
 from tools.cdp_browser import CDPBrowserLifecycleError, CDPBrowserManager
 from trippostcollect.records.topic_relevance import (
     topic_relevant_for_web_post,
@@ -998,7 +1002,42 @@ class XiaoHongShuCrawler(AbstractCrawler):
             new_page=self._new_guarded_page,
             manual_wait_budget=self._get_manual_wait_budget(),
         )
-        await login_obj.begin()
+        try:
+            await login_obj.begin()
+        except PlatformRuntimeError as exc:
+            stop_detail = str(exc.code or "xhs_login_runtime_failed")
+            failure_type_by_code = {
+                "xhs_sms_verification_parameter_error": (
+                    "sms_verification_terminal"
+                ),
+                "xhs_sms_verification_daily_limit": "sms_verification_terminal",
+                "xhs_sms_verification_rate_limited": "rate_limited",
+                "platform_security_limit_300011": "platform_security_limit",
+                "xhs_platform_security_limit_unspecified": (
+                    "platform_security_limit"
+                ),
+                "xhs_account_exception": "platform_security_limit",
+                "xhs_login_error_page": "platform_security_limit",
+                "ip_blocked_300012": "ip_blocked",
+                "xhs_manual_checkpoint_budget_exhausted": (
+                    "manual_checkpoint_timeout"
+                ),
+            }
+            append_execution_event(
+                "xhs_runtime_terminal",
+                {
+                    "phase": "login",
+                    "failure_type": failure_type_by_code.get(
+                        stop_detail,
+                        "login_runtime_error",
+                    ),
+                    "stop_reason": "runtime_failed",
+                    "stop_detail": stop_detail,
+                    **login_obj.terminal_context(),
+                    "retryable": False,
+                },
+            )
+            raise
         self.context_page = login_obj.context_page
         self.xhs_client.playwright_page = self.context_page
 

@@ -9,6 +9,7 @@ import pytest
 import config
 from media_platform.xhs import login as login_module
 from media_platform.xhs.core import XiaoHongShuCrawler
+from media_platform.xhs.exception import PlatformRuntimeError
 from media_platform.xhs.login import XiaoHongShuLogin
 from media_platform.xhs.manual_wait import (
     XHSManualWaitBudget,
@@ -212,6 +213,11 @@ async def test_zero_budget_is_terminal_before_any_login_page_mutation(
         await login.login_by_qrcode()
 
     assert clock.now == 0.0
+    assert login.terminal_context() == {
+        "checkpoint_kind": "initial_qrcode_login",
+        "manual_progress_observed": False,
+        "matched_markers": [],
+    }
     assert page.reload_times == []
     assert page.click_times == []
     assert page.close_calls == 0
@@ -241,7 +247,29 @@ async def test_visible_verification_latches_and_prevents_later_reload(
         await login.login_by_qrcode()
 
     assert login._last_login_observation["manual_in_progress"] is True
+    assert login.terminal_context()["checkpoint_kind"] == "sms_verification"
+    assert login.terminal_context()["manual_progress_observed"] is True
     assert page.reload_times == []
+
+
+@pytest.mark.asyncio
+async def test_captcha_budget_exhaustion_preserves_checkpoint_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    page = FakePage(clock)
+    page.visible_text = "请通过安全验证，拖动滑块"
+    page.visible_selectors.add("[class*='slider']")
+    login = make_login(page)
+    configure_virtual_login(monkeypatch, clock, wait_seconds=2)
+
+    with pytest.raises(XHSManualWaitBudgetExhausted):
+        await login.login_by_qrcode()
+
+    context = login.terminal_context()
+    assert context["checkpoint_kind"] == "captcha"
+    assert context["manual_progress_observed"] is True
+    assert "安全验证" in context["matched_markers"]
 
 
 @pytest.mark.asyncio
@@ -264,26 +292,26 @@ async def test_sms_verification_without_error_latches_despite_background_qr(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("text", "error"),
+    ("text", "error_code"),
     [
         (
             "SMS Verification Parameter error Refresh Feedback",
-            "xhs_login_verification_terminal:Parameter error",
+            "xhs_sms_verification_parameter_error",
         ),
         (
             "SMS Verification 今日次数已达上限",
-            "xhs_login_verification_terminal:今日次数已达上限",
+            "xhs_sms_verification_daily_limit",
         ),
         (
             "SMS Verification 操作频繁",
-            "xhs_platform_security_limit_300011",
+            "xhs_sms_verification_rate_limited",
         ),
     ],
 )
 async def test_sms_error_is_terminal_without_wait_refresh_or_close(
     monkeypatch: pytest.MonkeyPatch,
     text: str,
-    error: str,
+    error_code: str,
 ) -> None:
     clock = FakeClock()
     page = FakePage(clock)
@@ -292,13 +320,89 @@ async def test_sms_error_is_terminal_without_wait_refresh_or_close(
     login = make_login(page)
     configure_virtual_login(monkeypatch, clock, wait_seconds=600)
 
-    with pytest.raises(RuntimeError, match=error):
+    with pytest.raises(PlatformRuntimeError) as exc_info:
         await login.login_by_qrcode()
 
+    assert exc_info.value.code == error_code
+    assert login.terminal_context()["checkpoint_kind"] == "sms_verification"
+    assert login.terminal_context()["matched_markers"]
     assert clock.now == 0
     assert page.reload_times == []
     assert page.click_times == []
     assert page.close_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "url", "expected_code", "expected_marker"),
+    [
+        (
+            "安全限制",
+            "https://www.xiaohongshu.com/login",
+            "xhs_platform_security_limit_unspecified",
+            "安全限制",
+        ),
+        (
+            "账号异常",
+            "https://www.xiaohongshu.com/login",
+            "xhs_account_exception",
+            "账号异常",
+        ),
+        (
+            "",
+            "https://www.xiaohongshu.com/website-login/error",
+            "xhs_login_error_page",
+            "website-login/error",
+        ),
+        (
+            "账号异常，错误码 300011",
+            "https://www.xiaohongshu.com/login",
+            "platform_security_limit_300011",
+            "300011",
+        ),
+        (
+            "安全限制，错误码 300012",
+            "https://www.xiaohongshu.com/login",
+            "ip_blocked_300012",
+            "300012",
+        ),
+        (
+            "",
+            "https://www.xiaohongshu.com/website-login/error?code=300011",
+            "platform_security_limit_300011",
+            "300011",
+        ),
+    ],
+)
+async def test_login_terminal_codes_are_exact_and_mutually_exclusive(
+    text: str,
+    url: str,
+    expected_code: str,
+    expected_marker: str,
+) -> None:
+    clock = FakeClock()
+    page = FakePage(clock)
+    page.visible_text = text
+    page.url = url
+    login = make_login(page)
+
+    with pytest.raises(PlatformRuntimeError) as exc_info:
+        await login._check_login_state_once("before")
+
+    assert exc_info.value.code == expected_code
+    assert login._last_login_observation["terminal_code"] == expected_code
+    assert login.terminal_context()["matched_markers"] == [expected_marker]
+
+
+@pytest.mark.asyncio
+async def test_longer_numeric_value_does_not_impersonate_security_code() -> None:
+    clock = FakeClock()
+    page = FakePage(clock, name="explore/note")
+    page.visible_text = "游记编号 1300011 和 2300012"
+    login = make_login(page)
+
+    assert await login._check_login_state_once("before") is False
+    assert login._last_login_observation["terminal_code"] == ""
 
 
 @pytest.mark.asyncio
@@ -519,7 +623,7 @@ async def test_plain_content_words_are_not_login_error_or_profile_evidence() -> 
     login = make_login(page)
 
     assert await login._check_login_state_once("before") is False
-    assert login._last_login_observation["terminal_login_error"] == []
+    assert login._last_login_observation["terminal_code"] == ""
     assert login._last_login_observation["profile_visible"] is False
 
 

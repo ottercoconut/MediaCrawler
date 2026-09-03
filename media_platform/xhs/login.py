@@ -20,6 +20,7 @@
 
 import asyncio
 import os
+import re
 import time
 from typing import Awaitable, Callable, Optional
 
@@ -28,6 +29,7 @@ from playwright.async_api import BrowserContext, Page
 from base.base_crawler import AbstractLogin
 from tools import utils
 
+from .exception import PlatformRuntimeError
 from .manual_wait import XHSManualWaitBudget
 
 
@@ -37,17 +39,11 @@ class XiaoHongShuLogin(AbstractLogin):
     _DEFAULT_LOGIN_POLL_SECONDS = 1.0
     _DEFAULT_STABLE_LOGIN_SECONDS = 5.0
     _QR_COMPONENT_REFRESH_RETRY_SECONDS = 5.0
-    _TERMINAL_SECURITY_MARKERS = frozenset({
-        "操作频繁",
-        "安全限制",
-        "账号异常",
-        "Account exception",
-        "300011",
-        "website-login/error",
-    })
-    _TERMINAL_LOGIN_ERROR_MARKERS = frozenset({
+    _SMS_PARAMETER_ERROR_MARKERS = frozenset({
         "Parameter error",
         "参数错误",
+    })
+    _SMS_DAILY_LIMIT_MARKERS = frozenset({
         "今日次数已达上限",
         "今日获取验证码次数已达上限",
         "今日验证码获取次数已达上限",
@@ -55,6 +51,16 @@ class XiaoHongShuLogin(AbstractLogin):
         "今日短信验证码次数已达上限",
         "获取验证码次数已达上限",
         "验证码获取次数已达上限",
+    })
+    _SMS_RATE_LIMIT_MARKERS = frozenset({
+        "操作频繁",
+        "请求频繁",
+        "Requests too frequent",
+    })
+    _GENERIC_SECURITY_MARKERS = frozenset({"安全限制"})
+    _ACCOUNT_EXCEPTION_MARKERS = frozenset({
+        "账号异常",
+        "Account exception",
     })
     _VERIFICATION_CONTEXT_TEXTS = (
         "SMS Verification",
@@ -135,6 +141,8 @@ class XiaoHongShuLogin(AbstractLogin):
         self.new_page = new_page
         self._manual_wait_budget = manual_wait_budget
         self._last_login_observation: dict[str, object] = {}
+        self._manual_progress_observed = False
+        self._last_checkpoint_kind = "initial_qrcode_login"
 
     def _get_manual_wait_budget(self) -> XHSManualWaitBudget:
         if self._manual_wait_budget is None:
@@ -263,23 +271,182 @@ class XiaoHongShuLogin(AbstractLogin):
             if marker.casefold() in lowered
         }
 
+    @classmethod
+    def _terminal_state(
+        cls,
+        *,
+        text: str,
+        url: str,
+        verification_context: bool,
+    ) -> tuple[str, str, list[str]]:
+        """Return one mutually exclusive terminal code and its failure family."""
+
+        terminal_source = f"{text}\n{url}"
+        if re.search(r"(?<!\d)300012(?!\d)", terminal_source):
+            return "ip_blocked_300012", "ip_blocked", ["300012"]
+        if re.search(r"(?<!\d)300011(?!\d)", terminal_source):
+            return (
+                "platform_security_limit_300011",
+                "platform_security_limit",
+                ["300011"],
+            )
+
+        if verification_context:
+            parameter_markers = cls._matching_markers(
+                text,
+                cls._SMS_PARAMETER_ERROR_MARKERS,
+            )
+            if parameter_markers:
+                return (
+                    "xhs_sms_verification_parameter_error",
+                    "sms_verification_terminal",
+                    sorted(parameter_markers),
+                )
+            daily_markers = cls._matching_markers(
+                text,
+                cls._SMS_DAILY_LIMIT_MARKERS,
+            )
+            if daily_markers:
+                return (
+                    "xhs_sms_verification_daily_limit",
+                    "sms_verification_terminal",
+                    sorted(daily_markers),
+                )
+            rate_markers = cls._matching_markers(
+                text,
+                cls._SMS_RATE_LIMIT_MARKERS,
+            )
+            if rate_markers:
+                return (
+                    "xhs_sms_verification_rate_limited",
+                    "rate_limited",
+                    sorted(rate_markers),
+                )
+
+        account_markers = cls._matching_markers(
+            text,
+            cls._ACCOUNT_EXCEPTION_MARKERS,
+        )
+        if account_markers:
+            return (
+                "xhs_account_exception",
+                "platform_security_limit",
+                sorted(account_markers),
+            )
+        if "/website-login/error" in url:
+            return (
+                "xhs_login_error_page",
+                "platform_security_limit",
+                ["website-login/error"],
+            )
+        security_markers = cls._matching_markers(
+            text,
+            cls._GENERIC_SECURITY_MARKERS,
+        )
+        if security_markers:
+            return (
+                "xhs_platform_security_limit_unspecified",
+                "platform_security_limit",
+                sorted(security_markers),
+            )
+        return "", "", []
+
+    @staticmethod
+    def _checkpoint_kind(observation: dict[str, object]) -> str:
+        terminal_code = str(observation.get("terminal_code") or "")
+        if terminal_code.startswith("xhs_sms_verification_"):
+            return "sms_verification"
+        if terminal_code == "ip_blocked_300012":
+            return "ip_block"
+        if terminal_code:
+            return "security_verification"
+
+        pages = [
+            item
+            for item in observation.get("pages") or []
+            if isinstance(item, dict)
+        ]
+        progress = {
+            str(marker).casefold()
+            for item in pages
+            for marker in item.get("manual_progress") or []
+        }
+        page_urls = {
+            str(item.get("url") or "").casefold()
+            for item in pages
+        }
+        if any(
+            "sms verification" in marker or "短信" in marker
+            for marker in progress
+        ):
+            return "sms_verification"
+        if (
+            any(
+                token in marker
+                for marker in progress
+                for token in ("安全验证", "身份验证", "滑块", "captcha")
+            )
+            or any("/website-login/captcha" in url for url in page_urls)
+            or any(item.get("strong_control_visible") for item in pages)
+        ):
+            return "captcha"
+        if (
+            any("验证码" in marker for marker in progress)
+            or any(item.get("conditional_control_visible") for item in pages)
+        ):
+            return "sms_verification"
+        if any(
+            token in marker
+            for marker in progress
+            for token in ("已扫码", "手机", "确认登录", "登录确认", "等待确认")
+        ):
+            return "mobile_confirmation"
+        if observation.get("qr_visible") or observation.get("qr_expired"):
+            return "qrcode_waiting"
+        if observation.get("visible_checkpoint"):
+            return "login_required"
+        return "unknown"
+
+    def _remember_observation(self, observation: dict[str, object]) -> None:
+        checkpoint_kind = self._checkpoint_kind(observation)
+        manual_in_progress = bool(observation.get("manual_in_progress"))
+        if manual_in_progress:
+            self._manual_progress_observed = True
+        if (
+            observation.get("terminal_code")
+            or manual_in_progress
+            or not self._manual_progress_observed
+        ):
+            self._last_checkpoint_kind = checkpoint_kind
+
+    def terminal_context(self) -> dict[str, object]:
+        """Return a serialization-safe description of the last login checkpoint."""
+
+        observation = self._last_login_observation
+        matched_markers = {
+            str(marker)
+            for marker in observation.get("terminal_markers") or []
+        }
+        if not matched_markers:
+            for page in observation.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                for key in ("manual_progress", "login_or_qr", "qr_expired"):
+                    matched_markers.update(
+                        str(marker) for marker in page.get(key) or []
+                    )
+        return {
+            "checkpoint_kind": self._last_checkpoint_kind,
+            "manual_progress_observed": self._manual_progress_observed,
+            "matched_markers": sorted(matched_markers),
+        }
+
     async def _page_login_observation(self, page: Page) -> dict[str, object]:
         try:
             url = str(page.url or "")
         except Exception:
             url = ""
         text = await self._visible_page_text(page)
-        terminal_security = self._matching_markers(
-            text,
-            self._TERMINAL_SECURITY_MARKERS - {"website-login/error"},
-        )
-        if "/website-login/error" in url:
-            terminal_security.add("website-login/error")
-        terminal_login_error_candidates = self._matching_markers(
-            text,
-            self._TERMINAL_LOGIN_ERROR_MARKERS,
-        )
-
         qr_visible = await self._selector_is_visible(
             page,
             self._QRCODE_SELECTOR,
@@ -330,10 +497,12 @@ class XiaoHongShuLogin(AbstractLogin):
                 for marker in self._VERIFICATION_CONTEXT_TEXTS
             )
         )
-        terminal_login_error = (
-            terminal_login_error_candidates
-            if verification_context
-            else set()
+        terminal_code, terminal_failure_type, terminal_markers = (
+            self._terminal_state(
+                text=text,
+                url=url,
+                verification_context=verification_context,
+            )
         )
         profile_visible = await self._any_selector_is_visible(
             page,
@@ -342,9 +511,12 @@ class XiaoHongShuLogin(AbstractLogin):
         return {
             "page": page,
             "url": url,
-            "terminal_security": sorted(terminal_security),
-            "terminal_login_error": sorted(terminal_login_error),
+            "terminal_code": terminal_code,
+            "terminal_failure_type": terminal_failure_type,
+            "terminal_markers": terminal_markers,
             "manual_progress": sorted(strong_progress | conditional_progress),
+            "conditional_control_visible": conditional_control,
+            "strong_control_visible": strong_control,
             "manual_control_visible": bool(conditional_control or strong_control),
             "manual_in_progress": manual_in_progress,
             "login_or_qr": sorted(login_or_qr),
@@ -358,16 +530,9 @@ class XiaoHongShuLogin(AbstractLogin):
             await self._page_login_observation(page)
             for page in await self._login_pages()
         ]
-        terminal_security = sorted({
-            marker
-            for item in page_observations
-            for marker in item["terminal_security"]
-        })
-        terminal_login_error = sorted({
-            marker
-            for item in page_observations
-            for marker in item["terminal_login_error"]
-        })
+        terminal_pages = [
+            item for item in page_observations if item["terminal_code"]
+        ]
         progress_pages = [
             item for item in page_observations if item["manual_in_progress"]
         ]
@@ -400,8 +565,17 @@ class XiaoHongShuLogin(AbstractLogin):
                 pass
             self.context_page = active_page
         return {
-            "terminal_security": terminal_security,
-            "terminal_login_error": terminal_login_error,
+            "terminal_code": str(
+                terminal_pages[0]["terminal_code"] if terminal_pages else ""
+            ),
+            "terminal_failure_type": str(
+                terminal_pages[0]["terminal_failure_type"]
+                if terminal_pages
+                else ""
+            ),
+            "terminal_markers": list(
+                terminal_pages[0]["terminal_markers"] if terminal_pages else []
+            ),
             "manual_in_progress": bool(progress_pages),
             "visible_checkpoint": visible_checkpoint,
             "profile_visible": bool(profile_pages),
@@ -417,8 +591,7 @@ class XiaoHongShuLogin(AbstractLogin):
     @staticmethod
     def _is_pure_qr_observation(observation: dict[str, object]) -> bool:
         if (
-            observation.get("terminal_security")
-            or observation.get("terminal_login_error")
+            observation.get("terminal_code")
             or observation.get("manual_in_progress")
             or observation.get("profile_visible")
         ):
@@ -482,11 +655,10 @@ class XiaoHongShuLogin(AbstractLogin):
         """Confirm login only from visible UI across the one BrowserContext."""
         observation = await self._login_observation()
         self._last_login_observation = observation
-        if observation["terminal_security"]:
-            raise RuntimeError("xhs_platform_security_limit_300011")
-        if observation["terminal_login_error"]:
-            markers = "|".join(observation["terminal_login_error"])
-            raise RuntimeError(f"xhs_login_verification_terminal:{markers}")
+        self._remember_observation(observation)
+        terminal_code = str(observation["terminal_code"] or "")
+        if terminal_code:
+            raise PlatformRuntimeError(terminal_code, code=terminal_code)
 
         # A stale profile shell can remain behind an active checkpoint. Every
         # visible verification state wins over every visible profile entry.

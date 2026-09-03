@@ -11,7 +11,10 @@ import pytest
 import media_platform.xhs.core as xhs_core
 from media_platform.xhs.core import XiaoHongShuCrawler
 from media_platform.xhs.login import XiaoHongShuLogin
-from media_platform.xhs.manual_wait import XHSManualWaitBudget
+from media_platform.xhs.manual_wait import (
+    XHSManualWaitBudget,
+    XHSManualWaitBudgetExhausted,
+)
 
 
 _REMOVED_LOGIN_ENV_VARS = (
@@ -71,6 +74,51 @@ async def test_xhs_login_begin_has_only_the_qrcode_branch() -> None:
 
     login._single_login_page.assert_awaited_once_with()
     login.login_by_qrcode.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_qrcode_login_budget_exhaustion_writes_structured_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = SimpleNamespace()
+    crawler.context_page = SimpleNamespace()
+    crawler.xhs_client = SimpleNamespace(playwright_page=crawler.context_page)
+    append_event = MagicMock()
+
+    class ExhaustedLogin:
+        def __init__(self, **kwargs: object) -> None:
+            self.context_page = kwargs["context_page"]
+
+        async def begin(self) -> None:
+            raise XHSManualWaitBudgetExhausted()
+
+        def terminal_context(self) -> dict[str, object]:
+            return {
+                "checkpoint_kind": "qrcode_waiting",
+                "manual_progress_observed": False,
+                "matched_markers": [],
+            }
+
+    monkeypatch.setattr(xhs_core, "XiaoHongShuLogin", ExhaustedLogin)
+    monkeypatch.setattr(xhs_core, "append_execution_event", append_event)
+
+    with pytest.raises(XHSManualWaitBudgetExhausted):
+        await crawler._run_qrcode_login()
+
+    append_event.assert_called_once_with(
+        "xhs_runtime_terminal",
+        {
+            "phase": "login",
+            "failure_type": "manual_checkpoint_timeout",
+            "stop_reason": "runtime_failed",
+            "stop_detail": "xhs_manual_checkpoint_budget_exhausted",
+            "checkpoint_kind": "qrcode_waiting",
+            "manual_progress_observed": False,
+            "matched_markers": [],
+            "retryable": False,
+        },
+    )
 
 
 def test_xhs_login_has_no_mobile_cookie_or_redis_automation_surface() -> None:
@@ -477,16 +525,25 @@ async def test_failed_startup_pong_enters_real_qrcode_state_machine_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("visible_text", "terminal_marker"),
+    ("visible_text", "terminal_code", "failure_type"),
     [
-        ("SMS Verification\nParameter error", "Parameter error"),
-        ("手机号登录\n今日短信验证码次数已达上限", "今日短信验证码次数已达上限"),
+        (
+            "SMS Verification\nParameter error",
+            "xhs_sms_verification_parameter_error",
+            "sms_verification_terminal",
+        ),
+        (
+            "手机号登录\n今日短信验证码次数已达上限",
+            "xhs_sms_verification_daily_limit",
+            "sms_verification_terminal",
+        ),
     ],
 )
 async def test_startup_sms_terminal_fails_immediately_without_retry_or_business_work(
     monkeypatch: pytest.MonkeyPatch,
     visible_text: str,
-    terminal_marker: str,
+    terminal_code: str,
+    failure_type: str,
 ) -> None:
     clock = _LoginFlowClock()
     page = _LoginFlowPage(visible_text=visible_text)
@@ -500,13 +557,12 @@ async def test_startup_sms_terminal_fails_immediately_without_retry_or_business_
     budget = XHSManualWaitBudget(limit_seconds=600, monotonic=clock.monotonic)
     crawler._manual_wait_budget = budget
     instances = _install_observed_login_factory(monkeypatch, events)
+    append_event = MagicMock()
+    monkeypatch.setattr(xhs_core, "append_execution_event", append_event)
     monkeypatch.setattr(xhs_core.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(xhs_core.asyncio, "sleep", clock.sleep)
 
-    with pytest.raises(
-        RuntimeError,
-        match=f"xhs_login_verification_terminal:.*{terminal_marker}",
-    ):
+    with pytest.raises(xhs_core.PlatformRuntimeError, match=f"^{terminal_code}$"):
         await crawler._run_browser_session(object(), None, None)
 
     assert len(instances) == 1
@@ -518,6 +574,23 @@ async def test_startup_sms_terminal_fails_immediately_without_retry_or_business_
     assert crawler._pong_with_network_recovery.await_args_list == [
         call(stage="startup_login_probe")
     ]
+    append_event.assert_called_once_with(
+        "xhs_runtime_terminal",
+        {
+            "phase": "login",
+            "failure_type": failure_type,
+            "stop_reason": "runtime_failed",
+            "stop_detail": terminal_code,
+            "checkpoint_kind": "sms_verification",
+            "manual_progress_observed": True,
+            "matched_markers": [
+                "Parameter error"
+                if terminal_code == "xhs_sms_verification_parameter_error"
+                else "今日短信验证码次数已达上限"
+            ],
+            "retryable": False,
+        },
+    )
     client.update_cookies.assert_not_awaited()
     crawler._open_behavior_search_page_on_primary_page.assert_not_awaited()
     crawler._run_human_behavior_on_primary_page.assert_not_awaited()

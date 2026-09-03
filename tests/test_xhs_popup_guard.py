@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from media_platform.xhs.core import XiaoHongShuCrawler
+from media_platform.xhs.exception import PlatformRuntimeError
 from media_platform.xhs.login import XiaoHongShuLogin
 
 
@@ -333,8 +334,10 @@ async def test_standalone_xhs_login_stops_on_platform_security_limit() -> None:
         context_page=page,
     )
 
-    with pytest.raises(RuntimeError, match="xhs_platform_security_limit_300011"):
+    with pytest.raises(PlatformRuntimeError) as exc_info:
         await login._check_login_state_once("")
+
+    assert exc_info.value.code == "xhs_login_error_page"
 
 
 @pytest.mark.asyncio
