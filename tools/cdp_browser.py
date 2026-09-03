@@ -135,7 +135,9 @@ class CDPBrowserManager:
 
         except Exception as e:
             utils.logger.error(f"[CDPBrowserManager] CDP browser launch failed: {e}")
-            await self.cleanup()
+            # This manager owns the one browser launch attempt. Force cleanup
+            # here so callers never need a second cleanup or fallback launch.
+            await self.cleanup(force=True)
             raise
 
     async def _connect_existing_browser(

@@ -213,6 +213,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.cookie_urls = [self.index_url]
         self.user_agent: Optional[str] = None
         self.cdp_manager = None
+        self._browser_session_started = False
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
         self.post_interaction_mode = os.environ.get("TRIPPOSTCOLLECT_XHS_POST_INTERACTION", "none").strip()
         self.post_interaction_attempted = False
@@ -1895,6 +1896,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
         playwright_proxy_format: Optional[Dict],
         httpx_proxy_format: Optional[str],
     ) -> None:
+        if self._browser_session_started:
+            raise RuntimeError("xhs_browser_session_already_started")
+        # Latch before the first await. A failed first launch must not make the
+        # crawler instance reusable for a second Chrome/BrowserContext attempt.
+        self._browser_session_started = True
+
         if config.ENABLE_CDP_MODE:
             utils.logger.info("[XiaoHongShuCrawler] Launching browser using CDP mode")
             self.browser_context = await self.launch_browser_with_cdp(
@@ -3066,10 +3073,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
         user_agent: Optional[str],
         headless: bool = True,
     ) -> BrowserContext:
-        """Launch browser using CDP mode"""
+        """Launch one CDP browser or fail without a second launch path."""
+        manager = CDPBrowserManager()
+        self.cdp_manager = manager
         try:
-            self.cdp_manager = CDPBrowserManager()
-            browser_context = await self.cdp_manager.launch_and_connect(
+            browser_context = await manager.launch_and_connect(
                 playwright=playwright,
                 playwright_proxy=playwright_proxy,
                 user_agent=user_agent,
@@ -3077,16 +3085,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
 
             # Display browser information
-            browser_info = await self.cdp_manager.get_browser_info()
+            browser_info = await manager.get_browser_info()
             utils.logger.info(f"[XiaoHongShuCrawler] CDP browser info: {browser_info}")
 
             return browser_context
 
-        except Exception as e:
-            utils.logger.error(f"[XiaoHongShuCrawler] CDP mode launch failed, falling back to standard mode: {e}")
-            # Fall back to standard mode
-            chromium = playwright.chromium
-            return await self.launch_browser(chromium, playwright_proxy, user_agent, headless)
+        except Exception as exc:
+            if self.cdp_manager is manager:
+                self.cdp_manager = None
+            detail = f"{type(exc).__name__}: {exc}"
+            raise RuntimeError(f"xhs_cdp_browser_launch_failed:{detail}") from exc
 
     async def close(self, *, force: bool = False):
         """Close browser context"""

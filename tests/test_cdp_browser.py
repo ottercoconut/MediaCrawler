@@ -118,3 +118,30 @@ def test_xhs_browser_rejects_invalid_window_size(monkeypatch):
 
     with pytest.raises(RuntimeError, match="invalid TRIPPOSTCOLLECT_XHS_WINDOW_SIZE"):
         BrowserLauncher.xhs_window_size_argument()
+
+
+@pytest.mark.asyncio
+async def test_failed_cdp_launch_is_force_cleaned_once_by_owning_manager(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(config, "CDP_CONNECT_EXISTING", False)
+    manager = CDPBrowserManager()
+    manager._get_browser_path = AsyncMock(return_value="/fake/chrome")
+    manager.launcher.find_available_port = MagicMock(return_value=9444)
+    manager._launch_browser = AsyncMock()
+    manager._register_cleanup_handlers = MagicMock()
+    manager._connect_via_cdp = AsyncMock(
+        side_effect=RuntimeError("cdp handshake failed")
+    )
+    manager._create_browser_context = AsyncMock(
+        side_effect=AssertionError("context must not be created after failed handshake")
+    )
+    manager.cleanup = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="cdp handshake failed"):
+        await manager.launch_and_connect(playwright=MagicMock())
+
+    manager._launch_browser.assert_awaited_once_with("/fake/chrome", False)
+    manager._register_cleanup_handlers.assert_called_once_with()
+    manager.cleanup.assert_awaited_once_with(force=True)
+    manager._create_browser_context.assert_not_awaited()

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -449,3 +451,106 @@ async def test_xhs_snapshot_preserves_account_binding_and_session_device_id(
         "source": "xhs_selfinfo",
         "verified_at": metadata["session_verification"]["verified_at"],
     }
+
+
+@pytest.mark.asyncio
+async def test_cdp_launch_failure_never_starts_standard_fallback(monkeypatch) -> None:
+    instances = []
+    cleanup_calls: list[bool] = []
+
+    class FailingManager:
+        def __init__(self) -> None:
+            instances.append(self)
+
+        async def launch_and_connect(self, **_kwargs):
+            await self.cleanup(force=True)
+            raise RuntimeError("cdp connect failed")
+
+        async def cleanup(self, *, force: bool = False) -> None:
+            cleanup_calls.append(force)
+
+        async def get_browser_info(self):
+            raise AssertionError("failed launch must not query browser info")
+
+    chromium = SimpleNamespace(
+        launch=AsyncMock(side_effect=AssertionError("second browser launched")),
+        launch_persistent_context=AsyncMock(
+            side_effect=AssertionError("second browser context launched")
+        ),
+    )
+    playwright = SimpleNamespace(chromium=chromium)
+    crawler = XiaoHongShuCrawler()
+    crawler.launch_browser = AsyncMock(
+        side_effect=AssertionError("standard fallback launched")
+    )
+    monkeypatch.setattr(
+        "media_platform.xhs.core.CDPBrowserManager",
+        FailingManager,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^xhs_cdp_browser_launch_failed:RuntimeError: cdp connect failed$",
+    ):
+        await crawler.launch_browser_with_cdp(
+            playwright,
+            None,
+            None,
+            headless=False,
+        )
+
+    assert len(instances) == 1
+    assert cleanup_calls == [True]
+    assert crawler.cdp_manager is None
+    crawler.launch_browser.assert_not_awaited()
+    chromium.launch.assert_not_awaited()
+    chromium.launch_persistent_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_browser_session_latch_prevents_concurrent_second_launch(
+    monkeypatch,
+) -> None:
+    launch_entered = asyncio.Event()
+    release_launch = asyncio.Event()
+
+    async def blocked_launch(*_args, **_kwargs):
+        launch_entered.set()
+        await release_launch.wait()
+        raise RuntimeError("first launch failed")
+
+    crawler = XiaoHongShuCrawler()
+    crawler.launch_browser_with_cdp = AsyncMock(side_effect=blocked_launch)
+    monkeypatch.setattr("media_platform.xhs.core.config.ENABLE_CDP_MODE", True)
+    playwright = SimpleNamespace(chromium=SimpleNamespace())
+
+    first = asyncio.create_task(crawler._run_browser_session(playwright, None, None))
+    await asyncio.wait_for(launch_entered.wait(), timeout=0.2)
+    with pytest.raises(RuntimeError, match=r"^xhs_browser_session_already_started$"):
+        await crawler._run_browser_session(playwright, None, None)
+
+    release_launch.set()
+    with pytest.raises(RuntimeError, match="first launch failed"):
+        await first
+
+    assert crawler._browser_session_started is True
+    crawler.launch_browser_with_cdp.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_browser_session_cannot_be_restarted_sequentially(
+    monkeypatch,
+) -> None:
+    crawler = XiaoHongShuCrawler()
+    crawler.launch_browser_with_cdp = AsyncMock(
+        side_effect=RuntimeError("first launch failed")
+    )
+    monkeypatch.setattr("media_platform.xhs.core.config.ENABLE_CDP_MODE", True)
+    playwright = SimpleNamespace(chromium=SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="first launch failed"):
+        await crawler._run_browser_session(playwright, None, None)
+    with pytest.raises(RuntimeError, match=r"^xhs_browser_session_already_started$"):
+        await crawler._run_browser_session(playwright, None, None)
+
+    crawler.launch_browser_with_cdp.assert_awaited_once()
