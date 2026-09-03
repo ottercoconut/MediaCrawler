@@ -254,13 +254,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
             return default
 
     @staticmethod
-    def _env_int(name: str, default: int) -> int:
-        try:
-            return max(0, int(os.environ.get(name, str(default))))
-        except ValueError:
-            return default
-
-    @staticmethod
     def _validate_login_contract() -> None:
         for env_name in _XHS_REMOVED_LOGIN_ENV_VARS:
             if env_name in os.environ:
@@ -964,65 +957,36 @@ class XiaoHongShuCrawler(AbstractCrawler):
             or "targetclosederror" in text
         )
 
-    async def _run_human_behavior_with_page_recovery(self, keyword: str) -> Dict:
-        failed_page = self.context_page
+    async def _run_human_behavior_on_primary_page(self, keyword: str) -> Dict:
+        """Run behavior once; a closed primary page terminates this browser session."""
         try:
-            return await run_required_human_behavior(failed_page, "xhs")
+            return await run_required_human_behavior(self.context_page, "xhs")
         except Exception as exc:
             if not self._is_target_closed_error(exc):
                 raise
-        await self._activate_latest_xhs_page()
-        if self.context_page is failed_page or self._page_is_closed(self.context_page):
-            raise RuntimeError("xhs_behavior_target_closed_without_replacement")
-        utils.logger.warning(
-            "[XiaoHongShuCrawler] Primary page closed during behavior; "
-            f"adopting replacement page: {self.context_page.url}"
-        )
-        await self._confirm_replacement_session()
-        await self._open_behavior_search_page(keyword)
-        return await run_required_human_behavior(self.context_page, "xhs")
+            self._assert_cdp_lifecycle_alive("behavior_primary_page_closed")
+            raise RuntimeError(
+                "xhs_main_page_closed_unexpected:stage=behavior"
+            ) from exc
 
-    async def _open_behavior_search_page_with_recovery(self, keyword: str) -> None:
-        failed_page = self.context_page
+    async def _open_behavior_search_page_on_primary_page(self, keyword: str) -> None:
+        """Navigate once; never adopt another tab after the primary page closes."""
         try:
             await self._open_behavior_search_page(keyword)
-            return
         except Exception as exc:
             if not self._is_target_closed_error(exc):
                 raise
-        await self._activate_latest_xhs_page()
-        if self.context_page is failed_page or self._page_is_closed(self.context_page):
-            raise RuntimeError("xhs_search_target_closed_without_replacement")
-        utils.logger.warning(
-            "[XiaoHongShuCrawler] Primary page closed during search navigation; "
-            f"adopting replacement page: {self.context_page.url}"
-        )
-        await self._confirm_replacement_session()
-        await self._open_behavior_search_page(keyword)
+            self._assert_cdp_lifecycle_alive("search_navigation_primary_page_closed")
+            raise RuntimeError(
+                "xhs_main_page_closed_unexpected:stage=search_navigation"
+            ) from exc
 
-    async def _confirm_replacement_session(self) -> None:
-        markers = await self._visible_checkpoint_markers()
-        await self.xhs_client.update_cookies(
-            browser_context=self.browser_context,
-            urls=self.cookie_urls,
-        )
-        session_ready = await self._pong_with_network_recovery(
-            stage="replacement_session_confirmation",
-        )
-        visible_checkpoint = bool(
-            markers.get("security") or markers.get("login_or_qr")
-        )
-        if visible_checkpoint or not session_ready:
-            if not await self._wait_for_manual_checkpoint_if_needed():
-                raise RuntimeError("xhs_replacement_page_login_not_recovered")
-            await self.xhs_client.update_cookies(
-                browser_context=self.browser_context,
-                urls=self.cookie_urls,
-            )
-            if not await self._pong_with_network_recovery(
-                stage="replacement_session_after_manual_checkpoint",
-            ):
-                raise RuntimeError("xhs_replacement_page_session_not_confirmed")
+    def _assert_cdp_lifecycle_alive(self, stage: str) -> None:
+        """Prefer a manager-observed context/browser lifecycle code when present."""
+        manager = getattr(self, "cdp_manager", None)
+        assert_alive = getattr(manager, "assert_alive", None)
+        if callable(assert_alive):
+            assert_alive(stage)
 
     async def _run_qrcode_login(self) -> None:
         """Run the one XHS login state machine in the current browser session."""
@@ -1086,63 +1050,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
         except Exception:
             return False
 
-    async def _cookie_markers(self) -> Dict[str, bool]:
-        try:
-            current_cookie = await self.browser_context.cookies(self.cookie_urls)
-            _, cookie_dict = utils.convert_cookies(current_cookie)
-        except Exception:
-            cookie_dict = {}
-        return {
-            "web_session": bool(cookie_dict.get("web_session")),
-            "a1": bool(cookie_dict.get("a1")),
-            "webId": bool(cookie_dict.get("webId")),
-            "gid": bool(cookie_dict.get("gid")),
-        }
-
-    async def _visible_checkpoint_markers(self) -> Dict[str, object]:
-        markers = {
-            "security": [],
-            "login_or_qr": [],
-            "pages": [],
-        }
-        security_texts = (
-            "请通过验证",
-            "安全验证",
-            "验证码",
-            "身份验证",
-            "操作频繁",
-            "环境异常",
-            "风险",
-            "安全限制",
-            "账号异常",
-            "Account exception",
-            "300011",
-        )
-        login_texts = ("扫码登录", "二维码", "打开小红书扫一扫", "确认登录", "登录确认", "手机号登录")
-        try:
-            pages = [page for page in self.browser_context.pages if not page.is_closed()]
-        except Exception:
-            pages = [self.context_page]
-        for page in pages:
-            page_info: Dict[str, object] = {"url": page.url}
-            try:
-                content = await page.content()
-            except Exception:
-                content = ""
-            security = sorted({text for text in security_texts if text in content})
-            if "/website-login/error" in str(page.url or ""):
-                security.append("website-login/error")
-                security = sorted(set(security))
-            login_or_qr = sorted({text for text in login_texts if text in content})
-            if security:
-                markers["security"] = sorted(set(markers["security"]) | set(security))  # type: ignore[arg-type]
-            if login_or_qr:
-                markers["login_or_qr"] = sorted(set(markers["login_or_qr"]) | set(login_or_qr))  # type: ignore[arg-type]
-            page_info["security"] = security
-            page_info["login_or_qr"] = login_or_qr
-            markers["pages"].append(page_info)  # type: ignore[union-attr]
-        return markers
-
     async def _wait_for_initial_page_settle(self) -> None:
         settle_seconds = self._env_float("TRIPPOSTCOLLECT_XHS_INITIAL_SETTLE_SECONDS", 12.0)
         try:
@@ -1159,55 +1066,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             await asyncio.sleep(settle_seconds)
         await self._activate_latest_xhs_page()
-
-    async def _wait_for_manual_checkpoint_if_needed(self) -> bool:
-        budget = self._get_manual_wait_budget()
-        ticket = budget.start("startup_manual_checkpoint")
-        try:
-            utils.logger.info(
-                "[XiaoHongShuCrawler] Login state is not ready; waiting within "
-                f"the shared manual budget ({ticket.remaining_seconds:.1f}s left) "
-                "for visible security/login confirmation ..."
-            )
-            last_print = 0.0
-            while True:
-                ticket.raise_if_exhausted()
-                await self._single_page_for_login()
-                checkpoint_markers = await self._visible_checkpoint_markers()
-                security_markers = set(checkpoint_markers.get("security") or [])
-                if security_markers.intersection(
-                    {"安全限制", "账号异常", "Account exception", "300011", "website-login/error"}
-                ):
-                    raise RuntimeError("xhs_platform_security_limit_300011")
-                cookie_markers = await self._cookie_markers()
-                profile_ui = await self._profile_ui_visible()
-                ticket.raise_if_exhausted()
-                visible_checkpoint = bool(
-                    checkpoint_markers.get("security")
-                    or checkpoint_markers.get("login_or_qr")
-                )
-                if profile_ui and not visible_checkpoint:
-                    utils.logger.info(
-                        "[XiaoHongShuCrawler] Login/session markers became ready "
-                        "after manual checkpoint wait: "
-                        f"profile_ui={profile_ui}, cookies={cookie_markers}"
-                    )
-                    return True
-
-                elapsed = ticket.manual_elapsed_seconds
-                if elapsed - last_print >= 10:
-                    utils.logger.info(
-                        "[XiaoHongShuCrawler] Waiting for Xiaohongshu checkpoint: "
-                        f"profile_ui={profile_ui}, cookies={cookie_markers}, "
-                        f"visible={checkpoint_markers}"
-                    )
-                    last_print = elapsed
-                remaining = ticket.remaining_seconds
-                if remaining <= 0:
-                    ticket.raise_if_exhausted()
-                await self._popup_sleep(min(2.0, remaining))
-        finally:
-            ticket.close()
 
     @staticmethod
     def _request_failure_exception(exc: BaseException) -> BaseException:
@@ -1349,10 +1207,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
         raise RuntimeError(f"xhs_{terminal}_during_page_guard:{reason}")
 
     def _assert_network_recovery_session(self, state: Dict[str, object]) -> None:
-        manager = getattr(self, "cdp_manager", None)
-        assert_alive = getattr(manager, "assert_alive", None)
-        if callable(assert_alive):
-            assert_alive(str(state.get("stage") or "network_recovery"))
+        self._assert_cdp_lifecycle_alive(
+            str(state.get("stage") or "network_recovery")
+        )
 
         context = getattr(self, "browser_context", None)
         page = state.get("operation_page")
@@ -1844,9 +1701,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
             "",
         )
         if behavior_keyword:
-            await self._open_behavior_search_page_with_recovery(behavior_keyword)
+            await self._open_behavior_search_page_on_primary_page(behavior_keyword)
         await self._activate_latest_xhs_page()
-        behavior_evidence = await self._run_human_behavior_with_page_recovery(
+        behavior_evidence = await self._run_human_behavior_on_primary_page(
             behavior_keyword
         )
         if behavior_evidence.get("status") != "completed":

@@ -85,6 +85,8 @@ async def test_unexpected_xhs_tab_is_held_and_preserved_for_login() -> None:
     await asyncio.sleep(0)
 
     assert selected is primary
+    assert crawler.context_page is primary
+    assert crawler._new_pages[id(popup)][2] == "platform_opened"
     assert popup.closed is False
     assert events[0] == ("front", "security-popup")
     assert events[1][0] == "sleep"
@@ -162,7 +164,7 @@ async def test_xhs_context_cleanup_waits_for_unexpected_tab() -> None:
 
 
 @pytest.mark.asyncio
-async def test_xhs_behavior_adopts_replacement_page_after_target_closed(
+async def test_xhs_behavior_primary_page_close_is_terminal_without_adoption(
     monkeypatch,
 ) -> None:
     events: list[tuple[str, object]] = []
@@ -173,43 +175,97 @@ async def test_xhs_behavior_adopts_replacement_page_after_target_closed(
     crawler.browser_context = context
     crawler.context_page = original
     original.closed = True
-    calls = []
+    calls: list[FakePage] = []
+    lifecycle_stages: list[str] = []
 
     async def run_behavior(page, platform_key):
         calls.append(page)
-        if page is original:
-            raise RuntimeError(
-                "human_behavior_failed:xhs:TargetClosedError: "
-                "Target page, context or browser has been closed"
-            )
-        return {"status": "completed"}
-
-    class FakeClient:
-        def __init__(self) -> None:
-            self.playwright_page = original
-            self.updated = 0
-
-        async def update_cookies(self, *, browser_context, urls) -> None:
-            assert browser_context is context
-            self.updated += 1
-
-        async def pong(self) -> bool:
-            return True
+        raise RuntimeError(
+            "human_behavior_failed:xhs:TargetClosedError: "
+            "Target page, context or browser has been closed"
+        )
 
     monkeypatch.setattr(
         "media_platform.xhs.core.run_required_human_behavior",
         run_behavior,
     )
-    crawler.xhs_client = FakeClient()
-    crawler._open_behavior_search_page = AsyncMock()
+    crawler.xhs_client = SimpleNamespace(playwright_page=original)
+    crawler.cdp_manager = SimpleNamespace(assert_alive=lifecycle_stages.append)
+    crawler._activate_latest_xhs_page = AsyncMock(
+        side_effect=AssertionError("must not adopt an existing page")
+    )
+    crawler.launch_browser_with_cdp = AsyncMock(
+        side_effect=AssertionError("must not relaunch Chrome")
+    )
 
-    evidence = await crawler._run_human_behavior_with_page_recovery("青岛旅游")
+    with pytest.raises(RuntimeError) as exc_info:
+        await crawler._run_human_behavior_on_primary_page("青岛旅游")
 
-    assert evidence["status"] == "completed"
-    assert calls == [original, replacement]
-    assert crawler.context_page is replacement
-    assert crawler.xhs_client.playwright_page is replacement
+    assert str(exc_info.value) == "xhs_main_page_closed_unexpected:stage=behavior"
+    assert calls == [original]
+    assert lifecycle_stages == ["behavior_primary_page_closed"]
+    assert crawler.context_page is original
+    assert crawler.xhs_client.playwright_page is original
+    assert replacement.closed is False
+    crawler._activate_latest_xhs_page.assert_not_awaited()
+    crawler.launch_browser_with_cdp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_xhs_search_navigation_primary_page_close_is_terminal_without_retry() -> None:
+    events: list[tuple[str, object]] = []
+    original = FakePage("search", events)
+    replacement = FakePage("replacement", events)
+    context = FakeContext([original, replacement], events)
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = context
+    crawler.context_page = original
+    crawler.xhs_client = SimpleNamespace(playwright_page=original)
+    crawler._open_behavior_search_page = AsyncMock(
+        side_effect=RuntimeError(
+            "TargetClosedError: Target page, context or browser has been closed"
+        )
+    )
+    crawler._activate_latest_xhs_page = AsyncMock(
+        side_effect=AssertionError("must not adopt an existing page")
+    )
+    crawler.launch_browser_with_cdp = AsyncMock(
+        side_effect=AssertionError("must not relaunch Chrome")
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await crawler._open_behavior_search_page_on_primary_page("青岛旅游")
+
+    assert str(exc_info.value) == (
+        "xhs_main_page_closed_unexpected:stage=search_navigation"
+    )
     crawler._open_behavior_search_page.assert_awaited_once_with("青岛旅游")
+    assert crawler.context_page is original
+    assert crawler.xhs_client.playwright_page is original
+    assert replacement.closed is False
+    crawler._activate_latest_xhs_page.assert_not_awaited()
+    crawler.launch_browser_with_cdp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_xhs_search_navigation_network_error_is_not_mislabeled_page_close() -> None:
+    events: list[tuple[str, object]] = []
+    primary = FakePage("search", events)
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = FakeContext([primary], events)
+    crawler.context_page = primary
+    network_error = RuntimeError("net::ERR_INTERNET_DISCONNECTED")
+    crawler._open_behavior_search_page = AsyncMock(side_effect=network_error)
+    crawler._assert_cdp_lifecycle_alive = AsyncMock(
+        side_effect=AssertionError("network errors are not page-close lifecycle events")
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await crawler._open_behavior_search_page_on_primary_page("青岛旅游")
+
+    assert exc_info.value is network_error
+    crawler._open_behavior_search_page.assert_awaited_once_with("青岛旅游")
+    crawler._assert_cdp_lifecycle_alive.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -279,30 +335,6 @@ async def test_standalone_xhs_login_stops_on_platform_security_limit() -> None:
 
     with pytest.raises(RuntimeError, match="xhs_platform_security_limit_300011"):
         await login._check_login_state_once("")
-
-
-@pytest.mark.asyncio
-async def test_crawler_checkpoint_markers_detect_url_only_security_limit() -> None:
-    class SecurityLimitPage:
-        url = "https://www.xiaohongshu.com/website-login/error?redirectPath=%2Fexplore"
-
-        def is_closed(self) -> bool:
-            return False
-
-        async def content(self) -> str:
-            return ""
-
-    class Context:
-        pages = [SecurityLimitPage()]
-
-    crawler = XiaoHongShuCrawler()
-    crawler.browser_context = Context()
-    crawler.context_page = Context.pages[0]
-
-    markers = await crawler._visible_checkpoint_markers()
-
-    assert markers["security"] == ["website-login/error"]
-    assert markers["pages"][0]["url"] == Context.pages[0].url
 
 
 @pytest.mark.asyncio

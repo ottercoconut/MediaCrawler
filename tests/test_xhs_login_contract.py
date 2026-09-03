@@ -359,8 +359,8 @@ def _configure_browser_session_test(
     crawler._goto_with_deadline = AsyncMock()
     crawler._wait_for_initial_page_settle = AsyncMock()
     crawler._wait_for_visible_page_shell = AsyncMock(return_value=True)
-    crawler._open_behavior_search_page_with_recovery = AsyncMock()
-    crawler._run_human_behavior_with_page_recovery = AsyncMock(
+    crawler._open_behavior_search_page_on_primary_page = AsyncMock()
+    crawler._run_human_behavior_on_primary_page = AsyncMock(
         return_value={"status": "completed"}
     )
     crawler.search = AsyncMock()
@@ -469,7 +469,7 @@ async def test_failed_startup_pong_enters_real_qrcode_state_machine_once(
     assert events.index("update_cookies") < events.index(
         "pong:startup_post_login_probe"
     )
-    crawler._run_human_behavior_with_page_recovery.assert_awaited_once_with(
+    crawler._run_human_behavior_on_primary_page.assert_awaited_once_with(
         "青岛登录测试"
     )
     crawler.search.assert_awaited_once_with()
@@ -519,8 +519,8 @@ async def test_startup_sms_terminal_fails_immediately_without_retry_or_business_
         call(stage="startup_login_probe")
     ]
     client.update_cookies.assert_not_awaited()
-    crawler._open_behavior_search_page_with_recovery.assert_not_awaited()
-    crawler._run_human_behavior_with_page_recovery.assert_not_awaited()
+    crawler._open_behavior_search_page_on_primary_page.assert_not_awaited()
+    crawler._run_human_behavior_on_primary_page.assert_not_awaited()
     crawler.search.assert_not_awaited()
 
 

@@ -242,24 +242,6 @@ async def test_creator_browser_fallback_waits_on_login_url(crawler, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_startup_checkpoint_wait_stops_on_platform_security_limit(crawler, monkeypatch):
-    monkeypatch.setattr(crawler, "_env_int", lambda name, default: 600)
-    crawler._single_page_for_login = AsyncMock()
-    crawler._cookie_markers = AsyncMock(return_value={"web_session": True})
-    crawler._profile_ui_visible = AsyncMock(return_value=True)
-    crawler._visible_checkpoint_markers = AsyncMock(
-        return_value={
-            "security": ["website-login/error"],
-            "login_or_qr": [],
-            "pages": [],
-        }
-    )
-
-    with pytest.raises(RuntimeError, match="xhs_platform_security_limit_300011"):
-        await crawler._wait_for_manual_checkpoint_if_needed()
-
-
-@pytest.mark.asyncio
 async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
     crawler,
     monkeypatch,
