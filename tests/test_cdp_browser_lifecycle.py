@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import signal
 import subprocess
 from types import SimpleNamespace
@@ -328,6 +329,120 @@ async def test_planned_cleanup_does_not_latch_close_or_disconnect() -> None:
     assert browser.close_calls == 1
     assert context.close_calls == 1
     manager.launcher.cleanup.assert_called_once_with(reason="normal_completion")
+
+
+@pytest.mark.asyncio
+async def test_context_cleanup_timeout_is_audited_and_retryable() -> None:
+    process = FakeProcess(pid=1323)
+    manager, browser, context = _connected_manager(process=process)
+    close_attempts = 0
+
+    async def close_context() -> None:
+        nonlocal close_attempts
+        close_attempts += 1
+        if close_attempts == 1:
+            await asyncio.Event().wait()
+
+    context.close = AsyncMock(side_effect=close_context)
+    manager.launcher.cleanup = MagicMock(
+        return_value={
+            "status": "terminated",
+            "reason": "normal_completion",
+            "pid": 1323,
+            "returncode": -15,
+        }
+    )
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.01):
+            await manager.cleanup(force=True, reason="normal_completion")
+
+    interrupted = manager.lifecycle_snapshot()["cleanup"]
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["interrupted_at"] == "context_close"
+    assert interrupted["context"] == "interrupted"
+    assert "CancelledError" in interrupted["errors"][-1]
+    assert interrupted["process"]["status"] == "not_started"
+    assert interrupted["process"]["pid"] == 1323
+    assert manager._cleanup_in_progress is False
+    assert manager._cleanup_complete is False
+    assert manager.browser_context is context
+    assert manager.browser is browser
+    assert manager.launcher.browser_process is process
+    manager.launcher.cleanup.assert_not_called()
+
+    completed = await manager.cleanup(force=True, reason="retry_cleanup")
+
+    assert completed["status"] == "completed"
+    assert manager._cleanup_complete is True
+    assert manager.browser_context is None
+    assert manager.browser is None
+    assert context.close.await_count == 2
+    manager.launcher.cleanup.assert_called_once_with(
+        reason="normal_completion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_browser_cleanup_cancellation_retains_unconfirmed_handles() -> None:
+    process = FakeProcess(pid=1333)
+    manager, browser, context = _connected_manager(process=process)
+    browser.close = AsyncMock(
+        side_effect=[asyncio.CancelledError("browser close cancelled"), None]
+    )
+    manager.launcher.cleanup = MagicMock(
+        return_value={
+            "status": "terminated",
+            "reason": "normal_completion",
+            "pid": 1333,
+            "returncode": -15,
+        }
+    )
+
+    with pytest.raises(
+        asyncio.CancelledError,
+        match="browser close cancelled",
+    ):
+        await manager.cleanup(force=True, reason="normal_completion")
+
+    interrupted = manager.lifecycle_snapshot()["cleanup"]
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["interrupted_at"] == "browser_close"
+    assert interrupted["context"] == "closed"
+    assert interrupted["browser"] == "interrupted"
+    assert interrupted["process"]["status"] == "not_started"
+    assert manager._cleanup_in_progress is False
+    assert manager.browser_context is None
+    assert manager.browser is browser
+    assert manager.launcher.browser_process is process
+    assert context.close_calls == 1
+    manager.launcher.cleanup.assert_not_called()
+
+    completed = await manager.cleanup(force=True, reason="retry_cleanup")
+
+    assert completed["status"] == "completed"
+    assert manager.browser is None
+    assert browser.close.await_count == 2
+    manager.launcher.cleanup.assert_called_once_with(
+        reason="normal_completion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_crawler_close_does_not_swallow_cleanup_timeout() -> None:
+    crawler = XiaoHongShuCrawler()
+    manager = MagicMock()
+    manager.cleanup = AsyncMock(
+        side_effect=TimeoutError("cleanup deadline exceeded")
+    )
+    crawler.cdp_manager = manager
+    crawler._prepare_browser_shutdown = AsyncMock()
+
+    with pytest.raises(TimeoutError, match="cleanup deadline exceeded"):
+        await crawler.close(force=True)
+
+    assert crawler.cdp_manager is manager
+    manager.cleanup.assert_awaited_once_with(force=True)
 
 
 @pytest.mark.asyncio

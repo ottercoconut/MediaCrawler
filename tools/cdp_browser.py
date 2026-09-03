@@ -695,6 +695,50 @@ class CDPBrowserManager:
                 return []
         return []
 
+    def _record_cancelled_cleanup(
+        self,
+        *,
+        reason: str,
+        stage: str,
+        context_status: str,
+        browser_status: str,
+        errors: list[str],
+        error: asyncio.CancelledError,
+    ) -> None:
+        if self._owns_browser_process:
+            process_result = {
+                "status": "not_started",
+                "reason": reason,
+                **self.launcher.process_status(reason="cleanup_interrupted"),
+            }
+        else:
+            process_result = {
+                "status": "not_owned",
+                "reason": reason,
+            }
+        detail = str(error) or "no detail"
+        result = {
+            "status": "interrupted",
+            "reason": reason,
+            "interrupted_at": stage,
+            "context": context_status,
+            "browser": browser_status,
+            "process": process_result,
+            "errors": [
+                *errors,
+                f"{stage}:{type(error).__name__}:{detail}",
+            ],
+        }
+        with self._state_lock:
+            self.last_cleanup_result = result
+            self._cleanup_complete = False
+            self._cleanup_in_progress = False
+        utils.logger.error(
+            "[CDPBrowserManager] Resource cleanup interrupted; "
+            f"reason={reason}, stage={stage}, "
+            f"error={type(error).__name__}: {detail}"
+        )
+
     async def cleanup(
         self,
         force: bool = False,
@@ -734,6 +778,20 @@ class CDPBrowserManager:
         if context is not None:
             try:
                 await context.close()
+            except asyncio.CancelledError as exc:
+                self._record_cancelled_cleanup(
+                    reason=cleanup_reason,
+                    stage="context_close",
+                    context_status="interrupted",
+                    browser_status=(
+                        "not_started"
+                        if self.browser is not None
+                        else "not_present"
+                    ),
+                    errors=errors,
+                    error=exc,
+                )
+                raise
             except Exception as exc:
                 error_msg = str(exc).casefold()
                 if "closed" in error_msg or "disconnected" in error_msg:
@@ -755,6 +813,16 @@ class CDPBrowserManager:
                 else:
                     browser_status = "already_disconnected"
                 self.browser = None
+            except asyncio.CancelledError as exc:
+                self._record_cancelled_cleanup(
+                    reason=cleanup_reason,
+                    stage="browser_close",
+                    context_status=context_status,
+                    browser_status="interrupted",
+                    errors=errors,
+                    error=exc,
+                )
+                raise
             except Exception as exc:
                 error_msg = str(exc).casefold()
                 if "closed" in error_msg or "disconnected" in error_msg:

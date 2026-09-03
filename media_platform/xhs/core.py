@@ -3121,9 +3121,22 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     self.cdp_manager = None
                 else:
                     await self.browser_context.close()
+        except asyncio.CancelledError:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler.close] Browser cleanup was cancelled; "
+                "retaining lifecycle handles for audit and retry"
+            )
+            raise
+        except TimeoutError:
+            utils.logger.error(
+                "[XiaoHongShuCrawler.close] Browser cleanup timed out; "
+                "retaining lifecycle handles for audit and retry"
+            )
+            raise
         except Exception as exc:
             utils.logger.warning(f"[XiaoHongShuCrawler.close] Browser cleanup timed out or failed: {exc}")
-        utils.logger.info("[XiaoHongShuCrawler.close] Browser context closed ...")
+        else:
+            utils.logger.info("[XiaoHongShuCrawler.close] Browser context closed ...")
 
     async def get_notice_media(self, note_detail: Dict):
         if not config.ENABLE_GET_MEIDAS:
