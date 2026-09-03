@@ -74,14 +74,6 @@ class AbstractLogin(ABC):
     async def login_by_qrcode(self):
         pass
 
-    @abstractmethod
-    async def login_by_mobile(self):
-        pass
-
-    @abstractmethod
-    async def login_by_cookies(self):
-        pass
-
 
 class AbstractStore(ABC):
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -203,7 +202,6 @@ async def test_xhs_behavior_adopts_replacement_page_after_target_closed(
     )
     crawler.xhs_client = FakeClient()
     crawler._open_behavior_search_page = AsyncMock()
-    crawler._write_storage_state = AsyncMock()
 
     evidence = await crawler._run_human_behavior_with_page_recovery("青岛旅游")
 
@@ -212,7 +210,6 @@ async def test_xhs_behavior_adopts_replacement_page_after_target_closed(
     assert crawler.context_page is replacement
     assert crawler.xhs_client.playwright_page is replacement
     crawler._open_behavior_search_page.assert_awaited_once_with("青岛旅游")
-    crawler._write_storage_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -309,170 +306,21 @@ async def test_crawler_checkpoint_markers_detect_url_only_security_limit() -> No
 
 
 @pytest.mark.asyncio
-async def test_xhs_shutdown_snapshots_device_state_before_closing_pages() -> None:
+async def test_xhs_shutdown_never_snapshots_browser_storage() -> None:
     events: list[tuple[str, object]] = []
     page = FakePage("search", events)
     context = FakeContext([page], events)
+    context.storage_state = AsyncMock(
+        side_effect=AssertionError("XHS must not serialize login state")
+    )
     crawler = XiaoHongShuCrawler()
     crawler.browser_context = context
 
-    async def snapshot() -> None:
-        events.append(("snapshot", "state"))
-
-    crawler._write_storage_state = snapshot
     await crawler._prepare_browser_shutdown()
 
-    assert events[0] == ("snapshot", "state")
-    assert events[1] == ("close", "search")
-    assert crawler._shutdown_storage_state_written is True
-
-
-@pytest.mark.asyncio
-async def test_xhs_restore_does_not_overwrite_newer_profile_cookie(tmp_path) -> None:
-    snapshot_path = tmp_path / "storage-state.json"
-    snapshot_path.write_text(
-        json.dumps(
-            {
-                "cookies": [
-                    {
-                        "name": "web_session",
-                        "value": "stale",
-                        "domain": ".xiaohongshu.com",
-                        "path": "/",
-                    },
-                    {
-                        "name": "a1",
-                        "value": "fallback",
-                        "domain": ".xiaohongshu.com",
-                        "path": "/",
-                    },
-                ],
-                "origins": [],
-                "trippostcollect": {
-                    "runtime_storage": [
-                        {
-                            "origin": "https://www.xiaohongshu.com",
-                            "page_role": "primary",
-                            "localStorage": {},
-                            "sessionStorage": {"XHS_TAB_DEVICE_ID": "stable-device"},
-                        },
-                        {
-                            "origin": "https://www.xiaohongshu.com",
-                            "page_role": "secondary",
-                            "localStorage": {},
-                            "sessionStorage": {"XHS_TAB_DEVICE_ID": "other-device"},
-                        }
-                    ]
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    class RestoreContext:
-        def __init__(self) -> None:
-            self.added_cookies = []
-            self.script = ""
-
-        async def cookies(self):
-            return [{"name": "web_session", "domain": ".xiaohongshu.com", "path": "/"}]
-
-        async def add_cookies(self, cookies):
-            self.added_cookies = cookies
-
-        async def add_init_script(self, *, script):
-            self.script = script
-
-    class RestorePage:
-        url = "about:blank"
-
-        def __init__(self) -> None:
-            self.script = ""
-
-        async def add_init_script(self, *, script):
-            self.script = script
-
-    crawler = XiaoHongShuCrawler()
-    crawler.browser_context = RestoreContext()
-    crawler._storage_state_path = lambda: str(snapshot_path)
-    page = RestorePage()
-
-    assert await crawler._restore_storage_state(primary_page=page) is True
-    assert [cookie["name"] for cookie in crawler.browser_context.added_cookies] == ["a1"]
-    assert "XHS_TAB_DEVICE_ID" not in crawler.browser_context.script
-    assert "XHS_TAB_DEVICE_ID" in page.script
-    assert "other-device" not in page.script
-    assert "sessionStorage.getItem(key) === null" in page.script
-
-
-@pytest.mark.asyncio
-async def test_xhs_snapshot_preserves_account_binding_and_session_device_id(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    snapshot_path = tmp_path / "storage-state.json"
-    snapshot_path.write_text(
-        json.dumps(
-            {
-                "cookies": [],
-                "origins": [],
-                "trippostcollect": {
-                    "schema_version": 3,
-                    "account_id": "xhs-a02",
-                    "identity_hash": "identity-2",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    class StoragePage:
-        url = "https://www.xiaohongshu.com/explore"
-
-        def is_closed(self):
-            return False
-
-        async def evaluate(self, script):
-            assert "sessionStorage" in script
-            return {
-                "origin": "https://www.xiaohongshu.com",
-                "url": self.url,
-                "localStorage": {"b1": "browser"},
-                "sessionStorage": {"XHS_TAB_DEVICE_ID": "stable-device"},
-            }
-
-    class StorageContext:
-        pages = [StoragePage()]
-
-        async def storage_state(self):
-            return {"cookies": [], "origins": []}
-
-    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_ACCOUNT_ID", "xhs-a02")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_RUN_ID", "run-verified")
-    crawler = XiaoHongShuCrawler()
-    crawler.browser_context = StorageContext()
-    crawler.context_page = crawler.browser_context.pages[0]
-    crawler._storage_state_path = lambda: str(snapshot_path)
-
-    await crawler._write_storage_state(session_verified=True)
-
-    saved = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    metadata = saved["trippostcollect"]
-    assert metadata["schema_version"] == 3
-    assert metadata["account_id"] == "xhs-a02"
-    assert metadata["identity_hash"] == "identity-2"
-    assert metadata["runtime_storage"][0]["sessionStorage"] == {
-        "XHS_TAB_DEVICE_ID": "stable-device"
-    }
-    assert metadata["runtime_storage"][0]["page_role"] == "primary"
-    assert metadata["session_verification"] == {
-        "status": "verified",
-        "run_id": "run-verified",
-        "source": "xhs_selfinfo",
-        "verified_at": metadata["session_verification"]["verified_at"],
-    }
-
-
+    context.storage_state.assert_not_awaited()
+    assert events == [("close", "search")]
+    assert not hasattr(crawler, "_shutdown_storage_state_written")
 @pytest.mark.asyncio
 async def test_cdp_launch_failure_never_starts_standard_fallback(monkeypatch) -> None:
     instances = []

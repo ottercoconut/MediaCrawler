@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import config
 from media_platform.xhs import login as login_module
 from media_platform.xhs.core import XiaoHongShuCrawler
 from media_platform.xhs.login import XiaoHongShuLogin
@@ -154,8 +155,8 @@ def configure_virtual_login(
         "TRIPPOSTCOLLECT_XHS_STABLE_LOGIN_SECONDS",
         str(stable_seconds),
     )
-    monkeypatch.setattr(login_module.config, "ENABLE_CDP_MODE", True)
-    monkeypatch.setattr(login_module.config, "CDP_HEADLESS", False)
+    monkeypatch.setattr(config, "ENABLE_CDP_MODE", True)
+    monkeypatch.setattr(config, "CDP_HEADLESS", False)
 
 
 def make_login(

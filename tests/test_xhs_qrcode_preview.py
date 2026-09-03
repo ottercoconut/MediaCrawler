@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
+import config
 from media_platform.xhs import login as login_module
 from media_platform.xhs.login import XiaoHongShuLogin
 from media_platform.xhs.manual_wait import XHSManualWaitBudgetExhausted
@@ -97,9 +98,9 @@ async def test_qrcode_never_schedules_initial_or_refreshed_os_preview(
         login,
         wait_seconds=182,
     )
-    monkeypatch.setattr(login_module.config, "ENABLE_CDP_MODE", enable_cdp)
-    monkeypatch.setattr(login_module.config, "CDP_HEADLESS", cdp_headless)
-    monkeypatch.setattr(login_module.config, "HEADLESS", playwright_headless)
+    monkeypatch.setattr(config, "ENABLE_CDP_MODE", enable_cdp)
+    monkeypatch.setattr(config, "CDP_HEADLESS", cdp_headless)
+    monkeypatch.setattr(config, "HEADLESS", playwright_headless)
     get_running_loop = MagicMock(
         side_effect=AssertionError("XHS login must not schedule an OS preview")
     )
@@ -144,9 +145,9 @@ async def test_headless_qrcode_stays_in_browser_without_os_preview(
     get_running_loop = MagicMock(
         side_effect=AssertionError("headless XHS login must not open an OS preview")
     )
-    monkeypatch.setattr(login_module.config, "ENABLE_CDP_MODE", enable_cdp)
-    monkeypatch.setattr(login_module.config, "CDP_HEADLESS", cdp_headless)
-    monkeypatch.setattr(login_module.config, "HEADLESS", playwright_headless)
+    monkeypatch.setattr(config, "ENABLE_CDP_MODE", enable_cdp)
+    monkeypatch.setattr(config, "CDP_HEADLESS", cdp_headless)
+    monkeypatch.setattr(config, "HEADLESS", playwright_headless)
     monkeypatch.setattr(
         login_module.asyncio,
         "get_running_loop",
@@ -176,9 +177,9 @@ async def test_removed_preview_hooks_cannot_abort_headless_login(
     get_running_loop = MagicMock(
         side_effect=AssertionError("legacy preview scheduling invoked")
     )
-    monkeypatch.setattr(login_module.config, "ENABLE_CDP_MODE", True)
-    monkeypatch.setattr(login_module.config, "CDP_HEADLESS", True)
-    monkeypatch.setattr(login_module.config, "HEADLESS", False)
+    monkeypatch.setattr(config, "ENABLE_CDP_MODE", True)
+    monkeypatch.setattr(config, "CDP_HEADLESS", True)
+    monkeypatch.setattr(config, "HEADLESS", False)
     monkeypatch.setattr(
         login_module.asyncio,
         "get_running_loop",
