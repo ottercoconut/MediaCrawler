@@ -1510,6 +1510,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
         raise RuntimeError(f"xhs_{terminal}_during_page_guard:{reason}")
 
     def _assert_network_recovery_session(self, state: Dict[str, object]) -> None:
+        manager = getattr(self, "cdp_manager", None)
+        assert_alive = getattr(manager, "assert_alive", None)
+        if callable(assert_alive):
+            assert_alive(str(state.get("stage") or "network_recovery"))
+
         context = getattr(self, "browser_context", None)
         page = state.get("operation_page")
         if context is None:

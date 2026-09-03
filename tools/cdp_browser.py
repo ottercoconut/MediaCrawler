@@ -18,19 +18,37 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 
-import os
 import asyncio
-import socket
-import httpx
-import signal
 import atexit
+import os
+import signal
+import socket
+import threading
+import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
+import httpx
 from playwright.async_api import Browser, BrowserContext, Playwright
 
 import config
-from tools.browser_launcher import BrowserLauncher
 from tools import utils
+from tools.browser_launcher import BrowserLauncher
+
+
+class CDPBrowserLifecycleError(RuntimeError):
+    """The one browser session disappeared outside a planned cleanup."""
+
+    def __init__(self, event: Dict[str, Any], *, stage: str):
+        self.event = dict(event)
+        self.stage = stage
+        code = str(event.get("code") or "xhs_cdp_lifecycle_failure")
+        details = [f"stage={stage}"]
+        for key in ("pid", "returncode", "debug_port", "detail"):
+            value = event.get(key)
+            if value is not None and value != "":
+                details.append(f"{key}={value}")
+        super().__init__(f"{code}:" + ":".join(details))
 
 
 class CDPBrowserManager:
@@ -44,6 +62,187 @@ class CDPBrowserManager:
         self.browser_context: Optional[BrowserContext] = None
         self.debug_port: Optional[int] = None
         self._cleanup_registered = False
+        self._launch_started = False
+        self._connection_established = False
+        self._owns_browser_process = False
+        self._planned_cleanup_reason = ""
+        self._cleanup_in_progress = False
+        self._cleanup_complete = False
+        self._observed_browser: Optional[Browser] = None
+        self._observed_browser_context: Optional[BrowserContext] = None
+        self._unexpected_lifecycle_event: Optional[Dict[str, Any]] = None
+        self.last_cleanup_result: Optional[Dict[str, Any]] = None
+        self._state_lock = threading.RLock()
+
+    def mark_planned_cleanup(self, reason: str) -> None:
+        normalized = str(reason or "requested")[:160]
+        with self._state_lock:
+            if not self._planned_cleanup_reason:
+                self._planned_cleanup_reason = normalized
+
+    def _planned_close_reason(self) -> str:
+        with self._state_lock:
+            reason = self._planned_cleanup_reason
+        if reason:
+            return reason
+        if self.launcher.cleanup_requested:
+            return "launcher_cleanup"
+        return ""
+
+    def lifecycle_snapshot(self) -> Dict[str, Any]:
+        with self._state_lock:
+            unexpected = dict(self._unexpected_lifecycle_event or {})
+            cleanup = dict(self.last_cleanup_result or {})
+            planned_reason = self._planned_cleanup_reason
+            connection_established = self._connection_established
+        return {
+            "planned_cleanup_reason": planned_reason,
+            "connection_established": connection_established,
+            "unexpected": unexpected,
+            "cleanup": cleanup,
+            "process": self.launcher.process_status(reason="lifecycle_snapshot"),
+        }
+
+    def _capture_lifecycle_event(self, kind: str, *, detail: str = "") -> None:
+        planned_reason = self._planned_close_reason()
+        if planned_reason:
+            utils.logger.info(
+                "[CDPBrowserManager] Planned browser lifecycle event; "
+                f"kind={kind}, reason={planned_reason}"
+            )
+            return
+
+        process = self.launcher.process_status(reason=kind)
+        if kind == "browser_process_exited" or (
+            process.get("present") and not process.get("running")
+        ):
+            code = "xhs_browser_process_exited"
+        elif kind == "browser_disconnected":
+            code = "xhs_cdp_disconnected_unexpected"
+        elif kind == "context_closed":
+            code = "xhs_browser_context_closed_unexpected"
+        else:
+            code = "xhs_cdp_lifecycle_failure"
+        event = {
+            "code": code,
+            "kind": kind,
+            "pid": process.get("pid"),
+            "returncode": process.get("returncode"),
+            "debug_port": self.debug_port,
+            "detail": str(detail or "")[:300],
+            "observed_at": time.time(),
+        }
+        with self._state_lock:
+            if self._planned_cleanup_reason or self.launcher.cleanup_requested:
+                return
+            if self._unexpected_lifecycle_event is None:
+                self._unexpected_lifecycle_event = event
+            else:
+                event = dict(self._unexpected_lifecycle_event)
+        utils.logger.error(
+            "[CDPBrowserManager] Unexpected browser lifecycle event: "
+            + str(CDPBrowserLifecycleError(event, stage="event"))
+        )
+
+    def _observe_browser(self, browser: Browser) -> None:
+        with self._state_lock:
+            if self._observed_browser is browser:
+                return
+            self._observed_browser = browser
+        on = getattr(browser, "on", None)
+        if not callable(on):
+            return
+        try:
+            on(
+                "disconnected",
+                lambda *_args: self._capture_lifecycle_event(
+                    "browser_disconnected"
+                ),
+            )
+        except Exception as exc:
+            utils.logger.warning(
+                "[CDPBrowserManager] Could not install browser disconnect observer: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _observe_browser_context(self, context: BrowserContext) -> None:
+        with self._state_lock:
+            if self._observed_browser_context is context:
+                return
+            self._observed_browser_context = context
+        on = getattr(context, "on", None)
+        if not callable(on):
+            return
+        try:
+            on(
+                "close",
+                lambda *_args: self._capture_lifecycle_event("context_closed"),
+            )
+        except Exception as exc:
+            utils.logger.warning(
+                "[CDPBrowserManager] Could not install context close observer: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def assert_alive(self, stage: str) -> None:
+        """Fail with stable evidence if the current CDP session disappeared."""
+        with self._state_lock:
+            unexpected = dict(self._unexpected_lifecycle_event or {})
+            established = self._connection_established
+            owns_process = self._owns_browser_process
+        if unexpected:
+            raise CDPBrowserLifecycleError(unexpected, stage=stage)
+
+        planned_reason = self._planned_close_reason()
+        if planned_reason:
+            raise RuntimeError(
+                "xhs_cdp_session_closing:"
+                f"stage={stage}:reason={planned_reason}"
+            )
+
+        process = self.launcher.process_status(reason=f"assert_alive:{stage}")
+        if owns_process and (
+            not process.get("present") or not process.get("running")
+        ):
+            self._capture_lifecycle_event("browser_process_exited")
+        elif established:
+            browser = self.browser
+            if browser is None:
+                self._capture_lifecycle_event(
+                    "browser_disconnected",
+                    detail="browser reference missing",
+                )
+            else:
+                try:
+                    connected = bool(browser.is_connected())
+                except Exception as exc:
+                    connected = False
+                    self._capture_lifecycle_event(
+                        "browser_disconnected",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                if not connected:
+                    self._capture_lifecycle_event("browser_disconnected")
+
+            context = self.browser_context
+            if context is None:
+                self._capture_lifecycle_event(
+                    "context_closed",
+                    detail="browser context reference missing",
+                )
+            else:
+                try:
+                    context.pages
+                except Exception as exc:
+                    self._capture_lifecycle_event(
+                        "context_closed",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+
+        with self._state_lock:
+            unexpected = dict(self._unexpected_lifecycle_event or {})
+        if unexpected:
+            raise CDPBrowserLifecycleError(unexpected, stage=stage)
 
     def _register_cleanup_handlers(self):
         """
@@ -55,8 +254,9 @@ class CDPBrowserManager:
         def sync_cleanup():
             """Synchronous cleanup function for atexit"""
             if self.launcher and self.launcher.browser_process:
+                self.mark_planned_cleanup("atexit")
                 utils.logger.info("[CDPBrowserManager] atexit: Cleaning up browser process")
-                self.launcher.cleanup()
+                self.launcher.cleanup(reason="atexit")
 
         # Register atexit cleanup
         atexit.register(sync_cleanup)
@@ -69,7 +269,8 @@ class CDPBrowserManager:
             """Signal handler"""
             utils.logger.info(f"[CDPBrowserManager] Received signal {signum}, cleaning up browser process")
             if self.launcher and self.launcher.browser_process:
-                self.launcher.cleanup()
+                self.mark_planned_cleanup(f"signal_{signum}")
+                self.launcher.cleanup(reason=f"signal_{signum}")
 
             if signum == signal.SIGINT:
                 if prev_sigint == signal.default_int_handler:
@@ -105,6 +306,11 @@ class CDPBrowserManager:
         """
         Launch browser and connect via CDP
         """
+        with self._state_lock:
+            if self._launch_started:
+                raise RuntimeError("cdp_browser_manager_already_started")
+            self._launch_started = True
+            self._owns_browser_process = not config.CDP_CONNECT_EXISTING
         try:
             if config.CDP_CONNECT_EXISTING:
                 # Connect to an existing browser that already has remote debugging enabled
@@ -131,12 +337,14 @@ class CDPBrowserManager:
             )
 
             self.browser_context = browser_context
+            self._observe_browser_context(browser_context)
             return browser_context
 
         except Exception as e:
             utils.logger.error(f"[CDPBrowserManager] CDP browser launch failed: {e}")
             # This manager owns the one browser launch attempt. Force cleanup
             # here so callers never need a second cleanup or fallback launch.
+            self.mark_planned_cleanup("launch_failure")
             await self.cleanup(force=True)
             raise
 
@@ -193,6 +401,7 @@ class CDPBrowserManager:
         # Create browser context (reuse existing method, will prefer existing context)
         browser_context = await self._create_browser_context(playwright_proxy, user_agent)
         self.browser_context = browser_context
+        self._observe_browser_context(browser_context)
 
         utils.logger.info("[CDPBrowserManager] Successfully connected to existing browser")
         return browser_context
@@ -394,7 +603,10 @@ class CDPBrowserManager:
                 utils.logger.info(f"[CDPBrowserManager] Connecting to browser via CDP: {ws_url}")
                 self.browser = await playwright.chromium.connect_over_cdp(ws_url)
 
+            self._observe_browser(self.browser)
             if self.browser.is_connected():
+                with self._state_lock:
+                    self._connection_established = True
                 utils.logger.info("[CDPBrowserManager] Successfully connected to browser")
                 utils.logger.info(
                     f"[CDPBrowserManager] Browser contexts count: {len(self.browser.contexts)}"
@@ -483,78 +695,130 @@ class CDPBrowserManager:
                 return []
         return []
 
-    async def cleanup(self, force: bool = False):
+    async def cleanup(
+        self,
+        force: bool = False,
+        *,
+        reason: str = "requested",
+    ) -> Dict[str, Any]:
         """
         Cleanup resources
 
         Args:
             force: Whether to force cleanup browser process (ignoring AUTO_CLOSE_BROWSER config)
         """
-        try:
-            # Close browser context
-            if self.browser_context:
-                try:
-                    # Check if context is already closed
-                    # Try to get page list, if fails means already closed
-                    try:
-                        pages = self.browser_context.pages
-                        if pages is not None:
-                            await self.browser_context.close()
-                            utils.logger.info("[CDPBrowserManager] Browser context closed")
-                    except:
-                        utils.logger.debug("[CDPBrowserManager] Browser context already closed")
-                except Exception as context_error:
-                    # Only log warning if error is not due to already being closed
-                    error_msg = str(context_error).lower()
-                    if "closed" not in error_msg and "disconnected" not in error_msg:
-                        utils.logger.warning(
-                            f"[CDPBrowserManager] Failed to close browser context: {context_error}"
-                        )
-                    else:
-                        utils.logger.debug(f"[CDPBrowserManager] Browser context already closed: {context_error}")
-                finally:
+        self.mark_planned_cleanup(reason)
+        with self._state_lock:
+            if self._cleanup_complete:
+                return dict(self.last_cleanup_result or {})
+            if self._cleanup_in_progress:
+                return dict(
+                    self.last_cleanup_result
+                    or {
+                        "status": "in_progress",
+                        "reason": self._planned_cleanup_reason,
+                    }
+                )
+            self._cleanup_in_progress = True
+            cleanup_reason = self._planned_cleanup_reason
+
+        errors = []
+        context_status = "not_present"
+        browser_status = "not_present"
+        process_result: Dict[str, Any] = {
+            "status": "not_owned",
+            "reason": cleanup_reason,
+        }
+
+        context = self.browser_context
+        if context is not None:
+            try:
+                await context.close()
+            except Exception as exc:
+                error_msg = str(exc).casefold()
+                if "closed" in error_msg or "disconnected" in error_msg:
+                    context_status = "already_closed"
                     self.browser_context = None
-
-            # Disconnect browser
-            if self.browser:
-                try:
-                    # Check if browser is still connected
-                    if self.browser.is_connected():
-                        await self.browser.close()
-                        utils.logger.info("[CDPBrowserManager] Browser connection disconnected")
-                    else:
-                        utils.logger.debug("[CDPBrowserManager] Browser connection already disconnected")
-                except Exception as browser_error:
-                    # Only log warning if error is not due to already being closed
-                    error_msg = str(browser_error).lower()
-                    if "closed" not in error_msg and "disconnected" not in error_msg:
-                        utils.logger.warning(
-                            f"[CDPBrowserManager] Failed to close browser connection: {browser_error}"
-                        )
-                    else:
-                        utils.logger.debug(f"[CDPBrowserManager] Browser connection already closed: {browser_error}")
-                finally:
-                    self.browser = None
-
-            # Close browser process (skip if connected to existing browser - we didn't launch it)
-            if config.CDP_CONNECT_EXISTING:
-                utils.logger.info(
-                    "[CDPBrowserManager] Connected to existing browser, skipping process cleanup"
-                )
-            elif force or config.AUTO_CLOSE_BROWSER:
-                # force=True means force close, ignoring AUTO_CLOSE_BROWSER config
-                # Used for handling abnormal exit or manual cleanup
-                if self.launcher and self.launcher.browser_process:
-                    self.launcher.cleanup()
                 else:
-                    utils.logger.debug("[CDPBrowserManager] No browser process to cleanup")
+                    context_status = "failed"
+                    errors.append(f"context:{type(exc).__name__}:{exc}")
             else:
-                utils.logger.info(
-                    "[CDPBrowserManager] Browser process kept running (AUTO_CLOSE_BROWSER=False)"
-                )
+                context_status = "closed"
+                self.browser_context = None
 
-        except Exception as e:
-            utils.logger.error(f"[CDPBrowserManager] Error during resource cleanup: {e}")
+        browser = self.browser
+        if browser is not None:
+            try:
+                if browser.is_connected():
+                    await browser.close()
+                    browser_status = "closed"
+                else:
+                    browser_status = "already_disconnected"
+                self.browser = None
+            except Exception as exc:
+                error_msg = str(exc).casefold()
+                if "closed" in error_msg or "disconnected" in error_msg:
+                    browser_status = "already_disconnected"
+                    self.browser = None
+                else:
+                    browser_status = "failed"
+                    errors.append(f"browser:{type(exc).__name__}:{exc}")
+
+        if self._owns_browser_process:
+            if force or config.AUTO_CLOSE_BROWSER:
+                try:
+                    process_result = self.launcher.cleanup(reason=cleanup_reason)
+                except Exception as exc:
+                    process_result = {
+                        "status": "failed",
+                        "reason": cleanup_reason,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                if process_result.get("status") == "failed":
+                    errors.append(
+                        "process:" + str(process_result.get("error") or "cleanup failed")
+                    )
+            else:
+                process_result = {
+                    "status": "kept_running",
+                    "reason": cleanup_reason,
+                    **self.launcher.process_status(reason="cleanup_skipped"),
+                }
+                utils.logger.info(
+                    "[CDPBrowserManager] Browser process kept running "
+                    "(AUTO_CLOSE_BROWSER=False)"
+                )
+        elif config.CDP_CONNECT_EXISTING:
+            utils.logger.info(
+                "[CDPBrowserManager] Connected to existing browser, skipping process cleanup"
+            )
+
+        result = {
+            "status": "failed" if errors else "completed",
+            "reason": cleanup_reason,
+            "context": context_status,
+            "browser": browser_status,
+            "process": process_result,
+            "errors": errors,
+        }
+        with self._state_lock:
+            self.last_cleanup_result = result
+            self._cleanup_complete = (
+                not errors and process_result.get("status") != "kept_running"
+            )
+            self._cleanup_in_progress = False
+
+        if errors:
+            utils.logger.error(
+                "[CDPBrowserManager] Resource cleanup incomplete; "
+                f"reason={cleanup_reason}, errors={errors}"
+            )
+        else:
+            utils.logger.info(
+                "[CDPBrowserManager] Planned cleanup completed; "
+                f"reason={cleanup_reason}"
+            )
+        return dict(result)
 
     def is_connected(self) -> bool:
         """
