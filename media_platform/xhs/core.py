@@ -1012,6 +1012,20 @@ class XiaoHongShuCrawler(AbstractCrawler):
             ):
                 raise RuntimeError("xhs_replacement_page_session_not_confirmed")
 
+    async def _run_qrcode_login(self) -> None:
+        """Run the one XHS login state machine in the current browser session."""
+        login_obj = XiaoHongShuLogin(
+            login_type=config.LOGIN_TYPE,
+            browser_context=self.browser_context,
+            context_page=self.context_page,
+            close_page=self._close_page_with_deadline,
+            new_page=self._new_guarded_page,
+            manual_wait_budget=self._get_manual_wait_budget(),
+        )
+        await login_obj.begin()
+        self.context_page = login_obj.context_page
+        self.xhs_client.playwright_page = self.context_page
+
     async def _single_page_for_login(self) -> Page:
         """Select a login tab without closing any verification companion tab."""
         try:
@@ -1801,38 +1815,18 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
         self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
         if not await self._pong_with_network_recovery(stage="startup_login_probe"):
-            await self._single_page_for_login()
-            checkpoint_ready = False
-            if await self._wait_for_manual_checkpoint_if_needed():
-                await self.xhs_client.update_cookies(
-                    browser_context=self.browser_context,
-                    urls=self.cookie_urls,
+            await self._run_qrcode_login()
+            await self.xhs_client.update_cookies(
+                browser_context=self.browser_context,
+                urls=self.cookie_urls,
+            )
+            if not await self._pong_with_network_recovery(
+                stage="startup_post_login_probe",
+            ):
+                raise RuntimeError(
+                    "[XiaoHongShuCrawler] Xiaohongshu login state not confirmed "
+                    "after login flow"
                 )
-                checkpoint_ready = await self._pong_with_network_recovery(
-                    stage="startup_manual_checkpoint_probe",
-                )
-            if not checkpoint_ready:
-                await self._single_page_for_login()
-                login_obj = XiaoHongShuLogin(
-                    login_type=config.LOGIN_TYPE,
-                    browser_context=self.browser_context,
-                    context_page=self.context_page,
-                    close_page=self._close_page_with_deadline,
-                    new_page=self._new_guarded_page,
-                    manual_wait_budget=self._get_manual_wait_budget(),
-                )
-                await login_obj.begin()
-                await self.xhs_client.update_cookies(
-                    browser_context=self.browser_context,
-                    urls=self.cookie_urls,
-                )
-                if not await self._pong_with_network_recovery(
-                    stage="startup_post_login_probe",
-                ):
-                    raise RuntimeError(
-                        "[XiaoHongShuCrawler] Xiaohongshu login state not confirmed "
-                        "after login flow"
-                    )
         behavior_keyword = next(
             (item.strip() for item in config.KEYWORDS.split(",") if item.strip()),
             "",

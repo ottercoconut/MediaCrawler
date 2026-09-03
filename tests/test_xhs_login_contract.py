@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
 import media_platform.xhs.core as xhs_core
 from media_platform.xhs.core import XiaoHongShuCrawler
 from media_platform.xhs.login import XiaoHongShuLogin
+from media_platform.xhs.manual_wait import XHSManualWaitBudget
 
 
 _REMOVED_LOGIN_ENV_VARS = (
@@ -175,6 +177,269 @@ def test_xhs_crawler_has_no_storage_state_compatibility_surface() -> None:
     assert not hasattr(XiaoHongShuCrawler, "_write_storage_state")
     assert "TRIPPOSTCOLLECT_XHS_STORAGE_STATE_PATH" not in source
     assert ".storage_state(" not in source
+
+
+class _LoginFlowClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleep_calls: list[float] = []
+        self.on_sleep: Callable[[float], None] | None = None
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleep_calls.append(seconds)
+        self.now += seconds
+        if self.on_sleep is not None:
+            self.on_sleep(self.now)
+
+
+class _LoginFlowLocator:
+    def __init__(self, page: "_LoginFlowPage", selector: str) -> None:
+        self.page = page
+        self.selector = selector
+
+    async def count(self) -> int:
+        return 1 if self.selector == "body" else int(
+            self.selector in self.page.visible_selectors
+        )
+
+    async def inner_text(self, timeout: int) -> str:
+        assert timeout > 0
+        return self.page.visible_text
+
+    async def is_visible(self, timeout: int) -> bool:
+        assert timeout > 0
+        return self.selector in self.page.visible_selectors
+
+    async def click(self, timeout: int) -> None:
+        raise AssertionError(f"login flow must not click unexpected selector: {self.selector}")
+
+
+class _LoginFlowPage:
+    def __init__(self, *, visible_text: str = "") -> None:
+        self.url = "https://www.xiaohongshu.com/explore"
+        self.visible_text = visible_text
+        self.visible_selectors: set[str] = set()
+        self.closed = False
+        self.front_count = 0
+
+    @property
+    def frames(self) -> list["_LoginFlowPage"]:
+        return [self]
+
+    def locator(self, selector: str) -> _LoginFlowLocator:
+        return _LoginFlowLocator(self, selector)
+
+    async def is_visible(self, selector: str, timeout: int) -> bool:
+        assert timeout > 0
+        return selector in self.visible_selectors
+
+    async def bring_to_front(self) -> None:
+        self.front_count += 1
+
+    async def reload(self, **_kwargs: object) -> None:
+        raise AssertionError("startup login must not reload after manual progress")
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+
+class _LoginFlowContext:
+    def __init__(self, page: _LoginFlowPage) -> None:
+        self.pages = [page]
+        self.page_handler: object | None = None
+        self.new_page_calls = 0
+
+    def on(self, event: str, handler: object) -> None:
+        assert event == "page"
+        self.page_handler = handler
+
+    async def cookies(self, *_args: object, **_kwargs: object) -> list[dict[str, str]]:
+        return [{"name": "web_session", "value": "anonymous"}]
+
+    async def new_page(self) -> _LoginFlowPage:
+        self.new_page_calls += 1
+        raise AssertionError("startup login must reuse the current BrowserContext page")
+
+
+def _configure_browser_session_test(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    page: _LoginFlowPage,
+    pong_results: list[bool],
+    events: list[str],
+) -> tuple[XiaoHongShuCrawler, _LoginFlowContext, SimpleNamespace]:
+    context = _LoginFlowContext(page)
+    crawler = XiaoHongShuCrawler()
+    crawler.launch_browser_with_cdp = AsyncMock(return_value=context)
+    crawler._goto_with_deadline = AsyncMock()
+    crawler._wait_for_initial_page_settle = AsyncMock()
+    crawler._wait_for_visible_page_shell = AsyncMock(return_value=True)
+    crawler._open_behavior_search_page_with_recovery = AsyncMock()
+    crawler._run_human_behavior_with_page_recovery = AsyncMock(
+        return_value={"status": "completed"}
+    )
+    crawler.search = AsyncMock()
+
+    async def update_cookies(**_kwargs: object) -> None:
+        events.append("update_cookies")
+
+    client = SimpleNamespace(
+        playwright_page=page,
+        update_cookies=AsyncMock(side_effect=update_cookies),
+    )
+    crawler.create_xhs_client = AsyncMock(return_value=client)
+
+    outcomes = iter(pong_results)
+
+    async def pong(*, stage: str) -> bool:
+        events.append(f"pong:{stage}")
+        return next(outcomes)
+
+    crawler._pong_with_network_recovery = AsyncMock(side_effect=pong)
+    monkeypatch.setattr(xhs_core, "install_project_runtime_hints", AsyncMock())
+    monkeypatch.setattr(xhs_core.config, "ENABLE_CDP_MODE", True)
+    monkeypatch.setattr(xhs_core.config, "CDP_HEADLESS", False)
+    monkeypatch.setattr(xhs_core.config, "KEYWORDS", "青岛登录测试")
+    monkeypatch.setattr(xhs_core.config, "CRAWLER_TYPE", "search")
+    return crawler, context, client
+
+
+def _install_observed_login_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[str],
+) -> list[XiaoHongShuLogin]:
+    instances: list[XiaoHongShuLogin] = []
+
+    def factory(**kwargs: object) -> XiaoHongShuLogin:
+        login = XiaoHongShuLogin(**kwargs)
+        original_begin = login.begin
+
+        async def observed_begin() -> None:
+            events.append("login.begin")
+            await original_begin()
+
+        login.begin = observed_begin  # type: ignore[method-assign]
+        instances.append(login)
+        return login
+
+    monkeypatch.setattr(xhs_core, "XiaoHongShuLogin", factory)
+    return instances
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_pong_enters_real_qrcode_state_machine_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _LoginFlowClock()
+    page = _LoginFlowPage(visible_text="扫码登录 打开小红书扫一扫")
+    page.visible_selectors.add(XiaoHongShuLogin._QRCODE_SELECTOR)
+    events: list[str] = []
+    crawler, context, client = _configure_browser_session_test(
+        monkeypatch,
+        page=page,
+        pong_results=[False, True, True],
+        events=events,
+    )
+    budget = XHSManualWaitBudget(limit_seconds=600, monotonic=clock.monotonic)
+    crawler._manual_wait_budget = budget
+    instances = _install_observed_login_factory(monkeypatch, events)
+    monkeypatch.setattr(xhs_core.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(xhs_core.asyncio, "sleep", clock.sleep)
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_LOGIN_POLL_SECONDS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_STABLE_LOGIN_SECONDS", "1")
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_QR_REFRESH_SECONDS", "180")
+
+    async def find_qrcode(current_page: _LoginFlowPage, *, selector: str) -> str | None:
+        assert current_page is page
+        return "qr" if selector in page.visible_selectors else None
+
+    monkeypatch.setattr(xhs_core.utils, "find_login_qrcode", find_qrcode)
+
+    def complete_scan(now: float) -> None:
+        if now < 1:
+            return
+        page.visible_text = "首页 我"
+        page.visible_selectors.discard(XiaoHongShuLogin._QRCODE_SELECTOR)
+        page.visible_selectors.add(XiaoHongShuLogin._PROFILE_SELECTORS[0])
+
+    clock.on_sleep = complete_scan
+
+    await crawler._run_browser_session(object(), None, None)
+
+    assert len(instances) == 1
+    assert instances[0]._manual_wait_budget is budget
+    assert crawler._manual_wait_budget is budget
+    assert crawler.context_page is page
+    assert client.playwright_page is page
+    assert context.new_page_calls == 0
+    assert crawler.launch_browser_with_cdp.await_count == 1
+    assert crawler._pong_with_network_recovery.await_args_list == [
+        call(stage="startup_login_probe"),
+        call(stage="startup_post_login_probe"),
+        call(stage="post_behavior_login_probe"),
+    ]
+    assert events.count("login.begin") == 1
+    assert events.index("pong:startup_login_probe") < events.index("login.begin")
+    assert events.index("login.begin") < events.index("update_cookies")
+    assert events.index("update_cookies") < events.index(
+        "pong:startup_post_login_probe"
+    )
+    crawler._run_human_behavior_with_page_recovery.assert_awaited_once_with(
+        "青岛登录测试"
+    )
+    crawler.search.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("visible_text", "terminal_marker"),
+    [
+        ("SMS Verification\nParameter error", "Parameter error"),
+        ("手机号登录\n今日短信验证码次数已达上限", "今日短信验证码次数已达上限"),
+    ],
+)
+async def test_startup_sms_terminal_fails_immediately_without_retry_or_business_work(
+    monkeypatch: pytest.MonkeyPatch,
+    visible_text: str,
+    terminal_marker: str,
+) -> None:
+    clock = _LoginFlowClock()
+    page = _LoginFlowPage(visible_text=visible_text)
+    events: list[str] = []
+    crawler, context, client = _configure_browser_session_test(
+        monkeypatch,
+        page=page,
+        pong_results=[False],
+        events=events,
+    )
+    budget = XHSManualWaitBudget(limit_seconds=600, monotonic=clock.monotonic)
+    crawler._manual_wait_budget = budget
+    instances = _install_observed_login_factory(monkeypatch, events)
+    monkeypatch.setattr(xhs_core.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(xhs_core.asyncio, "sleep", clock.sleep)
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"xhs_login_verification_terminal:.*{terminal_marker}",
+    ):
+        await crawler._run_browser_session(object(), None, None)
+
+    assert len(instances) == 1
+    assert instances[0]._manual_wait_budget is budget
+    assert events == ["pong:startup_login_probe", "login.begin"]
+    assert clock.sleep_calls == []
+    assert context.new_page_calls == 0
+    assert crawler.launch_browser_with_cdp.await_count == 1
+    assert crawler._pong_with_network_recovery.await_args_list == [
+        call(stage="startup_login_probe")
+    ]
+    client.update_cookies.assert_not_awaited()
+    crawler._open_behavior_search_page_with_recovery.assert_not_awaited()
+    crawler._run_human_behavior_with_page_recovery.assert_not_awaited()
+    crawler.search.assert_not_awaited()
 
 
 @pytest.mark.asyncio
