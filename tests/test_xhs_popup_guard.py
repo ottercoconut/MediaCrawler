@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,17 +10,30 @@ from media_platform.xhs.login import XiaoHongShuLogin
 
 
 class FakePage:
-    def __init__(self, name: str, events: list[tuple[str, object]]):
+    def __init__(
+        self,
+        name: str,
+        events: list[tuple[str, object]],
+        *,
+        visible_states: list[str] | None = None,
+    ):
         self.name = name
         self.url = f"https://www.xiaohongshu.com/{name}"
         self.closed = False
         self.events = events
+        self.visible_states = list(visible_states or [""])
 
     def is_closed(self) -> bool:
         return self.closed
 
     async def bring_to_front(self) -> None:
         self.events.append(("front", self.name))
+
+    async def content(self) -> str:
+        state = self.visible_states[0]
+        if len(self.visible_states) > 1:
+            self.visible_states.pop(0)
+        return state
 
     async def close(self) -> None:
         self.events.append(("close", self.name))
@@ -139,6 +150,160 @@ async def test_crawler_opened_xhs_tab_waits_30_seconds_after_failed_scroll() -> 
 
 
 @pytest.mark.asyncio
+async def test_qr_and_verification_popup_remains_open_until_stably_cleared() -> None:
+    events: list[tuple[str, object]] = []
+    primary = FakePage("search", events)
+    popup = FakePage(
+        "login-popup",
+        events,
+        visible_states=[
+            "扫码登录 二维码",
+            "扫码登录 二维码",
+            "请输入验证码",
+            "首页 发现 消息 我",
+            "首页 发现 消息 我",
+        ],
+    )
+    context = FakeContext([primary], events)
+    crawler = XiaoHongShuCrawler()
+    install_fake_clock(crawler, events)
+    crawler.browser_context = context
+    crawler.context_page = primary
+    crawler._install_new_page_guard()
+
+    context.emit_page(popup)
+    selected = await crawler._single_page_for_login()
+
+    assert selected is primary
+    assert crawler.browser_context is context
+    assert popup.closed is True
+    first_close = events.index(("close", "login-popup"))
+    first_hold = events.index(("sleep", pytest.approx(30.0)))
+    checkpoint_front = events.index(("front", "login-popup"), 1)
+    checkpoint_polls = [
+        index
+        for index, event in enumerate(events)
+        if event == ("sleep", pytest.approx(2.0))
+    ]
+    assert first_hold < checkpoint_front < checkpoint_polls[0]
+    assert len(checkpoint_polls) == 3
+    assert checkpoint_polls[-1] < first_close
+
+
+@pytest.mark.asyncio
+async def test_manual_checkpoint_timeout_is_600_seconds_then_fails_and_closes() -> None:
+    events: list[tuple[str, object]] = []
+    page = FakePage(
+        "verification",
+        events,
+        visible_states=["请通过安全验证"],
+    )
+    context = FakeContext([page], events)
+    crawler = XiaoHongShuCrawler()
+    install_fake_clock(crawler, events)
+    crawler.browser_context = context
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"xhs_manual_checkpoint_timeout:test_cleanup:600s",
+    ):
+        await crawler._close_page_with_deadline(page, reason="test_cleanup")
+
+    assert page.closed is True
+    assert sum(
+        float(event[1]) for event in events if event[0] == "sleep"
+    ) == pytest.approx(600.0)
+    assert events[-1] == ("close", "verification")
+
+
+@pytest.mark.asyncio
+async def test_manual_timeout_does_not_skip_browser_context_cleanup() -> None:
+    events: list[tuple[str, object]] = []
+    page = FakePage(
+        "verification",
+        events,
+        visible_states=["请通过安全验证"],
+    )
+    context = FakeContext([page], events)
+    crawler = XiaoHongShuCrawler()
+    install_fake_clock(crawler, events)
+    crawler.browser_context = context
+    crawler.context_page = page
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"xhs_manual_checkpoint_timeout:browser_shutdown:600s",
+    ):
+        await crawler.close(force=True)
+
+    assert page.closed is True
+    assert context.closed is True
+    assert events[-2:] == [
+        ("close", "verification"),
+        ("context_close", "context"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_popup_fails_immediately_without_30_second_hold() -> None:
+    events: list[tuple[str, object]] = []
+    primary = FakePage("search", events)
+    popup = FakePage(
+        "rate-limit",
+        events,
+        visible_states=["请稍后重试，当前访问过于频繁"],
+    )
+    context = FakeContext([primary], events)
+    crawler = XiaoHongShuCrawler()
+    install_fake_clock(crawler, events)
+    crawler.browser_context = context
+    crawler.context_page = primary
+    crawler._install_new_page_guard()
+
+    context.emit_page(popup)
+    with pytest.raises(
+        RuntimeError,
+        match=r"xhs_rate_limited_during_page_guard:login_tab_normalization",
+    ):
+        await crawler._single_page_for_login()
+
+    assert popup.closed is True
+    assert not [event for event in events if event[0] == "sleep"]
+
+
+@pytest.mark.asyncio
+async def test_browser_shutdown_cannot_bypass_primary_login_checkpoint() -> None:
+    events: list[tuple[str, object]] = []
+    primary = FakePage(
+        "login",
+        events,
+        visible_states=[
+            "手机号登录 请输入验证码",
+            "手机号登录 请输入验证码",
+            "首页 发现 消息 我",
+            "首页 发现 消息 我",
+        ],
+    )
+    context = FakeContext([primary], events)
+    crawler = XiaoHongShuCrawler()
+    install_fake_clock(crawler, events)
+    crawler.browser_context = context
+    crawler.context_page = primary
+
+    await crawler.close()
+
+    assert crawler.browser_context is context
+    assert events[0] == ("front", "login")
+    assert events.index(("close", "login")) < events.index(
+        ("context_close", "context")
+    )
+    assert [event for event in events if event[0] == "sleep"] == [
+        ("sleep", pytest.approx(2.0)),
+        ("sleep", pytest.approx(2.0)),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_xhs_context_cleanup_waits_for_unexpected_tab() -> None:
     events: list[tuple[str, object]] = []
     primary = FakePage("search", events)
@@ -201,7 +366,6 @@ async def test_xhs_behavior_adopts_replacement_page_after_target_closed(
     )
     crawler.xhs_client = FakeClient()
     crawler._open_behavior_search_page = AsyncMock()
-    crawler._write_storage_state = AsyncMock()
 
     evidence = await crawler._run_human_behavior_with_page_recovery("青岛旅游")
 
@@ -210,21 +374,17 @@ async def test_xhs_behavior_adopts_replacement_page_after_target_closed(
     assert crawler.context_page is replacement
     assert crawler.xhs_client.playwright_page is replacement
     crawler._open_behavior_search_page.assert_awaited_once_with("青岛旅游")
-    crawler._write_storage_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_standalone_xhs_login_waits_before_closing_extra_tab(
-    monkeypatch,
-) -> None:
+async def test_standalone_xhs_login_preserves_extra_verification_tab() -> None:
     events: list[tuple[str, object]] = []
-
-    async def sleep(seconds: float) -> None:
-        events.append(("sleep", seconds))
-
-    monkeypatch.setattr("media_platform.xhs.login.asyncio.sleep", sleep)
     primary = FakePage("login", events)
-    popup = FakePage("verification", events)
+    popup = FakePage(
+        "verification",
+        events,
+        visible_states=["请输入验证码"],
+    )
     context = FakeContext([primary, popup], events)
     login = XiaoHongShuLogin(
         login_type="qrcode",
@@ -235,11 +395,9 @@ async def test_standalone_xhs_login_waits_before_closing_extra_tab(
     selected = await login._single_login_page()
 
     assert selected is primary
-    assert events == [
-        ("front", "verification"),
-        ("sleep", 30),
-        ("close", "verification"),
-    ]
+    assert context.pages == [primary, popup]
+    assert popup.closed is False
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -289,200 +447,72 @@ async def test_crawler_checkpoint_markers_detect_url_only_security_limit() -> No
 
 
 @pytest.mark.asyncio
-async def test_xhs_shutdown_snapshots_device_state_before_closing_pages() -> None:
+async def test_xhs_shutdown_does_not_write_independent_storage_snapshot(
+    tmp_path,
+    monkeypatch,
+) -> None:
     events: list[tuple[str, object]] = []
     page = FakePage("search", events)
     context = FakeContext([page], events)
     crawler = XiaoHongShuCrawler()
     crawler.browser_context = context
+    legacy_snapshot = tmp_path / "storage-state.json"
+    monkeypatch.setenv(
+        "TRIPPOSTCOLLECT_XHS_STORAGE_STATE_PATH",
+        str(legacy_snapshot),
+    )
 
-    async def snapshot() -> None:
-        events.append(("snapshot", "state"))
-
-    crawler._write_storage_state = snapshot
     await crawler._prepare_browser_shutdown()
 
-    assert events[0] == ("snapshot", "state")
-    assert events[1] == ("close", "search")
-    assert crawler._shutdown_storage_state_written is True
+    assert events[0] == ("close", "search")
+    assert not legacy_snapshot.exists()
+    assert not hasattr(crawler, "_storage_state_path")
+    assert not hasattr(crawler, "_restore_storage_state")
+    assert not hasattr(crawler, "_write_storage_state")
 
 
 @pytest.mark.asyncio
-async def test_xhs_restore_does_not_overwrite_newer_profile_cookie(tmp_path) -> None:
-    snapshot_path = tmp_path / "storage-state.json"
-    snapshot_path.write_text(
-        json.dumps(
-            {
-                "cookies": [
-                    {
-                        "name": "web_session",
-                        "value": "stale",
-                        "domain": ".xiaohongshu.com",
-                        "path": "/",
-                    },
-                    {
-                        "name": "a1",
-                        "value": "fallback",
-                        "domain": ".xiaohongshu.com",
-                        "path": "/",
-                    },
-                ],
-                "origins": [],
-                "trippostcollect": {
-                    "runtime_storage": [
-                        {
-                            "origin": "https://www.xiaohongshu.com",
-                            "page_role": "primary",
-                            "localStorage": {},
-                            "sessionStorage": {"XHS_TAB_DEVICE_ID": "stable-device"},
-                        },
-                        {
-                            "origin": "https://www.xiaohongshu.com",
-                            "page_role": "secondary",
-                            "localStorage": {},
-                            "sessionStorage": {"XHS_TAB_DEVICE_ID": "other-device"},
-                        }
-                    ]
-                },
-            }
-        ),
-        encoding="utf-8",
+async def test_xhs_login_and_replacement_pages_share_one_browser_context(
+) -> None:
+    events: list[tuple[str, object]] = []
+    primary = FakePage("login", events)
+    replacement = FakePage("verification", events)
+    context = FakeContext([primary, replacement], events)
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = context
+    crawler.context_page = replacement
+    login = XiaoHongShuLogin(
+        login_type="qrcode",
+        browser_context=crawler.browser_context,
+        context_page=crawler.context_page,
     )
 
-    class RestoreContext:
-        def __init__(self) -> None:
-            self.added_cookies = []
-            self.script = ""
-
-        async def cookies(self):
-            return [{"name": "web_session", "domain": ".xiaohongshu.com", "path": "/"}]
-
-        async def add_cookies(self, cookies):
-            self.added_cookies = cookies
-
-        async def add_init_script(self, *, script):
-            self.script = script
-
-    class RestorePage:
-        url = "about:blank"
-
-        def __init__(self) -> None:
-            self.script = ""
-
-        async def add_init_script(self, *, script):
-            self.script = script
-
-    crawler = XiaoHongShuCrawler()
-    crawler.browser_context = RestoreContext()
-    crawler._storage_state_path = lambda: str(snapshot_path)
-    page = RestorePage()
-
-    assert await crawler._restore_storage_state(primary_page=page) is True
-    assert [cookie["name"] for cookie in crawler.browser_context.added_cookies] == ["a1"]
-    assert "XHS_TAB_DEVICE_ID" not in crawler.browser_context.script
-    assert "XHS_TAB_DEVICE_ID" in page.script
-    assert "other-device" not in page.script
-    assert "sessionStorage.getItem(key) === null" in page.script
+    assert login.browser_context is context
+    assert login.context_page is replacement
+    assert crawler.context_page in crawler.browser_context.pages
 
 
 @pytest.mark.asyncio
-async def test_xhs_snapshot_preserves_account_binding_and_session_device_id(
-    tmp_path,
+async def test_cdp_launch_failure_cleans_once_without_standard_fallback(
     monkeypatch,
 ) -> None:
-    snapshot_path = tmp_path / "storage-state.json"
-    snapshot_path.write_text(
-        json.dumps(
-            {
-                "cookies": [],
-                "origins": [],
-                "trippostcollect": {
-                    "schema_version": 3,
-                    "account_id": "xhs-a02",
-                    "identity_hash": "identity-2",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    class StoragePage:
-        url = "https://www.xiaohongshu.com/explore"
-
-        def is_closed(self):
-            return False
-
-        async def evaluate(self, script):
-            assert "sessionStorage" in script
-            return {
-                "origin": "https://www.xiaohongshu.com",
-                "url": self.url,
-                "localStorage": {"b1": "browser"},
-                "sessionStorage": {"XHS_TAB_DEVICE_ID": "stable-device"},
-            }
-
-    class StorageContext:
-        pages = [StoragePage()]
-
-        async def storage_state(self):
-            return {"cookies": [], "origins": []}
-
-    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_ACCOUNT_ID", "xhs-a02")
-    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_RUN_ID", "run-verified")
-    crawler = XiaoHongShuCrawler()
-    crawler.browser_context = StorageContext()
-    crawler.context_page = crawler.browser_context.pages[0]
-    crawler._storage_state_path = lambda: str(snapshot_path)
-
-    await crawler._write_storage_state(session_verified=True)
-
-    saved = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    metadata = saved["trippostcollect"]
-    assert metadata["schema_version"] == 3
-    assert metadata["account_id"] == "xhs-a02"
-    assert metadata["identity_hash"] == "identity-2"
-    assert metadata["runtime_storage"][0]["sessionStorage"] == {
-        "XHS_TAB_DEVICE_ID": "stable-device"
-    }
-    assert metadata["runtime_storage"][0]["page_role"] == "primary"
-    assert metadata["session_verification"] == {
-        "status": "verified",
-        "run_id": "run-verified",
-        "source": "xhs_selfinfo",
-        "verified_at": metadata["session_verification"]["verified_at"],
-    }
-
-
-@pytest.mark.asyncio
-async def test_cdp_launch_failure_never_starts_standard_fallback(monkeypatch) -> None:
-    instances = []
     cleanup_calls: list[bool] = []
 
     class FailingManager:
-        def __init__(self) -> None:
-            instances.append(self)
-
-        async def launch_and_connect(self, **_kwargs):
+        async def launch_and_connect(self, **kwargs):
             await self.cleanup(force=True)
             raise RuntimeError("cdp connect failed")
 
-        async def cleanup(self, *, force: bool = False) -> None:
+        async def cleanup(self, force: bool = False) -> None:
             cleanup_calls.append(force)
 
-        async def get_browser_info(self):
-            raise AssertionError("failed launch must not query browser info")
-
     chromium = SimpleNamespace(
-        launch=AsyncMock(side_effect=AssertionError("second browser launched")),
-        launch_persistent_context=AsyncMock(
-            side_effect=AssertionError("second browser context launched")
-        ),
+        launch=AsyncMock(),
+        launch_persistent_context=AsyncMock(),
     )
     playwright = SimpleNamespace(chromium=chromium)
     crawler = XiaoHongShuCrawler()
-    crawler.launch_browser = AsyncMock(
-        side_effect=AssertionError("standard fallback launched")
-    )
+    crawler.launch_browser = AsyncMock()
     monkeypatch.setattr(
         "media_platform.xhs.core.CDPBrowserManager",
         FailingManager,
@@ -499,7 +529,6 @@ async def test_cdp_launch_failure_never_starts_standard_fallback(monkeypatch) ->
             headless=False,
         )
 
-    assert len(instances) == 1
     assert cleanup_calls == [True]
     assert crawler.cdp_manager is None
     crawler.launch_browser.assert_not_awaited()
@@ -508,37 +537,7 @@ async def test_cdp_launch_failure_never_starts_standard_fallback(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_browser_session_latch_prevents_concurrent_second_launch(
-    monkeypatch,
-) -> None:
-    launch_entered = asyncio.Event()
-    release_launch = asyncio.Event()
-
-    async def blocked_launch(*_args, **_kwargs):
-        launch_entered.set()
-        await release_launch.wait()
-        raise RuntimeError("first launch failed")
-
-    crawler = XiaoHongShuCrawler()
-    crawler.launch_browser_with_cdp = AsyncMock(side_effect=blocked_launch)
-    monkeypatch.setattr("media_platform.xhs.core.config.ENABLE_CDP_MODE", True)
-    playwright = SimpleNamespace(chromium=SimpleNamespace())
-
-    first = asyncio.create_task(crawler._run_browser_session(playwright, None, None))
-    await asyncio.wait_for(launch_entered.wait(), timeout=0.2)
-    with pytest.raises(RuntimeError, match=r"^xhs_browser_session_already_started$"):
-        await crawler._run_browser_session(playwright, None, None)
-
-    release_launch.set()
-    with pytest.raises(RuntimeError, match="first launch failed"):
-        await first
-
-    assert crawler._browser_session_started is True
-    crawler.launch_browser_with_cdp.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_failed_browser_session_cannot_be_restarted_sequentially(
+async def test_browser_session_cannot_be_started_twice_after_failed_attempt(
     monkeypatch,
 ) -> None:
     crawler = XiaoHongShuCrawler()
@@ -550,7 +549,48 @@ async def test_failed_browser_session_cannot_be_restarted_sequentially(
 
     with pytest.raises(RuntimeError, match="first launch failed"):
         await crawler._run_browser_session(playwright, None, None)
-    with pytest.raises(RuntimeError, match=r"^xhs_browser_session_already_started$"):
+
+    with pytest.raises(RuntimeError, match="^xhs_browser_session_already_started$"):
         await crawler._run_browser_session(playwright, None, None)
 
+    assert crawler._browser_session_started is True
     crawler.launch_browser_with_cdp.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_replacement_page_from_another_context_is_rejected() -> None:
+    events: list[tuple[str, object]] = []
+    primary = FakePage("search", events)
+    replacement = FakePage("verification", events)
+    active_context = FakeContext([primary, replacement], events)
+    foreign_context = FakeContext([], events)
+    replacement.context = foreign_context
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = active_context
+    crawler._browser_session_context = active_context
+    crawler.context_page = primary
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^xhs_page_context_mismatch:replacement_page_adoption$",
+    ):
+        await crawler._activate_latest_xhs_page()
+
+    assert crawler.context_page is primary
+    assert active_context.pages == [primary, replacement]
+
+
+def test_active_browser_context_cannot_be_replaced_within_session() -> None:
+    events: list[tuple[str, object]] = []
+    original_context = FakeContext([], events)
+    replacement = FakePage("verification", events)
+    replacement_context = FakeContext([replacement], events)
+    crawler = XiaoHongShuCrawler()
+    crawler._browser_session_context = original_context
+    crawler.browser_context = replacement_context
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^xhs_browser_context_replaced:test$",
+    ):
+        crawler._assert_page_in_active_browser_context(replacement, stage="test")

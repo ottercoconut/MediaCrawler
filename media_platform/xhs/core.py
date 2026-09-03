@@ -86,6 +86,9 @@ from .login import XiaoHongShuLogin
 
 
 XHS_NEW_PAGE_MIN_HOLD_SECONDS = 30.0
+XHS_MANUAL_CHECKPOINT_MAX_WAIT_SECONDS = 600.0
+XHS_MANUAL_CHECKPOINT_POLL_SECONDS = 2.0
+
 _XHS_MANUAL_CHECKPOINT_TEXTS = (
     "扫码登录",
     "二维码",
@@ -214,6 +217,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.user_agent: Optional[str] = None
         self.cdp_manager = None
         self._browser_session_started = False
+        self._browser_session_context: Optional[BrowserContext] = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
         self.post_interaction_mode = os.environ.get("TRIPPOSTCOLLECT_XHS_POST_INTERACTION", "none").strip()
         self.post_interaction_attempted = False
@@ -222,7 +226,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self._initial_pages: Dict[int, Page] = {}
         self._new_pages: Dict[int, tuple[Page, float, str]] = {}
         self._new_page_guard_tasks: Dict[int, Task[None]] = {}
-        self._shutdown_storage_state_written = False
+        self._manual_checkpoint_guard_tasks: Dict[int, Task[None]] = {}
         self._navigation_diagnostics: List[Dict] = []
         self._navigation_observed_pages: set[int] = set()
         self._navigation_page_errors: List[Dict] = []
@@ -241,6 +245,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
             return max(0, int(os.environ.get(name, str(default))))
         except ValueError:
             return default
+
+    @staticmethod
+    def _run_scoped_login_enabled() -> bool:
+        return (
+            os.environ.get("TRIPPOSTCOLLECT_XHS_RUN_SCOPED_LOGIN", "0").strip()
+            == "1"
+        )
 
     @staticmethod
     def _page_is_closed(page: Page) -> bool:
@@ -320,70 +331,262 @@ class XiaoHongShuCrawler(AbstractCrawler):
         return page
 
     async def _wait_before_page_close(self, page: Page, *, reason: str) -> None:
+        # A terminal platform/rate-limit page must win over the universal 30s
+        # new-tab hold.  Waiting before this preflight would turn an explicit
+        # failure into an artificial login delay.
+        initial_state = await self._popup_checkpoint_state(page)
+        self._raise_for_terminal_popup_state(initial_state, reason=reason)
+
         page_id = id(page)
-        if page_id not in self._new_pages:
-            return
-        task = self._new_page_guard_tasks.get(page_id)
-        if task and not task.done():
+        if page_id in self._new_pages:
+            task = self._new_page_guard_tasks.get(page_id)
+            if task and not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    utils.logger.warning(
+                        "[XiaoHongShuCrawler] New-tab guard task failed; "
+                        f"enforcing remaining hold directly: {type(exc).__name__}: {exc}"
+                    )
+            _, opened_at, source = self._new_pages[page_id]
+            remaining = max(
+                0.0,
+                XHS_NEW_PAGE_MIN_HOLD_SECONDS
+                - (self._popup_monotonic() - opened_at),
+            )
+            if remaining > 0:
+                await self._popup_sleep(remaining)
+            utils.logger.info(
+                "[XiaoHongShuCrawler] New-tab minimum hold completed; "
+                f"checking whether close may proceed: source={source}, reason={reason}, "
+                f"url={getattr(page, 'url', '')}"
+            )
+
+        # The checkpoint guard deliberately applies to *every* page, including
+        # the initial page and browser-shutdown cleanup.  Otherwise a close path
+        # could bypass the same login/CAPTCHA page protection that new tabs get.
+        await self._wait_for_page_checkpoint_guard(page, reason=reason)
+
+    async def _popup_checkpoint_state(self, page: Page) -> Dict[str, object]:
+        """Classify only visible login/verification/terminal page evidence."""
+        if self._page_is_closed(page):
+            return {
+                "closed": True,
+                "visible_text": "",
+                "visible_markers": {},
+                "manual_markers": [],
+                "terminal": "",
+            }
+
+        visible_text = ""
+        visible_markers: Dict[str, bool] = {}
+        try:
+            visible_text, visible_markers = await inspect_visible_page_state(page)
+        except Exception:
+            # Unit-level callers and partially loaded popup pages might not have
+            # the project inspection bridge available yet.  ``innerText`` is
+            # preferred in production because it excludes hidden login markup;
+            # content is only the bounded fallback.
             try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                utils.logger.warning(
-                    "[XiaoHongShuCrawler] New-tab guard task failed; "
-                    f"enforcing remaining hold directly: {type(exc).__name__}: {exc}"
-                )
-        _, opened_at, source = self._new_pages[page_id]
-        remaining = max(
-            0.0,
-            XHS_NEW_PAGE_MIN_HOLD_SECONDS
-            - (self._popup_monotonic() - opened_at),
+                locator = getattr(page, "locator", None)
+                if callable(locator):
+                    visible_text = await locator("body").inner_text(timeout=2_000)
+                else:
+                    visible_text = await page.content()
+            except Exception:
+                visible_text = ""
+            visible_text = " ".join(str(visible_text).split())[:2_000]
+
+        selector_markers: List[str] = []
+        locator = getattr(page, "locator", None)
+        if callable(locator):
+            for selector in _XHS_MANUAL_CHECKPOINT_SELECTORS:
+                try:
+                    candidate = locator(selector)
+                    first = getattr(candidate, "first", candidate)
+                    if await first.is_visible(timeout=250):
+                        selector_markers.append(selector)
+                except Exception:
+                    continue
+
+        normalized = str(visible_text or "")
+        lowered = normalized.casefold()
+        text_markers = sorted(
+            {
+                marker
+                for marker in _XHS_MANUAL_CHECKPOINT_TEXTS
+                if marker.casefold() in lowered
+            }
         )
-        if remaining > 0:
-            await self._popup_sleep(remaining)
-        utils.logger.info(
-            "[XiaoHongShuCrawler] New-tab minimum hold completed; "
-            f"close may proceed: source={source}, reason={reason}, "
-            f"url={getattr(page, 'url', '')}"
+        manual_markers = sorted(set(text_markers) | set(selector_markers))
+        if visible_markers.get("captcha_or_verify"):
+            manual_markers.append("captcha_or_verify")
+        if visible_markers.get("login_required"):
+            manual_markers.append("login_required")
+        manual_markers = sorted(set(manual_markers))
+
+        terminal = ""
+        if visible_markers.get("platform_security_limit"):
+            terminal = "platform_security_limit_300011"
+        elif visible_markers.get("rate_limited"):
+            terminal = "rate_limited"
+        elif visible_markers.get("blocked"):
+            terminal = "blocked"
+
+        # Keep terminal recognition available even while the project bridge is
+        # not ready (for example, a platform-opened error tab during startup).
+        if re.search(
+            r"安全限制|账号异常|account exception|\b300011\b",
+            normalized,
+            re.I,
+        ):
+            terminal = "platform_security_limit_300011"
+        elif re.search(
+            r"访问(?:过于)?频繁|请求(?:过于)?频繁|操作频繁|"
+            r"too many requests|rate limit|requests? (?:are )?too frequent",
+            normalized,
+            re.I,
+        ):
+            terminal = "rate_limited"
+        elif re.search(r"拒绝访问|access denied|forbidden|访问受限", normalized, re.I):
+            terminal = "blocked"
+
+        page_url = str(getattr(page, "url", "") or "")
+        if "/website-login/error" in page_url:
+            terminal = "platform_security_limit_300011"
+
+        return {
+            "closed": False,
+            "url": page_url,
+            "visible_text": normalized[:360],
+            "visible_markers": visible_markers,
+            "manual_markers": manual_markers,
+            "terminal": terminal,
+        }
+
+    @staticmethod
+    def _raise_for_terminal_popup_state(
+        state: Dict[str, object],
+        *,
+        reason: str,
+    ) -> None:
+        terminal = str(state.get("terminal") or "")
+        if not terminal:
+            return
+        if terminal == "platform_security_limit_300011":
+            raise RuntimeError("xhs_platform_security_limit_300011")
+        raise RuntimeError(f"xhs_{terminal}_during_page_guard:{reason}")
+
+    async def _wait_for_page_checkpoint_guard(
+        self,
+        page: Page,
+        *,
+        reason: str,
+    ) -> None:
+        page_id = id(page)
+        task = self._manual_checkpoint_guard_tasks.get(page_id)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._wait_for_manual_checkpoint_resolution(page, reason=reason)
+            )
+            self._manual_checkpoint_guard_tasks[page_id] = task
+        try:
+            await asyncio.shield(task)
+        finally:
+            if task.done() and self._manual_checkpoint_guard_tasks.get(page_id) is task:
+                self._manual_checkpoint_guard_tasks.pop(page_id, None)
+
+    async def _wait_for_manual_checkpoint_resolution(
+        self,
+        page: Page,
+        *,
+        reason: str,
+    ) -> None:
+        state = await self._popup_checkpoint_state(page)
+        self._raise_for_terminal_popup_state(state, reason=reason)
+        if state.get("closed") or not state.get("manual_markers"):
+            return
+
+        try:
+            await page.bring_to_front()
+        except Exception as exc:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] Could not foreground manual checkpoint page; "
+                f"continuing the bounded guard: {type(exc).__name__}: {exc}"
+            )
+        utils.logger.warning(
+            "[XiaoHongShuCrawler] Visible login/verification page detected; "
+            f"keeping it open in the current BrowserContext for up to "
+            f"{XHS_MANUAL_CHECKPOINT_MAX_WAIT_SECONDS:.0f}s: reason={reason}, "
+            f"markers={state.get('manual_markers')}, url={state.get('url', '')}"
         )
 
-    async def _wait_for_all_new_page_guards(self) -> None:
-        """Drain all new-tab hold periods before Playwright or the context can close them."""
-        while True:
-            guarded_pages = [
-                page
-                for page, _, _ in self._new_pages.values()
-                if not self._page_is_closed(page)
-            ]
-            pending = [
-                page
-                for page in guarded_pages
-                if self._popup_monotonic() - self._new_pages[id(page)][1]
-                < XHS_NEW_PAGE_MIN_HOLD_SECONDS
-            ]
-            if not pending:
+        started = self._popup_monotonic()
+        clear_observations = 0
+        last_log_at = -30.0
+        while not self._page_is_closed(page):
+            elapsed = self._popup_monotonic() - started
+            remaining = XHS_MANUAL_CHECKPOINT_MAX_WAIT_SECONDS - elapsed
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"xhs_manual_checkpoint_timeout:{reason}:"
+                    f"{XHS_MANUAL_CHECKPOINT_MAX_WAIT_SECONDS:.0f}s"
+                )
+
+            await self._popup_sleep(
+                min(XHS_MANUAL_CHECKPOINT_POLL_SECONDS, remaining)
+            )
+            state = await self._popup_checkpoint_state(page)
+            self._raise_for_terminal_popup_state(state, reason=reason)
+            if state.get("closed"):
                 return
+            if state.get("manual_markers"):
+                clear_observations = 0
+            elif str(state.get("visible_text") or "").strip():
+                clear_observations += 1
+                if clear_observations >= 2:
+                    utils.logger.info(
+                        "[XiaoHongShuCrawler] Manual checkpoint cleared; "
+                        f"page close may proceed: reason={reason}, "
+                        f"url={state.get('url', '')}"
+                    )
+                    return
+            else:
+                # A blank/loading page is not proof that the operator flow has
+                # completed.  Keep the gate alive instead of closing on a
+                # transient DOM replacement.
+                clear_observations = 0
+
+            elapsed = self._popup_monotonic() - started
+            if elapsed - last_log_at >= 30.0:
+                utils.logger.info(
+                    "[XiaoHongShuCrawler] Waiting for manual checkpoint: "
+                    f"elapsed={elapsed:.0f}s, reason={reason}, "
+                    f"markers={state.get('manual_markers')}, url={state.get('url', '')}"
+                )
+                last_log_at = elapsed
+
+    async def _wait_for_all_new_page_guards(self) -> None:
+        """Drain every open new-page guard, including manual checkpoint gates."""
+        guarded_pages = [
+            page
+            for page, _, _ in self._new_pages.values()
+            if not self._page_is_closed(page)
+        ]
+        if guarded_pages:
             await asyncio.gather(
                 *(
                     self._wait_before_page_close(page, reason="browser_context_cleanup")
-                    for page in pending
+                    for page in guarded_pages
                 )
             )
 
     async def _prepare_browser_shutdown(self) -> None:
         """Close pages through the guard before context or Playwright teardown."""
-        if not getattr(self, "_shutdown_storage_state_written", False):
-            try:
-                await self._write_storage_state()
-                self._shutdown_storage_state_written = True
-            except Exception as exc:
-                utils.logger.warning(
-                    "[XiaoHongShuCrawler] Final storage state snapshot failed before shutdown: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+        guard_errors: List[BaseException] = []
         while True:
-            await self._wait_for_all_new_page_guards()
             try:
                 pages = [
                     page
@@ -395,11 +598,30 @@ class XiaoHongShuCrawler(AbstractCrawler):
             if not pages:
                 return
             page_ids_before = {id(page) for page in pages}
+
+            # Resolve every page guard before closing any page.  A verification
+            # popup can depend on its opener; closing the primary page first
+            # would technically wait on the popup but still destroy the manual
+            # flow that the guard exists to protect.
             for page in pages:
-                await self._close_page_with_deadline(
-                    page,
-                    reason="browser_shutdown",
-                )
+                try:
+                    await self._wait_before_page_close(
+                        page,
+                        reason="browser_shutdown",
+                    )
+                except Exception as exc:
+                    guard_errors.append(exc)
+            for page in pages:
+                if self._page_is_closed(page):
+                    continue
+                try:
+                    async with asyncio.timeout(10):
+                        await page.close()
+                except Exception as exc:
+                    utils.logger.warning(
+                        "[XiaoHongShuCrawler] Page close did not finish cleanly "
+                        f"during shutdown: {exc}"
+                    )
             await asyncio.sleep(0)
             try:
                 remaining_ids = {
@@ -410,7 +632,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
             except Exception:
                 return
             if not remaining_ids or remaining_ids == page_ids_before:
-                return
+                break
+        if guard_errors:
+            raise guard_errors[0]
 
     async def _guarded_pause(self, stage: str, minimum: float, maximum: float) -> float:
         event = await run_required_request_pause(stage, minimum, maximum)
@@ -785,14 +1009,26 @@ class XiaoHongShuCrawler(AbstractCrawler):
         *,
         reason: str = "crawler_page_cleanup",
     ) -> None:
-        await self._wait_before_page_close(page, reason=reason)
+        guard_error: Optional[BaseException] = None
+        try:
+            await self._wait_before_page_close(page, reason=reason)
+        except Exception as exc:
+            # A terminal restriction or a 600s operator timeout is still a
+            # failed run, but it must not leak the page/context.  Close only
+            # after the guard has produced that authoritative outcome, then
+            # re-raise it to the caller.
+            guard_error = exc
         if self._page_is_closed(page):
+            if guard_error is not None:
+                raise guard_error
             return
         try:
             async with asyncio.timeout(10):
                 await page.close()
         except Exception as exc:
             utils.logger.warning(f"[XiaoHongShuCrawler] Page close did not finish cleanly: {exc}")
+        if guard_error is not None:
+            raise guard_error
 
     async def _browser_identity_headers(self) -> Dict[str, str]:
         try:
@@ -907,214 +1143,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 reason="post_interaction_cleanup",
             )
 
-    def _storage_state_path(self) -> str:
-        explicit_path = os.environ.get("TRIPPOSTCOLLECT_XHS_STORAGE_STATE_PATH", "").strip()
-        if not explicit_path:
-            raise RuntimeError("XHS requires TRIPPOSTCOLLECT_XHS_STORAGE_STATE_PATH from xhs_runner.py")
-        return os.path.abspath(os.path.expanduser(explicit_path))
-
     @staticmethod
     def _profile_dir() -> str:
         explicit_path = os.environ.get("TRIPPOSTCOLLECT_XHS_PROFILE_DIR", "").strip()
         if not explicit_path:
             raise RuntimeError("XHS requires TRIPPOSTCOLLECT_XHS_PROFILE_DIR from xhs_runner.py")
         return os.path.abspath(os.path.expanduser(explicit_path))
-
-    @staticmethod
-    def _cookie_for_restore(cookie: Dict) -> Dict:
-        allowed_keys = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
-        restored = {key: value for key, value in cookie.items() if key in allowed_keys and value is not None}
-        if restored.get("expires") == -1:
-            restored.pop("expires", None)
-        return restored
-
-    async def _restore_storage_state(self, primary_page: Optional[Page] = None) -> bool:
-        snapshot_path = self._storage_state_path()
-        if not snapshot_path or not os.path.isfile(snapshot_path):
-            return False
-        try:
-            with open(snapshot_path, "r", encoding="utf-8") as handle:
-                state = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
-            utils.logger.warning(f"[XiaoHongShuCrawler] Failed to load storage state {snapshot_path}: {exc}")
-            return False
-
-        existing_cookies = {
-            (
-                str(cookie.get("name") or ""),
-                str(cookie.get("domain") or ""),
-                str(cookie.get("path") or "/"),
-            )
-            for cookie in await self.browser_context.cookies()
-            if isinstance(cookie, dict)
-        }
-        cookies = [
-            self._cookie_for_restore(cookie)
-            for cookie in state.get("cookies", [])
-            if isinstance(cookie, dict) and cookie.get("name") and cookie.get("value")
-            and (
-                str(cookie.get("name") or ""),
-                str(cookie.get("domain") or ""),
-                str(cookie.get("path") or "/"),
-            ) not in existing_cookies
-        ]
-        if cookies:
-            try:
-                await self.browser_context.add_cookies(cookies)
-                utils.logger.info(
-                    f"[XiaoHongShuCrawler] Restored {len(cookies)} cookies from storage state: {snapshot_path}"
-                )
-            except Exception as exc:
-                utils.logger.warning(f"[XiaoHongShuCrawler] Restore cookies failed: {exc}")
-
-        local_storage_by_origin: Dict[str, Dict[str, str]] = {}
-        for origin_item in state.get("origins", []):
-            if not isinstance(origin_item, dict):
-                continue
-            origin = origin_item.get("origin")
-            if not origin:
-                continue
-            bucket = local_storage_by_origin.setdefault(origin, {})
-            for item in origin_item.get("localStorage", []):
-                if isinstance(item, dict) and item.get("name") is not None and item.get("value") is not None:
-                    bucket[str(item["name"])] = str(item["value"])
-
-        runtime_storage = [
-            item
-            for item in state.get("trippostcollect", {}).get("runtime_storage", [])
-            if isinstance(item, dict) and item.get("origin")
-        ]
-        for item in runtime_storage:
-            if not isinstance(item, dict):
-                continue
-            origin = item.get("origin")
-            if not origin:
-                continue
-            values = item.get("localStorage")
-            if not isinstance(values, dict):
-                continue
-            bucket = local_storage_by_origin.setdefault(origin, {})
-            for key, value in values.items():
-                if value is not None:
-                    bucket[str(key)] = str(value)
-
-        if local_storage_by_origin:
-            script_payload = json.dumps(local_storage_by_origin, ensure_ascii=False)
-            await self.browser_context.add_init_script(
-                script=f"""
-                (() => {{
-                  const storageByOrigin = {script_payload};
-                  const state = storageByOrigin[location.origin];
-                  if (!state) return;
-                  for (const [key, value] of Object.entries(state)) {{
-                    try {{
-                      if (window.localStorage.getItem(key) === null) window.localStorage.setItem(key, value);
-                    }} catch (_) {{}}
-                  }}
-                }})();
-                """
-            )
-            utils.logger.info(
-                f"[XiaoHongShuCrawler] Installed local storage restore init script for {len(local_storage_by_origin)} origins"
-            )
-        session_item: Dict = {}
-        if primary_page is not None:
-            parsed = urlparse(str(getattr(primary_page, "url", "") or ""))
-            primary_origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
-            candidates = [item for item in runtime_storage if item.get("origin") == primary_origin]
-            if not candidates:
-                candidates = runtime_storage
-            session_item = next(
-                (item for item in candidates if item.get("page_role") == "primary"),
-                candidates[0] if candidates else {},
-            )
-        session_storage = session_item.get("sessionStorage") or {}
-        if primary_page is not None and isinstance(session_storage, dict) and session_storage:
-            script_payload = json.dumps(
-                {str(key): str(value) for key, value in session_storage.items() if value is not None},
-                ensure_ascii=False,
-            )
-            await primary_page.add_init_script(
-                script=f"""
-                (() => {{
-                  const state = {script_payload};
-                  for (const [key, value] of Object.entries(state)) {{
-                    try {{
-                      if (window.sessionStorage.getItem(key) === null) window.sessionStorage.setItem(key, value);
-                    }} catch (_) {{}}
-                  }}
-                }})();
-                """
-            )
-            utils.logger.info("[XiaoHongShuCrawler] Installed session storage restore on the primary tab")
-        return bool(cookies or local_storage_by_origin or session_storage)
-
-    async def _write_storage_state(self, *, session_verified: bool | None = None) -> None:
-        snapshot_path = self._storage_state_path()
-        if not snapshot_path:
-            return
-        try:
-            state = await self.browser_context.storage_state()
-            runtime_storage: List[Dict] = []
-            for page in [page for page in self.browser_context.pages if not page.is_closed()]:
-                url = page.url or ""
-                if "xiaohongshu.com" not in url and "rednote.com" not in url:
-                    continue
-                try:
-                    storage = await page.evaluate(
-                        """
-                        () => ({
-                          origin: location.origin,
-                          url: location.href,
-                          localStorage: Object.fromEntries(Object.entries(window.localStorage || {})),
-                          sessionStorage: Object.fromEntries(Object.entries(window.sessionStorage || {}))
-                        })
-                        """
-                    )
-                except Exception as exc:
-                    storage = {"url": url, "error": f"{type(exc).__name__}: {exc}"}
-                storage["page_role"] = "primary" if page is getattr(self, "context_page", None) else "secondary"
-                runtime_storage.append(storage)
-            previous_metadata: Dict = {}
-            try:
-                with open(snapshot_path, "r", encoding="utf-8") as handle:
-                    previous_state = json.load(handle)
-                if isinstance(previous_state, dict) and isinstance(
-                    previous_state.get("trippostcollect"), dict
-                ):
-                    previous_metadata = dict(previous_state["trippostcollect"])
-            except (OSError, json.JSONDecodeError):
-                pass
-            previous_metadata.update(
-                {
-                    "schema_version": 3,
-                    "platform": "xhs",
-                    "account_id": os.environ.get("TRIPPOSTCOLLECT_XHS_ACCOUNT_ID", "").strip(),
-                    "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "runtime_storage": runtime_storage,
-                }
-            )
-            if session_verified is not None:
-                previous_metadata["session_verification"] = {
-                    "status": "verified" if session_verified else "invalid",
-                    "run_id": os.environ.get("TRIPPOSTCOLLECT_XHS_RUN_ID", "").strip(),
-                    "source": "xhs_selfinfo",
-                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                }
-            state["trippostcollect"] = previous_metadata
-            os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-            temporary_path = f"{snapshot_path}.{os.getpid()}.tmp"
-            with open(temporary_path, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, ensure_ascii=False, indent=2)
-            os.chmod(temporary_path, 0o600)
-            os.replace(temporary_path, snapshot_path)
-            try:
-                os.chmod(snapshot_path, 0o600)
-            except OSError:
-                pass
-            utils.logger.info(f"[XiaoHongShuCrawler] Wrote storage state snapshot: {snapshot_path}")
-        except Exception as exc:
-            utils.logger.warning(f"[XiaoHongShuCrawler] Write storage state failed: {exc}")
 
     async def _activate_latest_xhs_page(self) -> None:
         """Use the newest Xiaohongshu/Rednote page when login opens an extra tab/window."""
@@ -1125,11 +1159,41 @@ class XiaoHongShuCrawler(AbstractCrawler):
         for page in reversed(pages):
             url = page.url or ""
             if "xiaohongshu.com" in url or "rednote.com" in url:
+                self._assert_page_in_active_browser_context(
+                    page,
+                    stage="replacement_page_adoption",
+                )
                 self.context_page = page
                 client = getattr(self, "xhs_client", None)
                 if client is not None:
                     client.playwright_page = page
                 return
+
+    def _assert_page_in_active_browser_context(
+        self,
+        page: Page,
+        *,
+        stage: str,
+    ) -> None:
+        """Fail closed if a page does not belong to this run's sole context."""
+        active_context = getattr(self, "browser_context", None)
+        if active_context is None:
+            raise RuntimeError(f"xhs_browser_context_missing:{stage}")
+        session_context = self._browser_session_context
+        if session_context is not None and active_context is not session_context:
+            raise RuntimeError(f"xhs_browser_context_replaced:{stage}")
+        try:
+            active_pages = list(active_context.pages)
+        except Exception as exc:
+            raise RuntimeError(f"xhs_browser_context_unavailable:{stage}") from exc
+        if page not in active_pages:
+            raise RuntimeError(f"xhs_page_outside_active_browser_context:{stage}")
+
+        # Playwright exposes Page.context as a property.  The membership check
+        # above remains authoritative for small fakes that do not expose it.
+        page_context = getattr(page, "context", None)
+        if page_context is not None and page_context is not active_context:
+            raise RuntimeError(f"xhs_page_context_mismatch:{stage}")
 
     @staticmethod
     def _is_target_closed_error(exc: BaseException) -> bool:
@@ -1177,6 +1241,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
         await self._open_behavior_search_page(keyword)
 
     async def _confirm_replacement_session(self) -> None:
+        self._assert_page_in_active_browser_context(
+            self.context_page,
+            stage="replacement_session_confirmation",
+        )
         markers = await self._visible_checkpoint_markers()
         await self.xhs_client.update_cookies(
             browser_context=self.browser_context,
@@ -1404,110 +1472,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 "session expired",
             )
         )
-
-    async def _popup_checkpoint_state(self, page: Page) -> Dict[str, object]:
-        """Classify only visible login, verification, and terminal evidence."""
-        if self._page_is_closed(page):
-            return {
-                "closed": True,
-                "visible_text": "",
-                "visible_markers": {},
-                "manual_markers": [],
-                "terminal": "",
-            }
-
-        visible_text = ""
-        visible_markers: Dict[str, bool] = {}
-        try:
-            visible_text, visible_markers = await inspect_visible_page_state(page)
-        except Exception:
-            try:
-                locator = getattr(page, "locator", None)
-                if callable(locator):
-                    visible_text = await locator("body").inner_text(timeout=2_000)
-                else:
-                    visible_text = await page.content()
-            except Exception:
-                visible_text = ""
-            visible_text = " ".join(str(visible_text).split())[:2_000]
-
-        selector_markers: List[str] = []
-        locator = getattr(page, "locator", None)
-        if callable(locator):
-            for selector in _XHS_MANUAL_CHECKPOINT_SELECTORS:
-                try:
-                    candidate = locator(selector)
-                    first = getattr(candidate, "first", candidate)
-                    if await first.is_visible(timeout=250):
-                        selector_markers.append(selector)
-                except Exception:
-                    continue
-
-        normalized = str(visible_text or "")
-        lowered = normalized.casefold()
-        text_markers = sorted(
-            {
-                marker
-                for marker in _XHS_MANUAL_CHECKPOINT_TEXTS
-                if marker.casefold() in lowered
-            }
-        )
-        manual_markers = sorted(set(text_markers) | set(selector_markers))
-        if visible_markers.get("captcha_or_verify"):
-            manual_markers.append("captcha_or_verify")
-        if visible_markers.get("login_required"):
-            manual_markers.append("login_required")
-        manual_markers = sorted(set(manual_markers))
-
-        terminal = ""
-        if visible_markers.get("platform_security_limit"):
-            terminal = "platform_security_limit_300011"
-        elif visible_markers.get("rate_limited"):
-            terminal = "rate_limited"
-        elif visible_markers.get("blocked"):
-            terminal = "blocked"
-
-        if re.search(
-            r"安全限制|账号异常|account exception|\b300011\b",
-            normalized,
-            re.I,
-        ):
-            terminal = "platform_security_limit_300011"
-        elif re.search(
-            r"访问(?:过于)?频繁|请求(?:过于)?频繁|操作频繁|"
-            r"too many requests|rate limit|requests? (?:are )?too frequent",
-            normalized,
-            re.I,
-        ):
-            terminal = "rate_limited"
-        elif re.search(r"拒绝访问|access denied|forbidden|访问受限", normalized, re.I):
-            terminal = "blocked"
-
-        page_url = str(getattr(page, "url", "") or "")
-        if "/website-login/error" in page_url:
-            terminal = "platform_security_limit_300011"
-
-        return {
-            "closed": False,
-            "url": page_url,
-            "visible_text": normalized[:360],
-            "visible_markers": visible_markers,
-            "manual_markers": manual_markers,
-            "terminal": terminal,
-        }
-
-    @staticmethod
-    def _raise_for_terminal_popup_state(
-        state: Dict[str, object],
-        *,
-        reason: str,
-    ) -> None:
-        terminal = str(state.get("terminal") or "")
-        if not terminal:
-            return
-        if terminal == "platform_security_limit_300011":
-            raise RuntimeError("xhs_platform_security_limit_300011")
-        raise RuntimeError(f"xhs_{terminal}_during_page_guard:{reason}")
 
     def _assert_network_recovery_session(self, state: Dict[str, object]) -> None:
         context = getattr(self, "browser_context", None)
@@ -1898,7 +1862,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
     ) -> None:
         if self._browser_session_started:
             raise RuntimeError("xhs_browser_session_already_started")
-        # Latch before the first await. A failed first launch must not make the
+        # Latch before the first await.  A failed first launch must not make the
         # crawler instance reusable for a second Chrome/BrowserContext attempt.
         self._browser_session_started = True
 
@@ -1923,10 +1887,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
+        self._browser_session_context = self.browser_context
+
         self._install_new_page_guard()
         await install_project_runtime_hints(self.browser_context)
         self.context_page = await self._single_page_for_login()
-        await self._restore_storage_state(primary_page=self.context_page)
         await self._goto_with_deadline(
             self.context_page,
             self.explore_url,
@@ -1958,7 +1923,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
         if not await self._pong_with_network_recovery(stage="startup_login_probe"):
             await self._single_page_for_login()
             checkpoint_ready = False
-            if await self._wait_for_manual_checkpoint_if_needed():
+            if self._run_scoped_login_enabled():
+                utils.logger.info(
+                    "[XiaoHongShuCrawler] Fresh run-scoped session detected; "
+                    "starting the configured login flow immediately."
+                )
+            elif await self._wait_for_manual_checkpoint_if_needed():
                 await self.xhs_client.update_cookies(
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
@@ -1974,8 +1944,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     context_page=self.context_page,
                     cookie_str=config.COOKIES,
-                    close_page=self._close_page_with_deadline,
-                    new_page=self._new_guarded_page,
                 )
                 await login_obj.begin()
                 await self.xhs_client.update_cookies(
@@ -1990,7 +1958,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         "after login flow"
                     )
 
-        await self._write_storage_state(session_verified=True)
         behavior_keyword = next(
             (item.strip() for item in config.KEYWORDS.split(",") if item.strip()),
             "",
@@ -2011,7 +1978,6 @@ class XiaoHongShuCrawler(AbstractCrawler):
             stage="post_behavior_login_probe",
         ):
             raise RuntimeError("xhs_session_not_confirmed_after_human_behavior")
-        await self._write_storage_state(session_verified=True)
         crawler_type_var.set(config.CRAWLER_TYPE)
         if config.CRAWLER_TYPE == "search":
             await self.search()
@@ -3073,7 +3039,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         user_agent: Optional[str],
         headless: bool = True,
     ) -> BrowserContext:
-        """Launch one CDP browser or fail without a second launch path."""
+        """Launch one CDP browser or fail the run without a second launch path."""
         manager = CDPBrowserManager()
         self.cdp_manager = manager
         try:
@@ -3098,7 +3064,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def close(self, *, force: bool = False):
         """Close browser context"""
-        await self._prepare_browser_shutdown()
+        guard_error: Optional[BaseException] = None
+        try:
+            await self._prepare_browser_shutdown()
+        except Exception as exc:
+            guard_error = exc
         try:
             async with asyncio.timeout(20):
                 # Special handling if using CDP mode
@@ -3110,6 +3080,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
         except Exception as exc:
             utils.logger.warning(f"[XiaoHongShuCrawler.close] Browser cleanup timed out or failed: {exc}")
         utils.logger.info("[XiaoHongShuCrawler.close] Browser context closed ...")
+        if guard_error is not None:
+            raise guard_error
 
     async def get_notice_media(self, note_detail: Dict):
         if not config.ENABLE_GET_MEIDAS:

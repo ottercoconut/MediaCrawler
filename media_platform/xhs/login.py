@@ -21,8 +21,8 @@
 import asyncio
 import functools
 import os
-import sys
-from typing import Awaitable, Callable, Optional
+import time
+from typing import Optional
 
 from playwright.async_api import BrowserContext, Page
 from tenacity import (RetryError, retry, retry_if_result, stop_after_attempt,
@@ -36,46 +36,101 @@ from tools import utils
 
 class XiaoHongShuLogin(AbstractLogin):
 
+    _MIN_QR_REFRESH_SECONDS = 180
+    _DEFAULT_MANUAL_LOGIN_SECONDS = 600
+    _DEFAULT_LOGIN_POLL_SECONDS = 1.0
+    _DEFAULT_STABLE_LOGIN_SECONDS = 5.0
+    _QR_COMPONENT_REFRESH_RETRY_SECONDS = 5.0
+    _TERMINAL_SECURITY_MARKERS = frozenset({
+        "操作频繁",
+        "安全限制",
+        "账号异常",
+        "Account exception",
+        "300011",
+        "website-login/error",
+    })
+    _LOGIN_OR_QR_TEXTS = (
+        "扫码登录",
+        "二维码",
+        "打开小红书扫一扫",
+        "手机号登录",
+    )
+    _STRONG_MANUAL_PROGRESS_TEXTS = (
+        "已扫码",
+        "请在手机上确认",
+        "请在小红书App确认",
+        "请在小红书 APP 确认",
+        "手机确认",
+        "等待确认",
+        "请通过验证",
+        "安全验证",
+        "身份验证",
+        "滑块验证",
+        "拖动滑块",
+        "SMS Verification",
+        "Parameter error",
+    )
+    _CONDITIONAL_MANUAL_PROGRESS_TEXTS = (
+        "确认登录",
+        "登录确认",
+        "验证码",
+    )
+    _QR_EXPIRED_TEXTS = (
+        "二维码已失效",
+        "二维码已过期",
+        "点击刷新",
+        "重新获取二维码",
+    )
+    _CONDITIONAL_MANUAL_PROGRESS_SELECTORS = (
+        "input[autocomplete='one-time-code']",
+        "input[placeholder*='验证码']",
+    )
+    _STRONG_MANUAL_PROGRESS_SELECTORS = (
+        "input[placeholder*='安全验证']",
+        "[class*='captcha'] input",
+        "[class*='verify'] input",
+        "[class*='verification'] input",
+        "[class*='slider']",
+        "[class*='captcha'] canvas",
+    )
+    _MANUAL_PROGRESS_SELECTORS = (
+        _CONDITIONAL_MANUAL_PROGRESS_SELECTORS
+        + _STRONG_MANUAL_PROGRESS_SELECTORS
+    )
+    _QR_COMPONENT_REFRESH_SELECTORS = (
+        "xpath=//*[normalize-space()='点击刷新']",
+        "xpath=//*[normalize-space()='重新获取二维码']",
+    )
+    _PROFILE_SELECTORS = (
+        "xpath=//a[contains(@href, '/user/profile/')]"
+        "[.//*[normalize-space()='我'] or normalize-space()='我']",
+        "xpath=//*[self::a or self::button]"
+        "[.//*[normalize-space()='我'] or normalize-space()='我']",
+        "xpath=//*[normalize-space()='我']",
+    )
+    _QRCODE_SELECTOR = "xpath=//img[contains(concat(' ', normalize-space(@class), ' '), ' qrcode-img ')]"
+
     def __init__(self,
                  login_type: str,
                  browser_context: BrowserContext,
                  context_page: Page,
                  login_phone: Optional[str] = "",
                  cookie_str: str = "",
-                 close_page: Optional[Callable[..., Awaitable[None]]] = None,
-                 new_page: Optional[Callable[[], Awaitable[Page]]] = None,
                  ):
         config.LOGIN_TYPE = login_type
         self.browser_context = browser_context
         self.context_page = context_page
         self.login_phone = login_phone
         self.cookie_str = cookie_str
-        self.close_page = close_page
-        self.new_page = new_page
-
-    async def _new_login_page(self) -> Page:
-        if self.new_page:
-            return await self.new_page()
-        return await self.browser_context.new_page()
-
-    async def _close_extra_login_page(self, page: Page) -> None:
-        if self.close_page:
-            await self.close_page(page, reason="login_tab_normalization")
-            return
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
-        utils.logger.warning(
-            "[XiaoHongShuLogin] Unexpected login tab detected; keeping it visible "
-            "for at least 30s before close."
-        )
-        await asyncio.sleep(30)
-        if not page.is_closed():
-            await page.close()
+        self._last_login_observation: dict[str, object] = {}
 
     async def _single_login_page(self) -> Page:
-        """Retain one login tab without immediately closing unexpected tabs."""
+        """Return the active login tab without closing verification popups.
+
+        Login/security tabs are owned by the current BrowserContext and may be
+        required for an operator to finish the same login.  Cleanup belongs to
+        the crawler's guarded shutdown, never to the login polling loop.
+        """
         try:
             pages = [page for page in self.browser_context.pages if not page.is_closed()]
         except Exception:
@@ -84,82 +139,299 @@ class XiaoHongShuLogin(AbstractLogin):
         page = (
             self.context_page
             if self.context_page in pages
-            else (pages[0] if pages else await self._new_login_page())
+            else (pages[-1] if pages else await self.browser_context.new_page())
         )
-        closed_count = 0
-        for other_page in pages:
-            if other_page is page:
-                continue
-            await self._close_extra_login_page(other_page)
-            closed_count += 1
-        if closed_count:
+        if len(pages) > 1:
             utils.logger.info(
-                "[XiaoHongShuLogin] Retained one login tab and closed "
-                f"{closed_count} stale tab(s)."
+                "[XiaoHongShuLogin] Preserving all login/verification tabs "
+                f"until login completes: {len(pages)} open tab(s)."
             )
         self.context_page = page
         return page
+
+    async def _login_pages(self) -> list[Page]:
+        try:
+            pages = [page for page in self.browser_context.pages if not page.is_closed()]
+        except Exception:
+            pages = []
+        if not pages:
+            pages = [await self._single_login_page()]
+        return pages
+
+    @staticmethod
+    async def _selector_is_visible(page: Page, selector: str) -> bool:
+        frames = getattr(page, "frames", None)
+        targets = list(frames) if frames else [page]
+        for target in targets:
+            try:
+                if await target.locator(selector).is_visible(timeout=500):
+                    return True
+            except Exception:
+                continue
+        try:
+            return bool(await page.is_visible(selector, timeout=500))
+        except Exception:
+            return False
+
+    @classmethod
+    async def _any_selector_is_visible(
+        cls,
+        page: Page,
+        selectors: tuple[str, ...],
+    ) -> bool:
+        for selector in selectors:
+            if await cls._selector_is_visible(page, selector):
+                return True
+        return False
+
+    @staticmethod
+    async def _visible_page_text(page: Page) -> str:
+        """Read rendered text, excluding hidden fallback DOM in real pages."""
+        parts: list[str] = []
+        frames = getattr(page, "frames", None)
+        targets = list(frames) if frames else [page]
+        locator_supported = False
+        for target in targets:
+            locator = getattr(target, "locator", None)
+            if not callable(locator):
+                continue
+            locator_supported = True
+            try:
+                body = locator("body")
+                if await body.count() > 0:
+                    parts.append(await body.inner_text(timeout=750))
+            except Exception:
+                continue
+        if locator_supported:
+            return "\n".join(parts)
+
+        # Lightweight test doubles and older Page shims may not implement
+        # Locator. Playwright pages always use the rendered-text branch above.
+        try:
+            return await page.content()
+        except Exception:
+            return ""
+
+    async def _page_login_observation(self, page: Page) -> dict[str, object]:
+        try:
+            url = str(page.url or "")
+        except Exception:
+            url = ""
+        text = await self._visible_page_text(page)
+        terminal_markers = {
+            marker for marker in self._TERMINAL_SECURITY_MARKERS
+            if marker != "website-login/error" and marker in text
+        }
+        if "/website-login/error" in url:
+            terminal_markers.add("website-login/error")
+
+        qr_visible = await self._selector_is_visible(page, self._QRCODE_SELECTOR)
+        conditional_progress_control_visible = await self._any_selector_is_visible(
+            page,
+            self._CONDITIONAL_MANUAL_PROGRESS_SELECTORS,
+        )
+        strong_progress_control_visible = await self._any_selector_is_visible(
+            page,
+            self._STRONG_MANUAL_PROGRESS_SELECTORS,
+        )
+        progress_control_visible = bool(
+            conditional_progress_control_visible
+            or strong_progress_control_visible
+        )
+        strong_progress = {
+            marker for marker in self._STRONG_MANUAL_PROGRESS_TEXTS if marker in text
+        }
+        conditional_progress = {
+            marker for marker in self._CONDITIONAL_MANUAL_PROGRESS_TEXTS if marker in text
+        }
+        qr_expired = {marker for marker in self._QR_EXPIRED_TEXTS if marker in text}
+        # Generic words such as "验证码" may be present as an alternative login
+        # method on the untouched or expired QR page. A generic code input has
+        # the same ambiguity; it becomes progress only after the QR checkpoint
+        # has left the visible UI. CAPTCHA/slider controls remain strong proof.
+        manual_in_progress = bool(
+            strong_progress
+            or strong_progress_control_visible
+            or (
+                (conditional_progress or conditional_progress_control_visible)
+                and not qr_visible
+                and not qr_expired
+            )
+        )
+        login_or_qr = {
+            marker for marker in self._LOGIN_OR_QR_TEXTS if marker in text
+        }
+        profile_visible = await self._any_selector_is_visible(
+            page,
+            self._PROFILE_SELECTORS,
+        )
+        return {
+            "page": page,
+            "url": url,
+            "terminal": sorted(terminal_markers),
+            "manual_progress": sorted(strong_progress | conditional_progress),
+            "manual_control_visible": progress_control_visible,
+            "manual_in_progress": manual_in_progress,
+            "login_or_qr": sorted(login_or_qr),
+            "qr_visible": qr_visible,
+            "qr_expired": sorted(qr_expired),
+            "profile_visible": profile_visible,
+        }
+
+    async def _login_observation(self) -> dict[str, object]:
+        page_observations = [
+            await self._page_login_observation(page)
+            for page in await self._login_pages()
+        ]
+        terminal = sorted({
+            marker
+            for item in page_observations
+            for marker in item["terminal"]
+        })
+        manual_in_progress = any(
+            bool(item["manual_in_progress"]) for item in page_observations
+        )
+        profile_pages = [
+            item for item in page_observations if item["profile_visible"]
+        ]
+        progress_pages = [
+            item for item in page_observations if item["manual_in_progress"]
+        ]
+        initial_checkpoint_pages = [
+            item
+            for item in page_observations
+            if item["login_or_qr"] or item["qr_visible"]
+        ]
+        # An obsolete QR-only tab may remain open after the active page signs
+        # in. It must not block success forever. Manual/verification progress on
+        # any tab still wins, and a login overlay on the same profile page wins
+        # over the stale profile shell beneath it.
+        profile_page_checkpoint = any(
+            bool(item["login_or_qr"] or item["qr_visible"])
+            for item in profile_pages
+        )
+        visible_checkpoint = bool(
+            progress_pages
+            or profile_page_checkpoint
+            or (not profile_pages and initial_checkpoint_pages)
+        )
+        active = (progress_pages or profile_pages or page_observations)[-1]
+        active_page = active["page"]
+        if manual_in_progress and active_page is not self.context_page:
+            try:
+                await active_page.bring_to_front()
+            except Exception:
+                pass
+            self.context_page = active_page
+        return {
+            "terminal": terminal,
+            "manual_in_progress": manual_in_progress,
+            "visible_checkpoint": visible_checkpoint,
+            "profile_visible": bool(profile_pages),
+            "qr_visible": any(bool(item["qr_visible"]) for item in page_observations),
+            "qr_expired": any(bool(item["qr_expired"]) for item in page_observations),
+            "pages": page_observations,
+        }
+
+    @staticmethod
+    def _is_pure_qr_observation(observation: dict[str, object]) -> bool:
+        if (
+            observation.get("terminal")
+            or observation.get("manual_in_progress")
+            or observation.get("profile_visible")
+        ):
+            return False
+        pages = observation.get("pages") or []
+        return bool(
+            observation.get("qr_visible")
+            or any(item.get("login_or_qr") for item in pages)
+        )
+
+    @classmethod
+    def _is_pure_expired_qr_observation(
+        cls,
+        observation: dict[str, object],
+    ) -> bool:
+        if not cls._is_pure_qr_observation(observation):
+            return False
+        return bool(
+            observation.get("qr_expired")
+            or any(item.get("qr_expired") for item in observation.get("pages") or [])
+        )
+
+    async def _click_expired_qr_component_refresh(
+        self,
+        observation: dict[str, object],
+    ) -> bool:
+        """Click only an explicit refresh control on the observed expired QR page."""
+        expired_pages = [
+            item["page"]
+            for item in observation.get("pages") or []
+            if item.get("qr_expired")
+        ]
+        for page in reversed(expired_pages):
+            frames = getattr(page, "frames", None)
+            targets = list(frames) if frames else [page]
+            for target in targets:
+                locator_factory = getattr(target, "locator", None)
+                if not callable(locator_factory):
+                    continue
+                for selector in self._QR_COMPONENT_REFRESH_SELECTORS:
+                    try:
+                        candidate = locator_factory(selector)
+                        locator = getattr(candidate, "first", candidate)
+                        if not await locator.is_visible(timeout=500):
+                            continue
+                        await locator.click(timeout=5_000)
+                        self.context_page = page
+                        utils.logger.info(
+                            "[XiaoHongShuLogin.login_by_qrcode] Expired pure QR "
+                            "confirmed twice; clicked its component refresh control."
+                        )
+                        return True
+                    except Exception:
+                        continue
+        return False
 
     async def _check_login_state_once(self, no_logged_in_session: str) -> bool:
         """
         Verify login status using dual-check: UI elements and Cookies.
         """
-        # 1. Priority check: Check if the "Me" (Profile) node appears in the sidebar
-        page = await self._single_login_page()
-
-        user_profile_selector = "xpath=//a[contains(@href, '/user/profile/')]//span[text()='我']"
-        security_texts = (
-            "请通过验证",
-            "安全验证",
-            "验证码",
-            "身份验证",
-            "操作频繁",
-            "环境异常",
-            "风险",
-            "安全限制",
-            "账号异常",
-            "Account exception",
-            "300011",
-        )
-        login_texts = ("扫码登录", "二维码", "打开小红书扫一扫", "确认登录", "登录确认", "手机号登录")
-        try:
-            content = await page.content()
-        except Exception:
-            content = ""
-        markers = sorted({text for text in (*security_texts, *login_texts) if text in content})
-        if "/website-login/error" in str(page.url or ""):
-            markers.append("website-login/error")
-            markers = sorted(set(markers))
-        if set(markers).intersection(
-            {"安全限制", "账号异常", "Account exception", "300011", "website-login/error"}
-        ):
+        observation = await self._login_observation()
+        self._last_login_observation = observation
+        terminal_markers = set(observation["terminal"])
+        if terminal_markers:
             raise RuntimeError("xhs_platform_security_limit_300011")
 
-        try:
-            # A stale signed-in shell can remain behind a security overlay, so
-            # terminal platform evidence must win before this profile check.
-            is_visible = await page.is_visible(user_profile_selector, timeout=500)
-            if is_visible:
-                utils.logger.info("[XiaoHongShuLogin.check_login_state] Login status confirmed by UI element ('Me' button).")
-                return True
-        except Exception:
-            pass
-
-        # 2. Check for CAPTCHA/security/login prompts on the single login page.
-        if markers:
+        # A stale signed-in shell can remain behind an active login or security
+        # overlay. Every visible checkpoint wins over every visible "我" entry.
+        if observation["visible_checkpoint"]:
+            page_summaries = [
+                {
+                    "url": item["url"],
+                    "manual_progress": item["manual_progress"],
+                    "manual_control_visible": item["manual_control_visible"],
+                    "login_or_qr": item["login_or_qr"],
+                    "qr_visible": item["qr_visible"],
+                }
+                for item in observation["pages"]
+            ]
             utils.logger.info(
                 "[XiaoHongShuLogin.check_login_state] Visible login/security checkpoint, "
-                f"please verify manually: {{'url': {page.url}, 'markers': {markers}}}"
+                f"please verify manually: {page_summaries}"
             )
+        elif observation["profile_visible"]:
+            utils.logger.info(
+                "[XiaoHongShuLogin.check_login_state] Login status confirmed by "
+                "visible profile UI without a login/security checkpoint."
+            )
+            return True
 
-        # 3. Compatibility fallback: Original Cookie-based change detection
+        # Cookie changes are diagnostic evidence only. They cannot close the
+        # browser before the visible page has reached a stable signed-in state.
         current_cookie = await self.browser_context.cookies()
         _, cookie_dict = utils.convert_cookies(current_cookie)
         current_web_session = cookie_dict.get("web_session")
-        
-        # web_session may change after a security verification while the web UI is
-        # still logged out. Treat it as evidence only; the logged-in sidebar is
-        # the success condition that prevents premature browser shutdown.
         if no_logged_in_session and current_web_session and current_web_session != no_logged_in_session:
             utils.logger.info(
                 "[XiaoHongShuLogin.check_login_state] web_session changed, "
@@ -252,9 +524,9 @@ class XiaoHongShuLogin(AbstractLogin):
 
         try:
             await self.check_login_state(no_logged_in_session)
-        except RetryError:
+        except RetryError as exc:
             utils.logger.info("[XiaoHongShuLogin.login_by_mobile] Login xiaohongshu failed by mobile login method ...")
-            sys.exit()
+            raise RuntimeError("xhs_mobile_login_timeout") from exc
 
         wait_redirect_seconds = 5
         utils.logger.info(f"[XiaoHongShuLogin.login_by_mobile] Login successful then wait for {wait_redirect_seconds} seconds redirect ...")
@@ -263,62 +535,286 @@ class XiaoHongShuLogin(AbstractLogin):
     async def login_by_qrcode(self):
         """login xiaohongshu website and keep webdriver login state"""
         utils.logger.info("[XiaoHongShuLogin.login_by_qrcode] Begin login xiaohongshu by qrcode ...")
-        qrcode_img_selector = "xpath=//img[@class='qrcode-img']"
-        refresh_seconds = int(os.environ.get("TRIPPOSTCOLLECT_XHS_QR_REFRESH_SECONDS", "90"))
-        max_attempts = int(os.environ.get("TRIPPOSTCOLLECT_XHS_QR_ATTEMPTS", "5"))
-
-        for attempt_no in range(1, max_attempts + 1):
-            if attempt_no > 1:
-                utils.logger.info(
-                    f"[XiaoHongShuLogin.login_by_qrcode] QR code expired or not confirmed, refreshing ({attempt_no}/{max_attempts}) ..."
-                )
-                try:
-                    await self.context_page.reload(wait_until="domcontentloaded", timeout=30_000)
-                    await asyncio.sleep(1)
-                except Exception as exc:
-                    utils.logger.warning(f"[XiaoHongShuLogin.login_by_qrcode] page reload failed: {exc}")
-
-            base64_qrcode_img = await utils.find_login_qrcode(
-                self.context_page,
-                selector=qrcode_img_selector
+        requested_refresh_seconds = int(
+            os.environ.get(
+                "TRIPPOSTCOLLECT_XHS_QR_REFRESH_SECONDS",
+                str(self._MIN_QR_REFRESH_SECONDS),
             )
-            if not base64_qrcode_img:
-                utils.logger.info("[XiaoHongShuLogin.login_by_qrcode] QR code not found, trying to open login dialog ...")
-                try:
-                    login_button_ele = self.context_page.locator("xpath=//*[@id='app']/div[1]/div[2]/div[1]/ul/div[1]/button")
-                    await login_button_ele.click(timeout=5_000)
-                    await asyncio.sleep(0.5)
-                except Exception as exc:
-                    utils.logger.warning(f"[XiaoHongShuLogin.login_by_qrcode] open login dialog failed: {exc}")
+        )
+        refresh_seconds = max(
+            self._MIN_QR_REFRESH_SECONDS,
+            requested_refresh_seconds,
+        )
+        if refresh_seconds != requested_refresh_seconds:
+            utils.logger.warning(
+                "[XiaoHongShuLogin.login_by_qrcode] QR refresh interval "
+                f"{requested_refresh_seconds}s is unsafe; clamped to {refresh_seconds}s."
+            )
+        manual_wait_seconds = int(
+            os.environ.get(
+                "TRIPPOSTCOLLECT_XHS_LOGIN_WAIT_SECONDS",
+                str(self._DEFAULT_MANUAL_LOGIN_SECONDS),
+            )
+        )
+        if manual_wait_seconds <= 0:
+            raise RuntimeError("xhs_qrcode_login_wait_disabled")
+        poll_seconds = max(
+            0.2,
+            float(
+                os.environ.get(
+                    "TRIPPOSTCOLLECT_XHS_LOGIN_POLL_SECONDS",
+                    str(self._DEFAULT_LOGIN_POLL_SECONDS),
+                )
+            ),
+        )
+        stable_seconds = max(
+            poll_seconds,
+            float(
+                os.environ.get(
+                    "TRIPPOSTCOLLECT_XHS_STABLE_LOGIN_SECONDS",
+                    str(self._DEFAULT_STABLE_LOGIN_SECONDS),
+                )
+            ),
+        )
+
+        current_cookie = await self.browser_context.cookies()
+        _, cookie_dict = utils.convert_cookies(current_cookie)
+        no_logged_in_session = cookie_dict.get("web_session")
+
+        started_at = time.monotonic()
+        deadline = started_at + manual_wait_seconds
+        next_refresh_at: Optional[float] = None
+        progress_latched = False
+        qrcode_displayed = False
+        refresh_count = 0
+        stable_started_at: Optional[float] = None
+        component_refresh_pending = False
+        next_component_refresh_retry_at: Optional[float] = None
+
+        utils.logger.info(
+            "[XiaoHongShuLogin.login_by_qrcode] Waiting for operator login: "
+            f"manual_deadline={manual_wait_seconds}s, qr_refresh_interval={refresh_seconds}s."
+        )
+        while time.monotonic() < deadline:
+            logged_in = await self._check_login_state_once(no_logged_in_session)
+            observation = self._last_login_observation
+            if observation.get("manual_in_progress") and not progress_latched:
+                progress_latched = True
+                utils.logger.info(
+                    "[XiaoHongShuLogin.login_by_qrcode] Manual login/verification "
+                    "progress observed; disabling QR reload for the remainder of "
+                    "this bounded login window."
+                )
+            if logged_in and not progress_latched:
+                progress_latched = True
+                utils.logger.info(
+                    "[XiaoHongShuLogin.login_by_qrcode] Signed-in UI observed; "
+                    "disabling every QR refresh path while stability is confirmed."
+                )
+
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if logged_in:
+                if stable_started_at is None:
+                    stable_started_at = now
+                    utils.logger.info(
+                        "[XiaoHongShuLogin.login_by_qrcode] Signed-in UI observed; "
+                        f"requiring {stable_seconds:.1f}s stable confirmation."
+                    )
+                elif now - stable_started_at >= stable_seconds:
+                    utils.logger.info(
+                        "[XiaoHongShuLogin.login_by_qrcode] Login confirmed stable "
+                        f"for {now - stable_started_at:.1f}s."
+                    )
+                    return
+            else:
+                stable_started_at = None
+
+            if (
+                component_refresh_pending
+                and self._is_pure_qr_observation(observation)
+                and not self._is_pure_expired_qr_observation(observation)
+            ):
+                # A component click produced a fresh QR. Start the full-page
+                # reload floor from this new ready observation, not from the
+                # expired image's original lifetime.
+                component_refresh_pending = False
+                next_component_refresh_retry_at = None
+                qrcode_displayed = False
+                next_refresh_at = None
+
+            if not qrcode_displayed and not progress_latched and not logged_in:
                 base64_qrcode_img = await utils.find_login_qrcode(
                     self.context_page,
-                    selector=qrcode_img_selector
+                    selector=self._QRCODE_SELECTOR,
                 )
                 if not base64_qrcode_img:
-                    if await self._check_login_state_once(""):
-                        break
-                    continue
+                    utils.logger.info(
+                        "[XiaoHongShuLogin.login_by_qrcode] QR code not found, "
+                        "trying to open login dialog ..."
+                    )
+                    try:
+                        login_button_ele = self.context_page.locator(
+                            "xpath=//*[@id='app']/div[1]/div[2]/div[1]/ul/div[1]/button"
+                        )
+                        await login_button_ele.click(timeout=5_000)
+                        await asyncio.sleep(0.5)
+                    except Exception as exc:
+                        utils.logger.warning(
+                            "[XiaoHongShuLogin.login_by_qrcode] open login dialog "
+                            f"failed: {exc}"
+                        )
+                    base64_qrcode_img = await utils.find_login_qrcode(
+                        self.context_page,
+                        selector=self._QRCODE_SELECTOR,
+                    )
+                if base64_qrcode_img and not observation.get("qr_expired"):
+                    browser_headless = bool(
+                        config.CDP_HEADLESS
+                        if config.ENABLE_CDP_MODE
+                        else config.HEADLESS
+                    )
+                    if browser_headless:
+                        partial_show_qrcode = functools.partial(
+                            utils.show_qrcode,
+                            base64_qrcode_img,
+                        )
+                        asyncio.get_running_loop().run_in_executor(
+                            executor=None,
+                            func=partial_show_qrcode,
+                        )
+                    qrcode_displayed = True
+                    next_refresh_at = time.monotonic() + refresh_seconds
+                    utils.logger.info(
+                        "[XiaoHongShuLogin.login_by_qrcode] QR code ready in "
+                        f"{'headless preview' if browser_headless else 'browser'}; "
+                        f"automatic page reload is not allowed before {refresh_seconds}s."
+                    )
 
-            current_cookie = await self.browser_context.cookies()
-            _, cookie_dict = utils.convert_cookies(current_cookie)
-            no_logged_in_session = cookie_dict.get("web_session")
+            now = time.monotonic()
+            if (
+                not progress_latched
+                and next_refresh_at is None
+                and observation.get("qr_visible")
+                and not observation.get("qr_expired")
+            ):
+                # The page may render a valid QR even when extracting its bytes
+                # for the terminal preview fails. Start its lifetime from this
+                # first visible observation, never from process startup.
+                next_refresh_at = now + refresh_seconds
 
-            partial_show_qrcode = functools.partial(utils.show_qrcode, base64_qrcode_img)
-            asyncio.get_running_loop().run_in_executor(executor=None, func=partial_show_qrcode)
+            if (
+                not progress_latched
+                and not logged_in
+                and self._is_pure_expired_qr_observation(observation)
+                and (
+                    not component_refresh_pending
+                    or next_component_refresh_retry_at is None
+                    or now >= next_component_refresh_retry_at
+                )
+            ):
+                # An expired QR can appear before the 180-second full-page
+                # floor. Confirm the same fail-safe state twice, then operate
+                # only the explicit control inside that QR component.
+                confirmed_logged_in = await self._check_login_state_once(
+                    no_logged_in_session
+                )
+                confirmed_observation = self._last_login_observation
+                observation = confirmed_observation
+                if confirmed_observation.get("manual_in_progress"):
+                    progress_latched = True
+                    utils.logger.info(
+                        "[XiaoHongShuLogin.login_by_qrcode] Manual progress "
+                        "appeared while confirming QR expiry; component refresh "
+                        "cancelled and permanently disabled."
+                    )
+                elif confirmed_logged_in:
+                    progress_latched = True
+                    utils.logger.info(
+                        "[XiaoHongShuLogin.login_by_qrcode] Signed-in UI appeared "
+                        "while confirming QR expiry; component refresh cancelled."
+                    )
+                elif self._is_pure_expired_qr_observation(
+                    confirmed_observation
+                ):
+                    component_clicked = (
+                        await self._click_expired_qr_component_refresh(
+                            confirmed_observation
+                        )
+                    )
+                    if component_clicked:
+                        component_refresh_pending = True
+                        next_component_refresh_retry_at = (
+                            time.monotonic()
+                            + self._QR_COMPONENT_REFRESH_RETRY_SECONDS
+                        )
+                        qrcode_displayed = False
 
-            utils.logger.info(
-                f"[XiaoHongShuLogin.login_by_qrcode] waiting for scan code login, "
-                f"attempt {attempt_no}/{max_attempts}, refresh in {refresh_seconds}s"
-            )
-            if await self.wait_login_state(no_logged_in_session, refresh_seconds):
-                break
-        else:
-            utils.logger.info("[XiaoHongShuLogin.login_by_qrcode] Login xiaohongshu failed by qrcode login method ...")
-            sys.exit()
+            if (
+                not progress_latched
+                and not component_refresh_pending
+                and next_refresh_at is not None
+                and now >= next_refresh_at
+                and now < deadline
+            ):
+                # Close the scan-at-expiry race: the normal poll above and this
+                # immediate second observation must both still be a pure QR
+                # state. A scan/verification transition between them latches the
+                # manual flow and permanently disables periodic reload.
+                refresh_allowed = self._is_pure_qr_observation(observation)
+                if refresh_allowed:
+                    confirmed_logged_in = await self._check_login_state_once(
+                        no_logged_in_session
+                    )
+                    confirmed_observation = self._last_login_observation
+                    if confirmed_observation.get("manual_in_progress"):
+                        progress_latched = True
+                        utils.logger.info(
+                            "[XiaoHongShuLogin.login_by_qrcode] Manual progress "
+                            "appeared at the QR refresh boundary; reload cancelled."
+                        )
+                    refresh_allowed = bool(
+                        not confirmed_logged_in
+                        and not progress_latched
+                        and self._is_pure_qr_observation(confirmed_observation)
+                    )
+                if refresh_allowed and time.monotonic() < deadline:
+                    refresh_count += 1
+                    utils.logger.info(
+                        "[XiaoHongShuLogin.login_by_qrcode] QR code not confirmed; "
+                        f"refreshing after at least {refresh_seconds}s "
+                        f"(refresh {refresh_count})."
+                    )
+                    try:
+                        await self.context_page.reload(
+                            wait_until="domcontentloaded",
+                            timeout=30_000,
+                        )
+                    except Exception as exc:
+                        utils.logger.warning(
+                            "[XiaoHongShuLogin.login_by_qrcode] page reload failed: "
+                            f"{exc}"
+                        )
+                    qrcode_displayed = False
+                    next_refresh_at = None
+                    component_refresh_pending = False
+                    next_component_refresh_retry_at = None
+                elif not progress_latched:
+                    next_refresh_at = time.monotonic() + poll_seconds
+                    utils.logger.info(
+                        "[XiaoHongShuLogin.login_by_qrcode] QR refresh deferred: "
+                        "two consecutive pure-QR observations were not available."
+                    )
 
-        wait_redirect_seconds = 5
-        utils.logger.info(f"[XiaoHongShuLogin.login_by_qrcode] Login successful then wait for {wait_redirect_seconds} seconds redirect ...")
-        await asyncio.sleep(wait_redirect_seconds)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(poll_seconds, remaining))
+
+        raise RuntimeError(
+            "xhs_qrcode_login_timeout: "
+            f"operator login did not stabilize within {manual_wait_seconds}s"
+        )
 
     async def login_by_cookies(self):
         """login xiaohongshu website by cookies"""

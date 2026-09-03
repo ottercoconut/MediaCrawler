@@ -255,6 +255,14 @@ async def test_startup_checkpoint_wait_stops_on_platform_security_limit(crawler,
         await crawler._wait_for_manual_checkpoint_if_needed()
 
 
+def test_run_scoped_login_marker_is_explicit(crawler, monkeypatch):
+    monkeypatch.delenv("TRIPPOSTCOLLECT_XHS_RUN_SCOPED_LOGIN", raising=False)
+    assert crawler._run_scoped_login_enabled() is False
+
+    monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_RUN_SCOPED_LOGIN", "1")
+    assert crawler._run_scoped_login_enabled() is True
+
+
 @pytest.mark.asyncio
 async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
     crawler,
@@ -310,6 +318,11 @@ async def test_creator_browser_fallback_keeps_qr_page_open_until_verified(
         [
             {"captcha_or_verify": True},
             {"captcha_or_verify": True},
+            {"captcha_or_verify": False},
+            # The universal page-close guard classifies the now-cleared page
+            # again before closing it. Keep the fake inspector available for
+            # those observations instead of falling back to page.content().
+            {"captcha_or_verify": False},
             {"captcha_or_verify": False},
         ]
     )
