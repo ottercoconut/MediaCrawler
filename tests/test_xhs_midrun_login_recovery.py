@@ -225,9 +225,10 @@ async def test_terminal_restriction_preempts_wait_and_session_probe(
         pong_results=[True],
     )
 
-    with pytest.raises(RuntimeError, match="xhs_rate_limited_during_page_guard"):
+    with pytest.raises(xhs_core.PlatformRuntimeError) as captured:
         await crawler._wait_for_midrun_login_recovery("青岛太平角旅游")
 
+    assert captured.value.code == "xhs_rate_limited_terminal"
     assert crawler._profile_ui_visible.await_count == 0
     assert crawler.xhs_client.pong.await_count == 0
     assert goto.await_count == 0

@@ -272,12 +272,12 @@ class XiaoHongShuLogin(AbstractLogin):
         }
 
     @classmethod
-    def _terminal_state(
+    def classify_terminal_state(
         cls,
         *,
         text: str,
         url: str,
-        verification_context: bool,
+        sms_verification_context: bool,
     ) -> tuple[str, str, list[str]]:
         """Return one mutually exclusive terminal code and its failure family."""
 
@@ -291,7 +291,7 @@ class XiaoHongShuLogin(AbstractLogin):
                 ["300011"],
             )
 
-        if verification_context:
+        if sms_verification_context:
             parameter_markers = cls._matching_markers(
                 text,
                 cls._SMS_PARAMETER_ERROR_MARKERS,
@@ -319,7 +319,7 @@ class XiaoHongShuLogin(AbstractLogin):
             if rate_markers:
                 return (
                     "xhs_sms_verification_rate_limited",
-                    "rate_limited",
+                    "sms_verification_terminal",
                     sorted(rate_markers),
                 )
 
@@ -441,6 +441,13 @@ class XiaoHongShuLogin(AbstractLogin):
             "matched_markers": sorted(matched_markers),
         }
 
+    def terminal_failure_type(self) -> str:
+        """Return the failure family attached to the last visible terminal."""
+
+        return str(
+            self._last_login_observation.get("terminal_failure_type") or ""
+        )
+
     async def _page_login_observation(self, page: Page) -> dict[str, object]:
         try:
             url = str(page.url or "")
@@ -487,21 +494,18 @@ class XiaoHongShuLogin(AbstractLogin):
         login_or_qr = {
             marker for marker in self._LOGIN_OR_QR_TEXTS if marker in text
         }
-        verification_context = bool(
+        sms_verification_context = bool(
             conditional_control
-            or strong_control
-            or login_or_qr
-            or "/login" in url
             or any(
                 marker.casefold() in text.casefold()
                 for marker in self._VERIFICATION_CONTEXT_TEXTS
             )
         )
         terminal_code, terminal_failure_type, terminal_markers = (
-            self._terminal_state(
+            self.classify_terminal_state(
                 text=text,
                 url=url,
-                verification_context=verification_context,
+                sms_verification_context=sms_verification_context,
             )
         )
         profile_visible = await self._any_selector_is_visible(

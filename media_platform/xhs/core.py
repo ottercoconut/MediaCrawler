@@ -1006,31 +1006,49 @@ class XiaoHongShuCrawler(AbstractCrawler):
             await login_obj.begin()
         except PlatformRuntimeError as exc:
             stop_detail = str(exc.code or "xhs_login_runtime_failed")
-            failure_type_by_code = {
-                "xhs_sms_verification_parameter_error": (
-                    "sms_verification_terminal"
-                ),
-                "xhs_sms_verification_daily_limit": "sms_verification_terminal",
-                "xhs_sms_verification_rate_limited": "rate_limited",
-                "platform_security_limit_300011": "platform_security_limit",
-                "xhs_platform_security_limit_unspecified": (
-                    "platform_security_limit"
-                ),
-                "xhs_account_exception": "platform_security_limit",
-                "xhs_login_error_page": "platform_security_limit",
-                "ip_blocked_300012": "ip_blocked",
-                "xhs_manual_checkpoint_budget_exhausted": (
+            observed_failure_type = getattr(
+                login_obj,
+                "terminal_failure_type",
+                lambda: "",
+            )()
+            failure_type = str(observed_failure_type or "")
+            if not failure_type:
+                failure_type = (
                     "manual_checkpoint_timeout"
-                ),
-            }
+                    if stop_detail == "xhs_manual_checkpoint_budget_exhausted"
+                    else "login_runtime_error"
+                )
             append_execution_event(
                 "xhs_runtime_terminal",
                 {
                     "phase": "login",
-                    "failure_type": failure_type_by_code.get(
-                        stop_detail,
-                        "login_runtime_error",
-                    ),
+                    "failure_type": failure_type,
+                    "stop_reason": "runtime_failed",
+                    "stop_detail": stop_detail,
+                    **login_obj.terminal_context(),
+                    "retryable": False,
+                },
+            )
+            raise
+        except Exception as exc:
+            stop_detail = str(exc).strip() or (
+                f"xhs_login_{type(exc).__name__.lower()}"
+            )
+            browser_lifecycle_codes = {
+                "xhs_login_browser_context_unavailable",
+                "xhs_login_browser_pages_closed",
+            }
+            failure_type = (
+                "browser_target_closed"
+                if stop_detail in browser_lifecycle_codes
+                or self._is_target_closed_error(exc)
+                else "login_runtime_error"
+            )
+            append_execution_event(
+                "xhs_runtime_terminal",
+                {
+                    "phase": "login",
+                    "failure_type": failure_type,
                     "stop_reason": "runtime_failed",
                     "stop_detail": stop_detail,
                     **login_obj.terminal_context(),
@@ -1141,6 +1159,49 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
         )
 
+    @staticmethod
+    def _classify_visible_terminal(
+        *,
+        text: str,
+        url: str,
+        markers: Dict[str, bool],
+    ) -> tuple[str, str, List[str]]:
+        """Classify visible XHS blockers without inventing a numeric code."""
+
+        lowered = str(text or "").casefold()
+        sms_verification_context = any(
+            marker.casefold() in lowered
+            for marker in XiaoHongShuLogin._VERIFICATION_CONTEXT_TEXTS
+        )
+        terminal_code, failure_type, matched_markers = (
+            XiaoHongShuLogin.classify_terminal_state(
+                text=str(text or ""),
+                url=str(url or ""),
+                sms_verification_context=sms_verification_context,
+            )
+        )
+        if terminal_code:
+            return terminal_code, failure_type, matched_markers
+        if markers.get("platform_security_limit"):
+            return (
+                "xhs_platform_security_limit_unspecified",
+                "platform_security_limit",
+                ["platform_security_limit"],
+            )
+        if markers.get("rate_limited"):
+            return (
+                "xhs_rate_limited_terminal",
+                "rate_limited",
+                ["rate_limited"],
+            )
+        if markers.get("blocked"):
+            return (
+                "xhs_blocked_terminal",
+                "blocked_or_forbidden",
+                ["blocked"],
+            )
+        return "", "", []
+
     async def _popup_checkpoint_state(self, page: Page) -> Dict[str, object]:
         """Classify only visible login, verification, and terminal evidence."""
         if self._page_is_closed(page):
@@ -1195,33 +1256,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
             manual_markers.append("login_required")
         manual_markers = sorted(set(manual_markers))
 
-        terminal = ""
-        if visible_markers.get("platform_security_limit"):
-            terminal = "platform_security_limit_300011"
-        elif visible_markers.get("rate_limited"):
-            terminal = "rate_limited"
-        elif visible_markers.get("blocked"):
-            terminal = "blocked"
-
-        if re.search(
-            r"安全限制|账号异常|account exception|\b300011\b",
-            normalized,
-            re.I,
-        ):
-            terminal = "platform_security_limit_300011"
-        elif re.search(
-            r"访问(?:过于)?频繁|请求(?:过于)?频繁|操作频繁|"
-            r"too many requests|rate limit|requests? (?:are )?too frequent",
-            normalized,
-            re.I,
-        ):
-            terminal = "rate_limited"
-        elif re.search(r"拒绝访问|access denied|forbidden|访问受限", normalized, re.I):
-            terminal = "blocked"
-
         page_url = str(getattr(page, "url", "") or "")
-        if "/website-login/error" in page_url:
-            terminal = "platform_security_limit_300011"
+        terminal, terminal_failure_type, terminal_markers = (
+            self._classify_visible_terminal(
+                text=normalized,
+                url=page_url,
+                markers=visible_markers,
+            )
+        )
 
         return {
             "closed": False,
@@ -1230,6 +1272,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
             "visible_markers": visible_markers,
             "manual_markers": manual_markers,
             "terminal": terminal,
+            "terminal_failure_type": terminal_failure_type,
+            "terminal_markers": terminal_markers,
         }
 
     @staticmethod
@@ -1241,9 +1285,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
         terminal = str(state.get("terminal") or "")
         if not terminal:
             return
-        if terminal == "platform_security_limit_300011":
-            raise RuntimeError("xhs_platform_security_limit_300011")
-        raise RuntimeError(f"xhs_{terminal}_during_page_guard:{reason}")
+        if terminal == "rate_limited":
+            terminal = "xhs_rate_limited_terminal"
+        elif terminal == "blocked":
+            terminal = "xhs_blocked_terminal"
+        raise PlatformRuntimeError(
+            f"{terminal}:{reason}",
+            code=terminal,
+        )
 
     def _assert_network_recovery_session(self, state: Dict[str, object]) -> None:
         self._assert_cdp_lifecycle_alive(
@@ -2484,6 +2533,37 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             raise XHSCreatorProfileUnavailable(str(user_id), attempts)
 
+    async def _raise_for_creator_page_terminal(
+        self,
+        page: Page,
+        *,
+        user_id: str,
+        stage: str,
+        visible_text: str,
+        visible_markers: Dict[str, bool],
+    ) -> None:
+        page_url = str(getattr(page, "url", "") or "")
+        terminal_code, failure_type, _matched_markers = (
+            self._classify_visible_terminal(
+                text=visible_text,
+                url=page_url,
+                markers=visible_markers,
+            )
+        )
+        if not terminal_code:
+            return
+        if failure_type == "platform_security_limit":
+            await record_platform_security_limit(
+                page,
+                stage=f"creator_profile:{user_id}:{stage}",
+                visible_text_sample=visible_text,
+                visible_markers=visible_markers,
+            )
+        self._raise_for_terminal_popup_state(
+            {"terminal": terminal_code},
+            reason=f"creator_profile:{user_id}:{stage}",
+        )
+
     async def _get_creator_info_from_browser(self, user_id: str) -> Optional[Dict]:
         """Load an author homepage in the signed-in context when the direct request is empty."""
         page = await self._new_guarded_page()
@@ -2496,29 +2576,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
             await page.wait_for_timeout(random.randint(1_200, 3_000))
 
             text_sample, markers = await inspect_visible_page_state(page)
-            if markers.get("platform_security_limit"):
-                await record_platform_security_limit(
-                    page,
-                    stage=f"creator_profile:{user_id}:arrival",
-                    visible_text_sample=text_sample,
-                    visible_markers=markers,
-                )
-                raise PlatformRuntimeError(
-                    "XHS creator profile is blocked by a platform security limit",
-                    code="platform_security_limit_300011",
-                )
+            await self._raise_for_creator_page_terminal(
+                page,
+                user_id=str(user_id),
+                stage="arrival",
+                visible_text=text_sample,
+                visible_markers=markers,
+            )
             if markers.get("captcha_or_verify") or markers.get("login_required"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
-            challenge = next(
-                (
-                    key
-                    for key in ("platform_security_limit", "rate_limited", "blocked")
-                    if markers.get(key)
-                ),
-                "",
-            )
-            if challenge:
-                raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
             viewport = page.viewport_size or {"width": 1280, "height": 800}
             await page.mouse.move(
                 random.randint(80, max(81, viewport["width"] - 80)),
@@ -2529,29 +2595,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
             await page.wait_for_timeout(random.randint(500, 1_500))
 
             text_sample, markers = await inspect_visible_page_state(page)
-            if markers.get("platform_security_limit"):
-                await record_platform_security_limit(
-                    page,
-                    stage=f"creator_profile:{user_id}:post_scroll",
-                    visible_text_sample=text_sample,
-                    visible_markers=markers,
-                )
-                raise PlatformRuntimeError(
-                    "XHS creator profile is blocked by a platform security limit",
-                    code="platform_security_limit_300011",
-                )
+            await self._raise_for_creator_page_terminal(
+                page,
+                user_id=str(user_id),
+                stage="post_scroll",
+                visible_text=text_sample,
+                visible_markers=markers,
+            )
             if markers.get("captcha_or_verify") or markers.get("login_required"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
-            challenge = next(
-                (
-                    key
-                    for key in ("platform_security_limit", "rate_limited", "blocked")
-                    if markers.get(key)
-                ),
-                "",
-            )
-            if challenge:
-                raise RuntimeError(f"xhs_creator_profile_visible_block:{challenge}")
             html_content = await page.content()
             return self.xhs_client.extract_creator_info_from_html(html_content)
         finally:
@@ -2584,33 +2636,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
             while True:
                 ticket.raise_if_exhausted()
                 text_sample, markers = await inspect_visible_page_state(page)
-                if markers.get("platform_security_limit"):
-                    await record_platform_security_limit(
-                        page,
-                        stage=f"creator_profile:{user_id}:verification_wait",
-                        visible_text_sample=text_sample,
-                        visible_markers=markers,
-                    )
-                    raise PlatformRuntimeError(
-                        "XHS creator profile is blocked by a platform security limit",
-                        code="platform_security_limit_300011",
-                    )
-                challenge = next(
-                    (
-                        key
-                        for key in (
-                            "platform_security_limit",
-                            "rate_limited",
-                            "blocked",
-                        )
-                        if markers.get(key)
-                    ),
-                    "",
+                await self._raise_for_creator_page_terminal(
+                    page,
+                    user_id=str(user_id),
+                    stage="verification_wait",
+                    visible_text=text_sample,
+                    visible_markers=markers,
                 )
-                if challenge:
-                    raise RuntimeError(
-                        f"xhs_creator_profile_visible_block:{challenge}"
-                    )
                 if not markers.get("captcha_or_verify"):
                     ticket.raise_if_exhausted()
                     html_content = await page.content()

@@ -121,6 +121,223 @@ async def test_qrcode_login_budget_exhaustion_writes_structured_terminal_event(
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_failure_type", "expected_detail"),
+    [
+        (
+            RuntimeError("xhs_login_browser_pages_closed"),
+            "browser_target_closed",
+            "xhs_login_browser_pages_closed",
+        ),
+        (
+            RuntimeError("unexpected login observation failure"),
+            "login_runtime_error",
+            "unexpected login observation failure",
+        ),
+    ],
+)
+async def test_qrcode_login_unknown_exception_writes_structured_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+    error: RuntimeError,
+    expected_failure_type: str,
+    expected_detail: str,
+) -> None:
+    crawler = XiaoHongShuCrawler()
+    crawler.browser_context = SimpleNamespace()
+    crawler.context_page = SimpleNamespace()
+    crawler.xhs_client = SimpleNamespace(playwright_page=crawler.context_page)
+    append_event = MagicMock()
+
+    class BrokenLogin:
+        def __init__(self, **kwargs: object) -> None:
+            self.context_page = kwargs["context_page"]
+
+        async def begin(self) -> None:
+            raise error
+
+        def terminal_context(self) -> dict[str, object]:
+            return {
+                "checkpoint_kind": "unknown",
+                "manual_progress_observed": False,
+                "matched_markers": [],
+            }
+
+    monkeypatch.setattr(xhs_core, "XiaoHongShuLogin", BrokenLogin)
+    monkeypatch.setattr(xhs_core, "append_execution_event", append_event)
+
+    with pytest.raises(RuntimeError, match=expected_detail):
+        await crawler._run_qrcode_login()
+
+    append_event.assert_called_once_with(
+        "xhs_runtime_terminal",
+        {
+            "phase": "login",
+            "failure_type": expected_failure_type,
+            "stop_reason": "runtime_failed",
+            "stop_detail": expected_detail,
+            "checkpoint_kind": "unknown",
+            "manual_progress_observed": False,
+            "matched_markers": [],
+            "retryable": False,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "text",
+        "url",
+        "sms_context",
+        "expected_code",
+        "expected_failure_type",
+    ),
+    [
+        (
+            "SMS Verification\nParameter error",
+            "https://www.xiaohongshu.com/",
+            True,
+            "xhs_sms_verification_parameter_error",
+            "sms_verification_terminal",
+        ),
+        (
+            "今日短信验证码次数已达上限",
+            "https://www.xiaohongshu.com/",
+            True,
+            "xhs_sms_verification_daily_limit",
+            "sms_verification_terminal",
+        ),
+        (
+            "SMS Verification\nRequests too frequent",
+            "https://www.xiaohongshu.com/",
+            True,
+            "xhs_sms_verification_rate_limited",
+            "sms_verification_terminal",
+        ),
+        (
+            "安全限制 300011",
+            "https://www.xiaohongshu.com/",
+            False,
+            "platform_security_limit_300011",
+            "platform_security_limit",
+        ),
+        (
+            "账号异常 300012",
+            "https://www.xiaohongshu.com/",
+            False,
+            "ip_blocked_300012",
+            "ip_blocked",
+        ),
+        (
+            "安全限制",
+            "https://www.xiaohongshu.com/",
+            False,
+            "xhs_platform_security_limit_unspecified",
+            "platform_security_limit",
+        ),
+        (
+            "Account exception",
+            "https://www.xiaohongshu.com/",
+            False,
+            "xhs_account_exception",
+            "platform_security_limit",
+        ),
+        (
+            "Something went wrong",
+            "https://www.xiaohongshu.com/website-login/error",
+            False,
+            "xhs_login_error_page",
+            "platform_security_limit",
+        ),
+    ],
+)
+def test_login_terminal_classification_preserves_precise_subtype(
+    text: str,
+    url: str,
+    sms_context: bool,
+    expected_code: str,
+    expected_failure_type: str,
+) -> None:
+    code, failure_type, _markers = XiaoHongShuLogin.classify_terminal_state(
+        text=text,
+        url=url,
+        sms_verification_context=sms_context,
+    )
+
+    assert code == expected_code
+    assert failure_type == expected_failure_type
+
+
+def test_generic_parameter_error_without_sms_context_is_not_sms_terminal() -> None:
+    code, failure_type, markers = XiaoHongShuLogin.classify_terminal_state(
+        text="Parameter error",
+        url="https://www.xiaohongshu.com/",
+        sms_verification_context=False,
+    )
+
+    assert (code, failure_type, markers) == ("", "", [])
+
+
+def test_visible_terminal_generic_marker_never_invents_300011() -> None:
+    code, failure_type, markers = XiaoHongShuCrawler._classify_visible_terminal(
+        text="page rendered",
+        url="https://www.xiaohongshu.com/",
+        markers={"platform_security_limit": True},
+    )
+
+    assert code == "xhs_platform_security_limit_unspecified"
+    assert failure_type == "platform_security_limit"
+    assert markers == ["platform_security_limit"]
+
+
+@pytest.mark.asyncio
+async def test_creator_generic_security_marker_raises_unspecified_subtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawler = XiaoHongShuCrawler()
+    page = SimpleNamespace(url="https://www.xiaohongshu.com/user/profile/example")
+    record_security = AsyncMock()
+    monkeypatch.setattr(
+        xhs_core,
+        "record_platform_security_limit",
+        record_security,
+    )
+
+    with pytest.raises(xhs_core.PlatformRuntimeError) as captured:
+        await crawler._raise_for_creator_page_terminal(
+            page,
+            user_id="example",
+            stage="arrival",
+            visible_text="安全限制",
+            visible_markers={"platform_security_limit": True},
+        )
+
+    assert captured.value.code == "xhs_platform_security_limit_unspecified"
+    record_security.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("marker", "expected_code", "expected_failure_type"),
+    [
+        ("rate_limited", "xhs_rate_limited_terminal", "rate_limited"),
+        ("blocked", "xhs_blocked_terminal", "blocked_or_forbidden"),
+    ],
+)
+def test_visible_terminal_non_security_blockers_have_stable_codes(
+    marker: str,
+    expected_code: str,
+    expected_failure_type: str,
+) -> None:
+    code, failure_type, _markers = XiaoHongShuCrawler._classify_visible_terminal(
+        text="page rendered",
+        url="https://www.xiaohongshu.com/",
+        markers={marker: True},
+    )
+
+    assert code == expected_code
+    assert failure_type == expected_failure_type
+
+
 def test_xhs_login_has_no_mobile_cookie_or_redis_automation_surface() -> None:
     signature = inspect.signature(XiaoHongShuLogin)
     source = inspect.getsource(XiaoHongShuLogin)
@@ -525,17 +742,25 @@ async def test_failed_startup_pong_enters_real_qrcode_state_machine_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("visible_text", "terminal_code", "failure_type"),
+    ("visible_text", "terminal_code", "failure_type", "matched_marker"),
     [
         (
             "SMS Verification\nParameter error",
             "xhs_sms_verification_parameter_error",
             "sms_verification_terminal",
+            "Parameter error",
         ),
         (
             "手机号登录\n今日短信验证码次数已达上限",
             "xhs_sms_verification_daily_limit",
             "sms_verification_terminal",
+            "今日短信验证码次数已达上限",
+        ),
+        (
+            "SMS Verification\nRequests too frequent",
+            "xhs_sms_verification_rate_limited",
+            "sms_verification_terminal",
+            "Requests too frequent",
         ),
     ],
 )
@@ -544,6 +769,7 @@ async def test_startup_sms_terminal_fails_immediately_without_retry_or_business_
     visible_text: str,
     terminal_code: str,
     failure_type: str,
+    matched_marker: str,
 ) -> None:
     clock = _LoginFlowClock()
     page = _LoginFlowPage(visible_text=visible_text)
@@ -583,11 +809,7 @@ async def test_startup_sms_terminal_fails_immediately_without_retry_or_business_
             "stop_detail": terminal_code,
             "checkpoint_kind": "sms_verification",
             "manual_progress_observed": True,
-            "matched_markers": [
-                "Parameter error"
-                if terminal_code == "xhs_sms_verification_parameter_error"
-                else "今日短信验证码次数已达上限"
-            ],
+            "matched_markers": [matched_marker],
             "retryable": False,
         },
     )
