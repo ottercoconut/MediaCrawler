@@ -791,7 +791,6 @@ async def test_initial_login_usage_leaves_only_remainder_for_midrun_recovery(
     crawler.cookie_urls = [crawler.index_url]
     crawler._popup_monotonic = clock.monotonic
     crawler._popup_sleep = clock.sleep
-    crawler._activate_latest_xhs_page = AsyncMock()
     crawler._profile_ui_visible = AsyncMock(return_value=False)
     crawler._popup_checkpoint_state = AsyncMock(
         return_value={

@@ -192,9 +192,6 @@ async def test_xhs_behavior_primary_page_close_is_terminal_without_adoption(
     )
     crawler.xhs_client = SimpleNamespace(playwright_page=original)
     crawler.cdp_manager = SimpleNamespace(assert_alive=lifecycle_stages.append)
-    crawler._activate_latest_xhs_page = AsyncMock(
-        side_effect=AssertionError("must not adopt an existing page")
-    )
     crawler.launch_browser_with_cdp = AsyncMock(
         side_effect=AssertionError("must not relaunch Chrome")
     )
@@ -208,7 +205,6 @@ async def test_xhs_behavior_primary_page_close_is_terminal_without_adoption(
     assert crawler.context_page is original
     assert crawler.xhs_client.playwright_page is original
     assert replacement.closed is False
-    crawler._activate_latest_xhs_page.assert_not_awaited()
     crawler.launch_browser_with_cdp.assert_not_awaited()
 
 
@@ -227,9 +223,6 @@ async def test_xhs_search_navigation_primary_page_close_is_terminal_without_retr
             "TargetClosedError: Target page, context or browser has been closed"
         )
     )
-    crawler._activate_latest_xhs_page = AsyncMock(
-        side_effect=AssertionError("must not adopt an existing page")
-    )
     crawler.launch_browser_with_cdp = AsyncMock(
         side_effect=AssertionError("must not relaunch Chrome")
     )
@@ -244,7 +237,6 @@ async def test_xhs_search_navigation_primary_page_close_is_terminal_without_retr
     assert crawler.context_page is original
     assert crawler.xhs_client.playwright_page is original
     assert replacement.closed is False
-    crawler._activate_latest_xhs_page.assert_not_awaited()
     crawler.launch_browser_with_cdp.assert_not_awaited()
 
 

@@ -937,20 +937,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
             raise RuntimeError("XHS requires TRIPPOSTCOLLECT_XHS_PROFILE_DIR from xhs_runner.py")
         return os.path.abspath(os.path.expanduser(explicit_path))
 
-    async def _activate_latest_xhs_page(self) -> None:
-        """Use the newest Xiaohongshu/Rednote page when login opens an extra tab/window."""
-        try:
-            pages = [page for page in self.browser_context.pages if not page.is_closed()]
-        except Exception:
-            return
-        for page in reversed(pages):
-            url = page.url or ""
-            if "xiaohongshu.com" in url or "rednote.com" in url:
-                self.context_page = page
-                client = getattr(self, "xhs_client", None)
-                if client is not None:
-                    client.playwright_page = page
-                return
+    def _assert_primary_page_alive(self, stage: str) -> None:
+        """Keep the original business page; auxiliary tabs never become primary."""
+        self._assert_cdp_lifecycle_alive(stage)
+        if self._page_is_closed(self.context_page):
+            raise RuntimeError(f"xhs_main_page_closed_unexpected:stage={stage}")
 
     @staticmethod
     def _is_target_closed_error(exc: BaseException) -> bool:
@@ -1086,8 +1077,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def _profile_ui_visible(self) -> bool:
         """Recognize the signed-in profile entry across XHS sidebar DOM variants."""
 
+        self._assert_primary_page_alive("profile_ui")
         try:
-            await self._activate_latest_xhs_page()
             selectors = (
                 # The original sidebar layout exposes a profile URL.
                 "xpath=//a[contains(@href, '/user/profile/')]"
@@ -1122,7 +1113,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 f"[XiaoHongShuCrawler] Waiting {settle_seconds:.1f}s for Xiaohongshu web startup settle ..."
             )
             await asyncio.sleep(settle_seconds)
-        await self._activate_latest_xhs_page()
+        self._assert_primary_page_alive("initial_page_settle")
 
     @staticmethod
     def _request_failure_exception(exc: BaseException) -> BaseException:
@@ -1540,19 +1531,19 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
         )
 
-    async def _wait_for_midrun_login_recovery(self, keyword: str) -> bool:
-        """Keep the headed browser open while the operator restores an expired login."""
+    async def _wait_for_midrun_login_recovery(self, keyword: Optional[str] = None) -> bool:
+        """Wait on the original page's QR; never open or adopt a login tab."""
+        self._assert_primary_page_alive("midrun_login_recovery")
         budget = self._get_manual_wait_budget()
         ticket = budget.start("midrun_login_recovery")
         recovered = False
         try:
             utils.logger.warning(
                 "[XiaoHongShuCrawler] Xiaohongshu login expired during search; "
-                "keeping every browser tab open within the shared manual budget "
+                "waiting on the original page within the shared manual budget "
                 f"({ticket.remaining_seconds:.1f}s left) so the operator can "
                 "complete login/security verification."
             )
-            await self._activate_latest_xhs_page()
             try:
                 await self.context_page.bring_to_front()
             except Exception:
@@ -1565,7 +1556,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             clear_observations = 0
             while True:
                 ticket.raise_if_exhausted()
-                await self._activate_latest_xhs_page()
+                self._assert_primary_page_alive("midrun_login_recovery")
                 try:
                     await self.context_page.bring_to_front()
                 except Exception:
@@ -1651,12 +1642,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
         if not recovered:
             raise RuntimeError("xhs_midrun_login_recovery_incomplete")
-        search_url = f"{self.index_url}/search_result?keyword={quote(keyword)}"
-        await self._goto_with_deadline(
-            self.context_page,
-            search_url,
-            stage="midrun_login_recovered",
-        )
+        if keyword is not None:
+            search_url = f"{self.index_url}/search_result?keyword={quote(keyword)}"
+            await self._goto_with_deadline(
+                self.context_page,
+                search_url,
+                stage="midrun_login_recovered",
+            )
         await self.xhs_client.update_cookies(
             browser_context=self.browser_context,
             urls=self.cookie_urls,
@@ -1790,7 +1782,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         )
         if behavior_keyword:
             await self._open_behavior_search_page_on_primary_page(behavior_keyword)
-        await self._activate_latest_xhs_page()
+        self._assert_primary_page_alive("initial_behavior")
         behavior_evidence = await self._run_human_behavior_on_primary_page(
             behavior_keyword
         )
@@ -2566,6 +2558,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def _get_creator_info_from_browser(self, user_id: str) -> Optional[Dict]:
         """Load an author homepage in the signed-in context when the direct request is empty."""
+        self._assert_primary_page_alive("creator_profile_browser")
+        primary_state = await self._popup_checkpoint_state(self.context_page)
+        self._raise_for_terminal_popup_state(primary_state, reason="creator_profile_browser")
+        if primary_state.get("manual_markers"):
+            return await self._recover_creator_login_on_primary_page(user_id)
         page = await self._new_guarded_page()
         try:
             await self._goto_with_deadline(
@@ -2583,7 +2580,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 visible_text=text_sample,
                 visible_markers=markers,
             )
-            if markers.get("captcha_or_verify") or markers.get("login_required"):
+            if markers.get("login_required"):
+                return await self._recover_creator_login_on_primary_page(user_id)
+            if markers.get("captcha_or_verify"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
             viewport = page.viewport_size or {"width": 1280, "height": 800}
             await page.mouse.move(
@@ -2602,7 +2601,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 visible_text=text_sample,
                 visible_markers=markers,
             )
-            if markers.get("captcha_or_verify") or markers.get("login_required"):
+            if markers.get("login_required"):
+                return await self._recover_creator_login_on_primary_page(user_id)
+            if markers.get("captcha_or_verify"):
                 return await self._wait_for_creator_profile_verification(page, user_id)
             html_content = await page.content()
             return self.xhs_client.extract_creator_info_from_html(html_content)
@@ -2611,6 +2612,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 page,
                 reason="creator_profile_cleanup",
             )
+
+    async def _recover_creator_login_on_primary_page(self, user_id: str) -> Optional[Dict]:
+        """Restore the shared session on the existing main page, then retry the author."""
+        await self._wait_for_midrun_login_recovery()
+        return await self._run_with_network_recovery(
+            lambda: self.xhs_client.get_creator_info(user_id=user_id),
+            stage=f"creator_profile_api:user={user_id}",
+        )
 
     async def _wait_for_creator_profile_verification(
         self,
@@ -2643,6 +2652,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     visible_text=text_sample,
                     visible_markers=markers,
                 )
+                if markers.get("login_required"):
+                    ticket.close()
+                    return await self._recover_creator_login_on_primary_page(user_id)
                 if not markers.get("captcha_or_verify"):
                     ticket.raise_if_exhausted()
                     html_content = await page.content()

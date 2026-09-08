@@ -26,6 +26,9 @@ def crawler(monkeypatch):
     monkeypatch.setenv("TRIPPOSTCOLLECT_XHS_ENRICH_CREATORS", "1")
     instance = XiaoHongShuCrawler()
     instance._guarded_pause = AsyncMock(return_value=0.0)
+    instance.context_page = Mock()
+    instance.context_page.is_closed.return_value = False
+    instance._popup_checkpoint_state = AsyncMock(return_value={})
     return instance
 
 
@@ -38,12 +41,12 @@ async def test_profile_ui_visible_accepts_current_button_sidebar_variant(crawler
     generic_current_layout = Mock()
     generic_current_layout.count = AsyncMock(return_value=1)
     crawler.context_page = Mock()
+    crawler.context_page.is_closed.return_value = False
     crawler.context_page.locator.side_effect = [
         original_layout,
         current_layout,
         generic_current_layout,
     ]
-    crawler._activate_latest_xhs_page = AsyncMock()
 
     assert await crawler._profile_ui_visible() is True
     assert crawler.context_page.locator.call_count == 2
@@ -54,10 +57,27 @@ async def test_profile_ui_visible_rejects_logged_out_sidebar(crawler):
     locator = Mock()
     locator.count = AsyncMock(return_value=0)
     crawler.context_page = Mock()
+    crawler.context_page.is_closed.return_value = False
     crawler.context_page.locator.side_effect = [locator, locator, locator]
-    crawler._activate_latest_xhs_page = AsyncMock()
 
     assert await crawler._profile_ui_visible() is False
+
+
+@pytest.mark.asyncio
+async def test_profile_probe_does_not_adopt_newer_signed_in_auxiliary(crawler):
+    primary = crawler.context_page
+    primary.locator.return_value.count = AsyncMock(return_value=0)
+    auxiliary = Mock()
+    auxiliary.is_closed.return_value = False
+    auxiliary.url = "https://www.xiaohongshu.com/user/profile/author"
+    auxiliary.locator.return_value.count = AsyncMock(return_value=1)
+    crawler.browser_context = Mock(pages=[primary, auxiliary])
+    crawler.xhs_client = Mock(playwright_page=primary)
+
+    assert await crawler._profile_ui_visible() is False
+    assert crawler.context_page is primary
+    assert crawler.xhs_client.playwright_page is primary
+    auxiliary.locator.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -67,12 +87,12 @@ async def test_profile_ui_visible_accepts_nonsemantic_current_sidebar(crawler):
     current_layout = Mock()
     current_layout.count = AsyncMock(return_value=1)
     crawler.context_page = Mock()
+    crawler.context_page.is_closed.return_value = False
     crawler.context_page.locator.side_effect = [
         missing_layout,
         missing_layout,
         current_layout,
     ]
-    crawler._activate_latest_xhs_page = AsyncMock()
 
     assert await crawler._profile_ui_visible() is True
     assert crawler.context_page.locator.call_count == 3
@@ -107,6 +127,21 @@ async def test_creator_enrichment_falls_back_to_signed_in_browser(crawler):
 
     crawler._get_creator_info_from_browser.assert_awaited_once_with("author-2")
     assert note["creator_profile"] == creator
+
+
+@pytest.mark.asyncio
+async def test_original_page_login_prevents_opening_creator_tab(crawler):
+    creator = {"interactions": [{"type": "fans", "count": "456"}]}
+    primary = crawler.context_page
+    crawler._popup_checkpoint_state.return_value = {"manual_markers": ["扫码登录"]}
+    crawler._new_guarded_page = AsyncMock()
+    crawler._wait_for_midrun_login_recovery = AsyncMock(return_value=True)
+    crawler.xhs_client = _CreatorClient(creator)
+
+    assert await crawler._get_creator_info_from_browser("author-login") == creator
+    assert crawler.context_page is primary
+    crawler._new_guarded_page.assert_not_awaited()
+    crawler._wait_for_midrun_login_recovery.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -206,7 +241,7 @@ async def test_creator_browser_fallback_stops_on_platform_security_limit(crawler
 
 
 @pytest.mark.asyncio
-async def test_creator_browser_fallback_waits_on_login_url(crawler, monkeypatch):
+async def test_creator_browser_login_returns_to_original_page(crawler, monkeypatch):
     creator = {"interactions": [{"type": "fans", "count": "321"}]}
 
     class LoginPage:
@@ -217,7 +252,9 @@ async def test_creator_browser_fallback_waits_on_login_url(crawler, monkeypatch)
     crawler._new_guarded_page = AsyncMock(return_value=page)
     crawler._goto_with_deadline = AsyncMock()
     crawler._close_page_with_deadline = AsyncMock()
-    crawler._wait_for_creator_profile_verification = AsyncMock(return_value=creator)
+    crawler._wait_for_creator_profile_verification = AsyncMock()
+    crawler._wait_for_midrun_login_recovery = AsyncMock(return_value=True)
+    crawler.xhs_client = _CreatorClient(creator)
 
     async def inspect_state(current_page):
         assert current_page is page
@@ -231,10 +268,9 @@ async def test_creator_browser_fallback_waits_on_login_url(crawler, monkeypatch)
     result = await crawler._get_creator_info_from_browser("author-login")
 
     assert result == creator
-    crawler._wait_for_creator_profile_verification.assert_awaited_once_with(
-        page,
-        "author-login",
-    )
+    crawler._wait_for_creator_profile_verification.assert_not_awaited()
+    crawler._wait_for_midrun_login_recovery.assert_awaited_once_with()
+    assert crawler.xhs_client.calls == [{"user_id": "author-login"}]
     crawler._close_page_with_deadline.assert_awaited_once_with(
         page,
         reason="creator_profile_cleanup",

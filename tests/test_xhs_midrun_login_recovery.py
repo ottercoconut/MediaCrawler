@@ -36,11 +36,10 @@ def _crawler(
     pong_results: list[bool] | None = None,
 ) -> tuple[XiaoHongShuCrawler, AsyncMock, AsyncMock, list[float]]:
     crawler = XiaoHongShuCrawler()
-    page = SimpleNamespace(bring_to_front=AsyncMock())
+    page = SimpleNamespace(bring_to_front=AsyncMock(), is_closed=lambda: False)
     crawler.context_page = page
     crawler.browser_context = object()
     crawler.cookie_urls = [crawler.index_url]
-    crawler._activate_latest_xhs_page = AsyncMock()
     crawler._profile_ui_visible = AsyncMock(
         side_effect=profile_results if profile_results is not None else False
     )
@@ -280,3 +279,54 @@ async def test_midrun_network_confirmation_and_navigation_do_not_use_manual_budg
     assert sleeps == [100.0, 1000.0]
     assert crawler._manual_wait_budget.manual_elapsed_seconds == 0.0
     assert crawler._manual_wait_budget.remaining_seconds == 6.0
+
+
+@pytest.mark.asyncio
+async def test_recovery_keeps_original_qr_page_when_auxiliary_tab_closes(monkeypatch):
+    crawler, foreground, goto, _sleeps = _crawler(
+        monkeypatch,
+        [_state(manual=("扫码登录",)), _state(), _state(), _state()],
+        profile_results=[True],
+        pong_results=[True],
+    )
+    primary = crawler.context_page
+    auxiliary = SimpleNamespace(
+        url="https://www.xiaohongshu.com/website-login/login",
+        is_closed=lambda: closed["auxiliary"],
+        bring_to_front=AsyncMock(),
+    )
+    closed = {"auxiliary": False}
+    crawler.browser_context = SimpleNamespace(
+        pages=[primary, auxiliary], new_page=AsyncMock(),
+    )
+    crawler.xhs_client.playwright_page = primary
+    observe = crawler._popup_checkpoint_state
+
+    async def observe_and_close_auxiliary(page):
+        assert page is primary
+        closed["auxiliary"] = True
+        return await observe(page)
+
+    crawler._popup_checkpoint_state = observe_and_close_auxiliary
+    assert await crawler._wait_for_midrun_login_recovery()
+    assert crawler.context_page is primary
+    assert crawler.xhs_client.playwright_page is primary
+    assert foreground.await_count >= 2
+    auxiliary.bring_to_front.assert_not_awaited()
+    crawler.browser_context.new_page.assert_not_awaited()
+    goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_closed_original_page_fails_without_adopting_auxiliary(monkeypatch):
+    crawler, _foreground, goto, _sleeps = _crawler(monkeypatch, [_state()])
+    primary = crawler.context_page
+    primary.is_closed = lambda: True
+    crawler.browser_context = SimpleNamespace(
+        pages=[SimpleNamespace(is_closed=lambda: False)], new_page=AsyncMock(),
+    )
+    with pytest.raises(RuntimeError, match="xhs_main_page_closed_unexpected"):
+        await crawler._wait_for_midrun_login_recovery()
+    assert crawler.context_page is primary
+    crawler.browser_context.new_page.assert_not_awaited()
+    goto.assert_not_awaited()
