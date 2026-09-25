@@ -20,6 +20,7 @@
 
 # -*- coding: utf-8 -*-
 import json
+import re
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -33,6 +34,38 @@ from tools.crawler_util import extract_text_from_html
 from tools.user_hash import anonymize_user_id, mask_nickname
 
 ZHIHU_SGIN_JS = None
+
+_ZHIHU_BODY_BLOCK_TAGS = frozenset(
+    {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "div",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+)
 
 
 def _first_non_empty(*values):
@@ -136,6 +169,51 @@ def extract_image_urls_from_html(html_content: str) -> List[str]:
             image_urls.append(url)
             break
     return image_urls
+
+
+def extract_zhihu_content_text(html_content: str) -> str:
+    """Extract narrative text while preserving block boundaries and omitting figures."""
+
+    if not html_content:
+        return ""
+
+    root = Selector(text=html_content, type="html").root
+    for node in root.xpath(".//script | .//style"):
+        node.drop_tree()
+    for node in root.xpath(".//figure"):
+        node.tail = "\n" + (node.tail or "")
+        node.drop_tree()
+    for node in root.xpath(".//figcaption"):
+        node.tail = "\n" + (node.tail or "")
+        node.drop_tree()
+
+    chunks: List[str] = []
+
+    def append_node_text(node) -> None:
+        tag = node.tag.lower() if isinstance(node.tag, str) else ""
+        if tag in _ZHIHU_BODY_BLOCK_TAGS:
+            chunks.append("\n")
+        if node.text:
+            chunks.append(node.text)
+        for child in node:
+            child_tag = child.tag.lower() if isinstance(child.tag, str) else ""
+            if child_tag == "br":
+                chunks.append("\n")
+            else:
+                append_node_text(child)
+            if child.tail:
+                chunks.append(child.tail)
+        if tag in _ZHIHU_BODY_BLOCK_TAGS:
+            chunks.append("\n")
+
+    append_node_text(root)
+    text = "".join(chunks).replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+    lines = []
+    for line in text.split("\n"):
+        normalized = re.sub(r"[^\S\n]+", " ", line).strip()
+        if normalized:
+            lines.append(normalized)
+    return "\n".join(lines)
 
 
 def merge_search_content_detail(
@@ -249,7 +327,7 @@ class ZhihuExtractor:
         res.content_id = str(answer.get("id") or "")
         res.content_type = answer.get("type")
         content_html = answer.get("content", "") or ""
-        res.content_text = extract_text_from_html(content_html)
+        res.content_text = extract_zhihu_content_text(content_html)
         res.image_list = extract_image_urls_from_html(content_html)
         res.image_count = len(res.image_list)
         res.question_id = str(answer.get("question", {}).get("id") or "")
@@ -279,7 +357,7 @@ class ZhihuExtractor:
         res.content_id = str(article.get("id") or "")
         res.content_type = article.get("type")
         content_html = article.get("content", "") or ""
-        res.content_text = extract_text_from_html(content_html)
+        res.content_text = extract_zhihu_content_text(content_html)
         res.image_list = extract_image_urls_from_html(content_html)
         res.image_count = len(res.image_list)
         res.content_url = f"{zhihu_constant.ZHIHU_ZHUANLAN_URL}/p/{res.content_id}"

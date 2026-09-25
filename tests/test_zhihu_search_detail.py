@@ -12,7 +12,11 @@ from media_platform.zhihu.core import (
     ZhihuImageDownloadError,
 )
 from media_platform.zhihu.exception import PlatformRuntimeError
-from media_platform.zhihu.help import ZhihuExtractor, merge_search_content_detail
+from media_platform.zhihu.help import (
+    ZhihuExtractor,
+    extract_zhihu_content_text,
+    merge_search_content_detail,
+)
 from model.m_zhihu import ZhihuContent
 from store import zhihu as zhihu_store
 
@@ -73,6 +77,64 @@ def test_detail_html_selects_exact_non_empty_answer_entity() -> None:
     assert result is not None
     assert result.content_id == "target"
     assert result.content_text == "target body"
+
+
+def test_content_text_preserves_blocks_and_omits_figures() -> None:
+    content_html = (
+        "<p>第一段<span>行内文字</span></p>"
+        '<figure><img src="https://pic1.zhimg.com/one.jpg">'
+        "<figcaption>重复图片说明</figcaption></figure>"
+        '<figure><img data-original="https://pic1.zhimg.com/two.jpg">'
+        "<figcaption>重复图片说明</figcaption></figure>"
+        "<p>第二段<br>换行文字</p>"
+        "<ul><li>列表甲</li><li>列表乙</li></ul>"
+    )
+
+    assert extract_zhihu_content_text(content_html) == (
+        "第一段行内文字\n第二段\n换行文字\n列表甲\n列表乙"
+    )
+
+
+@pytest.mark.parametrize(
+    ("content_type", "entity_key", "extract_method"),
+    [
+        ("answer", "answers", "extract_answer_content_from_html"),
+        ("article", "articles", "extract_article_content_from_html"),
+    ],
+)
+def test_answer_and_article_drop_captions_but_keep_figure_images(
+    content_type: str,
+    entity_key: str,
+    extract_method: str,
+) -> None:
+    target_id = f"{content_type}-target"
+    content_html = (
+        "<p>正文甲</p>"
+        '<figure><img data-original="https://pic1.zhimg.com/one_r.jpg">'
+        "<figcaption>小鱼山公园</figcaption></figure>"
+        '<figure><img data-actualsrc="https://pic1.zhimg.com/two_r.jpg">'
+        "<figcaption>小鱼山公园</figcaption></figure>"
+        "<p>正文乙</p>"
+    )
+    entity = {
+        "id": target_id,
+        "type": content_type,
+        "content": content_html,
+    }
+    if content_type == "answer":
+        entity["question"] = {"id": "question-1"}
+    payload = {"initialState": {"entities": {entity_key: {target_id: entity}}}}
+    page_html = f'<script id="js-initialData">{json.dumps(payload)}</script>'
+
+    result = getattr(ZhihuExtractor(), extract_method)(page_html, target_id)
+
+    assert result is not None
+    assert result.content_text == "正文甲\n正文乙"
+    assert result.image_list == [
+        "https://pic1.zhimg.com/one_r.jpg",
+        "https://pic1.zhimg.com/two_r.jpg",
+    ]
+    assert result.image_count == 2
 
 
 def test_detail_html_rejects_empty_target_even_when_other_entity_has_body() -> None:
