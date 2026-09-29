@@ -16,6 +16,8 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
 import asyncio
 import csv
 import json
@@ -25,20 +27,23 @@ from typing import Dict, List
 import aiofiles
 import config
 from tools.utils import utils
-from tools.words import AsyncWordCloudGenerator
 
 class AsyncFileWriter:
     def __init__(self, platform: str, crawler_type: str):
         self.lock = asyncio.Lock()
         self.platform = platform
         self.crawler_type = crawler_type
-        self.wordcloud_generator = AsyncWordCloudGenerator() if config.ENABLE_GET_WORDCLOUD else None
+        self.wordcloud_generator = None
+        if config.ENABLE_GET_WORDCLOUD:
+            from tools.words import AsyncWordCloudGenerator
+
+            self.wordcloud_generator = AsyncWordCloudGenerator()
 
     def _get_file_path(self, file_type: str, item_type: str) -> str:
         if config.SAVE_DATA_PATH:
             base_path = f"{config.SAVE_DATA_PATH}/{self.platform}/{file_type}"
         else:
-            base_path = f"data/{self.platform}/{file_type}"
+            base_path = str(MEDIACRAWLER_DIR / "data" / self.platform / file_type)
         pathlib.Path(base_path).mkdir(parents=True, exist_ok=True)
         file_name = f"{self.crawler_type}_{item_type}_{utils.get_current_date()}.{file_type}"
         return f"{base_path}/{file_name}"
@@ -135,7 +140,7 @@ class AsyncFileWriter:
             if config.SAVE_DATA_PATH:
                 words_base_path = f"{config.SAVE_DATA_PATH}/{self.platform}/words"
             else:
-                words_base_path = f"data/{self.platform}/words"
+                words_base_path = str(MEDIACRAWLER_DIR / "data" / self.platform / "words")
             pathlib.Path(words_base_path).mkdir(parents=True, exist_ok=True)
             words_file_prefix = f"{words_base_path}/{self.crawler_type}_comments_{utils.get_current_date()}"
 

@@ -19,6 +19,10 @@
 
 
 # -*- coding: utf-8 -*-
+# TripPostCollect：资源与 profile 基目录不再依赖进程 cwd。
+from trippostcollect.core import resources
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
 import asyncio
 import os
 # import random  # Removed as we now use fixed config.CRAWLER_MAX_SLEEP_SEC intervals
@@ -264,7 +268,8 @@ class ZhihuCrawler(AbstractCrawler):
                     chromium, None, self.user_agent, headless=config.HEADLESS
                 )
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
-                await self.browser_context.add_init_script(path="libs/stealth.min.js")
+                with resources.path("js/stealth.min.js") as stealth_path:
+                    await self.browser_context.add_init_script(path=str(stealth_path))
 
             self.context_page = await self.browser_context.new_page()
             await self._close_stale_pages(self.context_page)
@@ -960,7 +965,7 @@ class ZhihuCrawler(AbstractCrawler):
             # feat issue #14
             # we will save login state to avoid login every time
             user_data_dir = os.path.join(
-                os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM
+                MEDIACRAWLER_DIR, "browser_data", config.USER_DATA_DIR % config.PLATFORM
             )  # type: ignore
             browser_context = await chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,

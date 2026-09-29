@@ -19,23 +19,33 @@
 # @Author  : persist1@126.com
 # @Time    : 2025/9/5 19:34
 # @Desc    : Xiaohongshu storage implementation class
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+# 退出切片仅在对应实现被调用时加载；类型名供静态检查使用。
+if TYPE_CHECKING:
+    from sqlalchemy import select
+    from sqlalchemy import update
+    from sqlalchemy import delete
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.orm import Session
+    from database.db_session import get_session
+    from database.models import XhsNote
+    from database.models import XhsNoteComment
+    from database.mongodb_store_base import MongoDBStoreBase
+
 import json
 import os
 from datetime import datetime
 from typing import List, Dict, Any
 
-from sqlalchemy import select, update, delete
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
 
 from base.base_crawler import AbstractStore
-from database.db_session import get_session
-from database.models import XhsNote, XhsNoteComment
 
 from tools.async_file_writer import AsyncFileWriter
 from tools.time_util import get_current_timestamp
 from var import crawler_type_var
-from database.mongodb_store_base import MongoDBStoreBase
 from tools import utils
 from store.excel_store_base import ExcelStoreBase
 
@@ -124,6 +134,8 @@ class XhsDbStoreImplement(AbstractStore):
         super().__init__(**kwargs)
 
     async def store_content(self, content_item: Dict):
+        from database.db_session import get_session
+
         note_id = content_item.get("note_id")
         if not note_id:
             return
@@ -134,6 +146,8 @@ class XhsDbStoreImplement(AbstractStore):
                 await self.add_content(session, content_item)
 
     async def add_content(self, session: AsyncSession, content_item: Dict):
+        from database.models import XhsNote
+
         add_ts = int(get_current_timestamp())
         last_modify_ts = int(get_current_timestamp())
         note = XhsNote(
@@ -177,6 +191,9 @@ class XhsDbStoreImplement(AbstractStore):
         session.add(note)
 
     async def update_content(self, session: AsyncSession, content_item: Dict):
+        from database.models import XhsNote
+        from sqlalchemy import update
+
         note_id = content_item.get("note_id")
         last_modify_ts = int(get_current_timestamp())
         update_data = {
@@ -210,11 +227,16 @@ class XhsDbStoreImplement(AbstractStore):
         await session.execute(stmt)
 
     async def content_is_exist(self, session: AsyncSession, note_id: str) -> bool:
+        from database.models import XhsNote
+        from sqlalchemy import select
+
         stmt = select(XhsNote).where(XhsNote.note_id == note_id)
         result = await session.execute(stmt)
         return result.first() is not None
 
     async def store_comment(self, comment_item: Dict):
+        from database.db_session import get_session
+
         if not comment_item:
             return
         async with get_session() as session:
@@ -227,6 +249,8 @@ class XhsDbStoreImplement(AbstractStore):
                 await self.add_comment(session, comment_item)
 
     async def add_comment(self, session: AsyncSession, comment_item: Dict):
+        from database.models import XhsNoteComment
+
         add_ts = int(get_current_timestamp())
         last_modify_ts = int(get_current_timestamp())
         comment = XhsNoteComment(
@@ -246,6 +270,9 @@ class XhsDbStoreImplement(AbstractStore):
         session.add(comment)
 
     async def update_comment(self, session: AsyncSession, comment_item: Dict):
+        from database.models import XhsNoteComment
+        from sqlalchemy import update
+
         comment_id = comment_item.get("comment_id")
         last_modify_ts = int(get_current_timestamp())
         update_data = {
@@ -257,6 +284,9 @@ class XhsDbStoreImplement(AbstractStore):
         await session.execute(stmt)
 
     async def comment_is_exist(self, session: AsyncSession, comment_id: str) -> bool:
+        from database.models import XhsNoteComment
+        from sqlalchemy import select
+
         stmt = select(XhsNoteComment).where(XhsNoteComment.comment_id == comment_id)
         result = await session.execute(stmt)
         return result.first() is not None
@@ -266,12 +296,20 @@ class XhsDbStoreImplement(AbstractStore):
         pass
 
     async def get_all_content(self) -> List[Dict]:
+        from database.models import XhsNote
+        from database.db_session import get_session
+        from sqlalchemy import select
+
         async with get_session() as session:
             stmt = select(XhsNote)
             result = await session.execute(stmt)
             return [item.__dict__ for item in result.scalars().all()]
 
     async def get_all_comments(self) -> List[Dict]:
+        from database.models import XhsNoteComment
+        from database.db_session import get_session
+        from sqlalchemy import select
+
         async with get_session() as session:
             stmt = select(XhsNoteComment)
             result = await session.execute(stmt)
@@ -287,6 +325,8 @@ class XhsMongoStoreImplement(AbstractStore):
     """Xiaohongshu MongoDB storage implementation"""
 
     def __init__(self, **kwargs):
+        from database.mongodb_store_base import MongoDBStoreBase
+
         super().__init__(**kwargs)
         self.mongo_store = MongoDBStoreBase(collection_prefix="xhs")
 

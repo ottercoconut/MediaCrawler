@@ -21,6 +21,8 @@
 # @Author  : helloteemo
 # @Time    : 2024/7/11 22:35
 # @Desc    : Xiaohongshu media storage
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
 import pathlib
 from pathlib import Path
 from typing import Dict, List
@@ -44,7 +46,7 @@ class XiaoHongShuImage(AbstractStoreImage):
         if config.SAVE_DATA_PATH:
             self.save_data_root = Path(config.SAVE_DATA_PATH)
         else:
-            self.save_data_root = Path("data")
+            self.save_data_root = (MEDIACRAWLER_DIR / "data")
         self.platform_root = self.save_data_root / "xhs"
         self.image_store_path = self.platform_root / "images"
         self.manifest_path = self.platform_root / "image_manifest.jsonl"

@@ -17,6 +17,10 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+# TripPostCollect：资源与 profile 基目录不再依赖进程 cwd。
+from trippostcollect.core import resources
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
 import asyncio
 import os
 import random
@@ -127,7 +131,8 @@ class DouYinCrawler(AbstractCrawler):
                     headless=config.HEADLESS,
                 )
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
-                await self.browser_context.add_init_script(path="libs/stealth.min.js")
+                with resources.path("js/stealth.min.js") as stealth_path:
+                    await self.browser_context.add_init_script(path=str(stealth_path))
 
             self.context_page = await self.browser_context.new_page()
             await self.context_page.goto(self.index_url, wait_until="domcontentloaded")
@@ -892,7 +897,7 @@ class DouYinCrawler(AbstractCrawler):
     ) -> BrowserContext:
         """Launch browser and create browser context"""
         if config.SAVE_LOGIN_STATE:
-            user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
+            user_data_dir = os.path.join(MEDIACRAWLER_DIR, "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
             browser_context = await chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
                 accept_downloads=True,

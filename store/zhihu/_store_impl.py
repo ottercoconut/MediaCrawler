@@ -22,6 +22,20 @@
 # @Author  : persist1@126.com
 # @Time    : 2025/9/5 19:34
 # @Desc    : Zhihu storage implementation class
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+# 退出切片仅在对应实现被调用时加载；类型名供静态检查使用。
+if TYPE_CHECKING:
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from database.db_session import get_session
+    from database.models import ZhihuContent
+    from database.models import ZhihuComment
+    from tools import words
+    from database.mongodb_store_base import MongoDBStoreBase
+
 import asyncio
 import csv
 import json
@@ -30,17 +44,12 @@ import pathlib
 from typing import Dict
 
 import aiofiles
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 import config
 from base.base_crawler import AbstractStore
-from database.db_session import get_session
-from database.models import ZhihuContent, ZhihuComment
-from tools import utils, words
+from tools import utils
 from var import crawler_type_var
 from tools.async_file_writer import AsyncFileWriter
-from database.mongodb_store_base import MongoDBStoreBase
 
 def calculate_number_of_files(file_store_path: str) -> int:
     """Calculate the prefix sorting number for data save files, supporting writing to different files for each run
@@ -96,6 +105,10 @@ class ZhihuDbStoreImplement(AbstractStore):
         Args:
             content_item: content item dict
         """
+        from database.models import ZhihuContent
+        from database.db_session import get_session
+        from sqlalchemy import select
+
         content_item = dict(content_item)
         content_item.pop("content_detail_status", None)
         content_item.pop("image_list_source", None)
@@ -124,6 +137,10 @@ class ZhihuDbStoreImplement(AbstractStore):
         Args:
             comment_item: comment item dict
         """
+        from database.models import ZhihuComment
+        from database.db_session import get_session
+        from sqlalchemy import select
+
         comment_id = comment_item.get("comment_id")
         async with get_session() as session:
             stmt = select(ZhihuComment).where(ZhihuComment.comment_id == comment_id)
@@ -204,6 +221,8 @@ class ZhihuMongoStoreImplement(AbstractStore):
     """Zhihu MongoDB storage implementation"""
 
     def __init__(self):
+        from database.mongodb_store_base import MongoDBStoreBase
+
         self.mongo_store = MongoDBStoreBase(collection_prefix="zhihu")
 
     async def store_content(self, content_item: Dict):

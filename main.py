@@ -17,6 +17,8 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+from trippostcollect.runtime import worker
+
 import sys
 import io
 
@@ -120,31 +122,7 @@ async def main() -> None:
 
 
 async def async_cleanup() -> None:
-    global crawler
-    if crawler:
-        if config.PLATFORM == "xhs" and callable(getattr(crawler, "close", None)):
-            try:
-                await crawler.close(force=True)
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "closed" not in error_msg and "disconnected" not in error_msg:
-                    print(f"[Main] Error closing XHS crawler safely: {e}")
-        elif getattr(crawler, "cdp_manager", None):
-            try:
-                await crawler.cdp_manager.cleanup(force=True)
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "closed" not in error_msg and "disconnected" not in error_msg:
-                    print(f"[Main] Error cleaning up CDP browser: {e}")
-
-        elif getattr(crawler, "browser_context", None):
-            try:
-                await crawler.browser_context.close()
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "closed" not in error_msg and "disconnected" not in error_msg:
-                    print(f"[Main] Error closing browser context: {e}")
-
+    await worker.async_cleanup(crawler, config.PLATFORM)
     if config.SAVE_DATA_OPTION in ("db", "sqlite"):
         await db.close()
 

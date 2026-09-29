@@ -22,6 +22,8 @@
 # @Author  : relakkes@gmail.com
 # @Time    : 2023/12/2 12:55
 # @Desc    : Slider verification utility package
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
 import os
 from typing import List
 from urllib.parse import urlparse
@@ -41,7 +43,7 @@ class Slide:
         :param gap: Gap image path or url
         :param bg: Background image with gap path or url
         """
-        self.img_dir = os.path.join(os.getcwd(), 'temp_image')
+        self.img_dir = os.path.join(MEDIACRAWLER_DIR, 'temp_image')
         if not os.path.exists(self.img_dir):
             os.makedirs(self.img_dir)
 

@@ -19,6 +19,8 @@
 
 
 # -*- coding: utf-8 -*-
+from trippostcollect.core import resources
+
 import json
 import re
 from typing import Dict, List, Optional
@@ -250,8 +252,7 @@ def sign(url: str, cookies: str) -> Dict:
     """
     global ZHIHU_SGIN_JS
     if not ZHIHU_SGIN_JS:
-        with open("libs/zhihu.js", mode="r", encoding="utf-8-sig") as f:
-            ZHIHU_SGIN_JS = execjs.compile(f.read())
+        ZHIHU_SGIN_JS = execjs.compile(resources.read_text("js/zhihu.js"))
 
     return ZHIHU_SGIN_JS.call("get_sign", url, cookies)
 

@@ -17,6 +17,10 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+# TripPostCollect：资源与 profile 基目录不再依赖进程 cwd。
+from trippostcollect.core import resources
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
 import asyncio
 import json
 import os
@@ -1730,7 +1734,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 self.user_agent,
                 headless=config.HEADLESS,
             )
-            await self.browser_context.add_init_script(path="libs/stealth.min.js")
+            with resources.path("js/stealth.min.js") as stealth_path:
+                await self.browser_context.add_init_script(path=str(stealth_path))
 
         self._install_new_page_guard()
         await install_project_runtime_hints(self.browser_context)

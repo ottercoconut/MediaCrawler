@@ -22,6 +22,10 @@
 # @Time    : 2023/12/23 15:41
 # @Desc    : Weibo crawler main workflow code
 
+# TripPostCollect：资源与 profile 基目录不再依赖进程 cwd。
+from trippostcollect.core import resources
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
 import asyncio
 import os
 # import random  # Removed as we now use fixed config.CRAWLER_MAX_SLEEP_SEC intervals
@@ -136,7 +140,8 @@ class WeiboCrawler(AbstractCrawler):
                 self.browser_context = await self.launch_browser(chromium, None, self.mobile_user_agent, headless=config.HEADLESS)
 
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
-                await self.browser_context.add_init_script(path="libs/stealth.min.js")
+                with resources.path("js/stealth.min.js") as stealth_path:
+                    await self.browser_context.add_init_script(path=str(stealth_path))
 
 
             self.context_page = await self.browser_context.new_page()
@@ -685,7 +690,7 @@ class WeiboCrawler(AbstractCrawler):
         """Launch browser and create browser context"""
         utils.logger.info("[WeiboCrawler.launch_browser] Begin create browser context ...")
         if config.SAVE_LOGIN_STATE:
-            user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
+            user_data_dir = os.path.join(MEDIACRAWLER_DIR, "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
             browser_context = await chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
                 accept_downloads=True,

@@ -17,6 +17,8 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
 import pathlib
 from pathlib import Path
 from typing import Dict, List
@@ -40,7 +42,7 @@ class DouYinImage(AbstractStoreImage):
         if config.SAVE_DATA_PATH:
             self.save_data_root = Path(config.SAVE_DATA_PATH)
         else:
-            self.save_data_root = Path("data")
+            self.save_data_root = (MEDIACRAWLER_DIR / "data")
         self.platform_root = self.save_data_root / "douyin"
         self.image_store_path = self.platform_root / "images"
         self.manifest_path = self.platform_root / "image_manifest.jsonl"

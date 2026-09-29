@@ -188,11 +188,8 @@ class StaticProxyProvider(ProxyProvider):
             return []
 
 
-IpProxyProvider: Dict[str, ProxyProvider] = {
-    ProviderNameEnum.KUAI_DAILI_PROVIDER.value: new_kuai_daili_proxy(),
-    ProviderNameEnum.WANDOU_HTTP_PROVIDER.value: new_wandou_http_proxy(),
-    ProviderNameEnum.STATIC_PROVIDER.value: StaticProxyProvider(),
-}
+# 首次实际使用代理池时才构造提供者，普通 worker 不触发缓存依赖。
+IpProxyProvider: Dict[str, ProxyProvider] = {}
 
 
 async def create_ip_pool(ip_pool_count: int, enable_validate_ip: bool) -> ProxyIpPool:
@@ -202,6 +199,12 @@ async def create_ip_pool(ip_pool_count: int, enable_validate_ip: bool) -> ProxyI
     :param enable_validate_ip: Whether to enable IP proxy validation
     :return:
     """
+    if not IpProxyProvider:
+        IpProxyProvider.update({
+            ProviderNameEnum.KUAI_DAILI_PROVIDER.value: new_kuai_daili_proxy(),
+            ProviderNameEnum.WANDOU_HTTP_PROVIDER.value: new_wandou_http_proxy(),
+            ProviderNameEnum.STATIC_PROVIDER.value: StaticProxyProvider(),
+        })
     ip_provider = IpProxyProvider.get(config.IP_PROXY_PROVIDER_NAME)
     if ip_provider is None:
         raise ValueError(

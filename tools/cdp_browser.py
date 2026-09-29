@@ -18,6 +18,12 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 
+from contextlib import ExitStack
+from trippostcollect.core import resources
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
+PROFILE_BASE_DIR = MEDIACRAWLER_DIR / "browser_data"
+
 import asyncio
 import atexit
 import os
@@ -514,8 +520,7 @@ class CDPBrowserManager:
             if not os.environ.get("TRIPPOSTCOLLECT_SHARE_CDP_PROFILE"):
                 profile_name = f"cdp_{profile_name}"
             user_data_dir = os.path.join(
-                os.getcwd(),
-                "browser_data",
+                PROFILE_BASE_DIR,
                 profile_name,
             )
         else:
@@ -664,18 +669,22 @@ class CDPBrowserManager:
 
         return browser_context
 
-    async def add_stealth_script(self, script_path: str = "libs/stealth.min.js"):
-        """
-        Add anti-detection script
-        """
-        if self.browser_context and os.path.exists(script_path):
-            try:
-                await self.browser_context.add_init_script(path=script_path)
-                utils.logger.info(
-                    f"[CDPBrowserManager] Added anti-detection script: {script_path}"
-                )
-            except Exception as e:
-                utils.logger.warning(f"[CDPBrowserManager] Failed to add anti-detection script: {e}")
+    async def add_stealth_script(self, script_path: str | None = None):
+        """从包资源或显式路径注入脚本；资源缺失时保持跳过。"""
+        with ExitStack() as resource_paths:
+            if script_path is None:
+                try:
+                    script_path = str(resource_paths.enter_context(resources.path("js/stealth.min.js")))
+                except FileNotFoundError:
+                    return
+            if self.browser_context and os.path.exists(script_path):
+                try:
+                    await self.browser_context.add_init_script(path=script_path)
+                    utils.logger.info(
+                        f"[CDPBrowserManager] Added anti-detection script: {script_path}"
+                    )
+                except Exception as e:
+                    utils.logger.warning(f"[CDPBrowserManager] Failed to add anti-detection script: {e}")
 
     async def add_cookies(self, cookies: list):
         """

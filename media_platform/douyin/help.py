@@ -24,6 +24,8 @@
 # @Time    : 2024/6/10 02:24
 # @Desc    : Get a_bogus parameter, for learning and communication only, do not use for commercial purposes, contact author to delete if infringement
 
+from trippostcollect.core import resources
+
 import random
 import re
 from typing import Optional
@@ -34,7 +36,7 @@ from playwright.async_api import Page
 from model.m_douyin import VideoUrlInfo, CreatorUrlInfo
 from tools.crawler_util import extract_url_params_to_dict
 
-douyin_sign_obj = execjs.compile(open('libs/douyin.js', encoding='utf-8-sig').read())
+douyin_sign_obj = execjs.compile(resources.read_text("js/douyin.js"))
 
 def get_web_id():
     """

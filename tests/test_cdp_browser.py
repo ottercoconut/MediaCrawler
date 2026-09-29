@@ -231,7 +231,7 @@ async def test_non_xhs_cdp_profile_behavior_is_unchanged_and_ignores_xhs_env(
     expected_profile: str | None,
 ) -> None:
     xhs_only_path = tmp_path / "must-not-be-used"
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("tools.cdp_browser.PROFILE_BASE_DIR", tmp_path / "browser_data")
     monkeypatch.setattr(config, "PLATFORM", "zhihu")
     monkeypatch.setattr(config, "SAVE_LOGIN_STATE", save_login_state)
     monkeypatch.setattr(config, "USER_DATA_DIR", "%s_user_data_dir")

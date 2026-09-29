@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from trippostcollect.core.paths import MEDIACRAWLER_DIR
+
 from pathlib import Path
 from typing import Dict, List
 
@@ -20,7 +22,7 @@ from tools.image_manifest import (
 class ZhihuStoreImage(AbstractStoreImage):
     def __init__(self):
         self.save_data_root = (
-            Path(config.SAVE_DATA_PATH) if config.SAVE_DATA_PATH else Path("data")
+            Path(config.SAVE_DATA_PATH) if config.SAVE_DATA_PATH else (MEDIACRAWLER_DIR / "data")
         )
         self.platform_root = self.save_data_root / "zhihu"
         self.image_store_path = self.platform_root / "images"
