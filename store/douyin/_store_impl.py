@@ -24,25 +24,9 @@
 # @Desc    : Douyin storage implementation class
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-# 退出切片仅在对应实现被调用时加载；类型名供静态检查使用。
-if TYPE_CHECKING:
-    from sqlalchemy import select
-    from database.db_session import get_session
-    from database.models import DouyinAweme
-    from database.models import DouyinAwemeComment
-    from tools import words
-    from database.mongodb_store_base import MongoDBStoreBase
-
-import asyncio
-import json
-import os
-import pathlib
 from typing import Dict
 
 
-import config
 from base.base_crawler import AbstractStore
 from tools import utils
 from trippostcollect.artifacts.jsonl import JsonlContentStore
@@ -205,7 +189,7 @@ class DouyinJsonStoreImplement(AbstractStore):
         )
 
 
-
+# TripPostCollect：T06 改为根实现重导出或依赖装配；来源 fork 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可保留。
 class DouyinJsonlStoreImplement(JsonlContentStore, AbstractStore):
     def __init__(self):
         super().__init__(
@@ -214,7 +198,7 @@ class DouyinJsonlStoreImplement(JsonlContentStore, AbstractStore):
         )
 
     async def store_content(self, content_item: Dict):
-        await super().store_content(content_item)
+        return await JsonlContentStore.store_content(self, content_item)
 
     async def store_comment(self, comment_item: Dict):
         await self.file_writer.write_to_jsonl(

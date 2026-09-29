@@ -24,64 +24,21 @@
 # @Time    : 2024/6/10 02:24
 # @Desc    : Get a_bogus parameter, for learning and communication only, do not use for commercial purposes, contact author to delete if infringement
 
-from trippostcollect.core import resources
+# TripPostCollect：T06 改为根实现重导出或依赖装配；来源 fork 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可保留。
+from functools import partial
+from trippostcollect.platforms.douyin.client import get_web_id as _get_web_id
+from trippostcollect.platforms.douyin.parser import parse_video_info_from_url as parse_video_info_from_url
+from trippostcollect.platforms.douyin.signer import (
+    get_a_bogus as get_a_bogus, get_a_bogus_from_js as get_a_bogus_from_js,
+    douyin_sign_obj as douyin_sign_obj,
+)
 
 import random
 import re
-from typing import Optional
-
-import execjs
 from playwright.async_api import Page
+from model.m_douyin import CreatorUrlInfo
 
-from model.m_douyin import VideoUrlInfo, CreatorUrlInfo
-from tools.crawler_util import extract_url_params_to_dict
-
-douyin_sign_obj = execjs.compile(resources.read_text("js/douyin.js"))
-
-def get_web_id():
-    """
-    Generate random webid
-    Returns:
-
-    """
-
-    def e(t):
-        if t is not None:
-            return str(t ^ (int(16 * random.random()) >> (t // 4)))
-        else:
-            return ''.join(
-                [str(int(1e7)), '-', str(int(1e3)), '-', str(int(4e3)), '-', str(int(8e3)), '-', str(int(1e11))]
-            )
-
-    web_id = ''.join(
-        e(int(x)) if x in '018' else x for x in e(None)
-    )
-    return web_id.replace('-', '')[:19]
-
-
-
-async def get_a_bogus(url: str, params: str, post_data: dict, user_agent: str, page: Page = None):
-    """
-    Get a_bogus parameter, currently does not support POST request type signature
-    """
-    return get_a_bogus_from_js(url, params, user_agent)
-
-def get_a_bogus_from_js(url: str, params: str, user_agent: str):
-    """
-    Get a_bogus parameter through js
-    Args:
-        url:
-        params:
-        user_agent:
-
-    Returns:
-
-    """
-    sign_js_name = "sign_datail"
-    if "/reply" in url:
-        sign_js_name = "sign_reply"
-    return douyin_sign_obj.call(sign_js_name, params, user_agent)
-
+get_web_id = partial(_get_web_id, random_source=lambda: random.random())
 
 
 async def get_a_bogus_from_playwright(params: str, post_data: dict, user_agent: str, page: Page):
@@ -98,46 +55,6 @@ async def get_a_bogus_from_playwright(params: str, post_data: dict, user_agent: 
         [params, post_data, user_agent])
 
     return a_bogus
-
-
-def parse_video_info_from_url(url: str) -> VideoUrlInfo:
-    """
-    Parse video ID from Douyin video URL
-    Supports the following formats:
-    1. Normal video link: https://www.douyin.com/video/7525082444551310602
-    2. Link with modal_id parameter:
-       - https://www.douyin.com/user/MS4wLjABAAAATJPY7LAlaa5X-c8uNdWkvz0jUGgpw4eeXIwu_8BhvqE?modal_id=7525082444551310602
-       - https://www.douyin.com/root/search/python?modal_id=7471165520058862848
-    3. Short link: https://v.douyin.com/iF12345ABC/ (requires client parsing)
-    4. Pure ID: 7525082444551310602
-
-    Args:
-        url: Douyin video link or ID
-    Returns:
-        VideoUrlInfo: Object containing video ID
-    """
-    # If it's a pure numeric ID, return directly
-    if url.isdigit():
-        return VideoUrlInfo(aweme_id=url, url_type="normal")
-
-    # Check if it's a short link (v.douyin.com)
-    if "v.douyin.com" in url or url.startswith("http") and len(url) < 50 and "video" not in url:
-        return VideoUrlInfo(aweme_id="", url_type="short")  # Requires client parsing
-
-    # Try to extract modal_id from URL parameters
-    params = extract_url_params_to_dict(url)
-    modal_id = params.get("modal_id")
-    if modal_id:
-        return VideoUrlInfo(aweme_id=modal_id, url_type="modal")
-
-    # Extract ID from standard video URL: /video/number
-    video_pattern = r'/video/(\d+)'
-    match = re.search(video_pattern, url)
-    if match:
-        aweme_id = match.group(1)
-        return VideoUrlInfo(aweme_id=aweme_id, url_type="normal")
-
-    raise ValueError(f"Unable to parse video ID from URL: {url}")
 
 
 def parse_creator_info_from_url(url: str) -> CreatorUrlInfo:

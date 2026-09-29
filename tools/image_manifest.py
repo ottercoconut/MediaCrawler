@@ -1,5 +1,7 @@
 """图片 staging 旧导入出口；站点稳定键留待各站 parser 迁移。"""
 
+# T06：抖音资产键只保留根 parser 的权威实现。
+from trippostcollect.platforms.douyin.parser import douyin_source_asset_key as douyin_source_asset_key
 from hashlib import sha256
 import re
 from urllib.parse import unquote, urlsplit
@@ -59,11 +61,3 @@ def zhihu_source_asset_key(source_url: str) -> str:
     else:
         identity = f"{hostname}{path}"
     return f"zhihu:urlsha256:{sha256(identity.encode('utf-8')).hexdigest()}"
-
-
-def douyin_source_asset_key(uri: str | None, source_url: str) -> str:
-    if uri not in (None, ""):
-        return f"douyin:uri:{str(uri).strip()}"
-    normalized = normalize_image_url(source_url)
-    digest = sha256(urlsplit(normalized).path.encode("utf-8")).hexdigest()
-    return f"douyin:urlsha256:{digest}"

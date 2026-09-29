@@ -18,26 +18,10 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 
-from enum import Enum
+# TripPostCollect：T06 改为根实现重导出或依赖装配；来源 fork 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可保留。
 
-
-class SearchChannelType(Enum):
-    """search channel type"""
-    GENERAL = "aweme_general"  # General
-    VIDEO = "aweme_video_web"  # Video
-    USER = "aweme_user_web"  # User
-    LIVE = "aweme_live"  # Live
-
-
-class SearchSortType(Enum):
-    """search sort type"""
-    GENERAL = 0  # Comprehensive sorting
-    MOST_LIKE = 1  # Most likes
-    LATEST = 2  # Latest published
-
-class PublishTimeType(Enum):
-    """publish time type"""
-    UNLIMITED = 0  # Unlimited
-    ONE_DAY = 1  # Within one day
-    ONE_WEEK = 7  # Within one week
-    SIX_MONTH = 180  # Within six months
+from trippostcollect.platforms.douyin.models import (
+    SearchChannelType as SearchChannelType,
+    SearchSortType as SearchSortType,
+    PublishTimeType as PublishTimeType,
+)

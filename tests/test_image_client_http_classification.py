@@ -22,10 +22,11 @@ def async_client_factory(status_code: int, content: bytes = b""):
 
 @pytest.mark.asyncio
 async def test_douyin_http_404_preserves_terminal_status(monkeypatch) -> None:
-    monkeypatch.setattr(
-        douyin_client, "make_async_client", async_client_factory(404)
-    )
+    from types import SimpleNamespace
+
     client = object.__new__(douyin_client.DouYinClient)
+    # T06：HTTP 依赖已迁入显式端口，继续只验证本站原 404 分类。
+    client.ports = SimpleNamespace(make_async_client=async_client_factory(404))
     client.proxy = None
     client.timeout = 1
 

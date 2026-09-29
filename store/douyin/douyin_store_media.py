@@ -17,6 +17,7 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+# TripPostCollect：T06 改为根实现重导出或依赖装配；来源 fork 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可保留。
 from trippostcollect.core.paths import MEDIACRAWLER_DIR
 
 import pathlib
@@ -27,7 +28,7 @@ import aiofiles
 
 from base.base_crawler import AbstractStoreImage, AbstractStoreVideo
 from tools import utils
-from tools.image_manifest import douyin_source_asset_key
+from trippostcollect.platforms.douyin.parser import douyin_source_asset_key
 from trippostcollect.artifacts.image_staging import PostImageStager
 import config
 
@@ -46,10 +47,10 @@ class DouYinImage(PostImageStager, AbstractStoreImage):
         )
 
     async def store_post_images(self, aweme_id: str, image_content_items: List[Dict]):
-        return await super().store_post_images(aweme_id, image_content_items)
+        return await PostImageStager.store_post_images(self, aweme_id, image_content_items)
 
     async def record_failure(self, aweme_id: str, image_content_item: Dict):
-        return await super().record_failure(aweme_id, image_content_item)
+        return await PostImageStager.record_failure(self, aweme_id, image_content_item)
 
 
 class DouYinVideo(AbstractStoreVideo):

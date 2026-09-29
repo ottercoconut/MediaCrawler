@@ -24,39 +24,6 @@
 # @Time    : 2024/6/2 11:06
 # @Desc    : Abstract class
 
-from abc import ABC, abstractmethod
-from typing import Any, List, Optional
+# TripPostCollect：T06 改为根实现重导出或依赖装配；来源 fork 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可保留。
 
-
-class AbstractCache(ABC):
-
-    @abstractmethod
-    def get(self, key: str) -> Optional[Any]:
-        """
-        Get the value of a key from the cache.
-        This is an abstract method. Subclasses must implement this method.
-        :param key: The key
-        :return:
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def set(self, key: str, value: Any, expire_time: int) -> None:
-        """
-        Set the value of a key in the cache.
-        This is an abstract method. Subclasses must implement this method.
-        :param key: The key
-        :param value: The value
-        :param expire_time: Expiration time
-        :return:
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def keys(self, pattern: str) -> List[str]:
-        """
-        Get all keys matching the pattern
-        :param pattern: Matching pattern
-        :return:
-        """
-        raise NotImplementedError
+from trippostcollect.platforms.douyin.login_support import AbstractCache as AbstractCache

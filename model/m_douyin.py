@@ -20,13 +20,9 @@
 
 # -*- coding: utf-8 -*-
 
+# TripPostCollect：T06 改为根实现重导出或依赖装配；来源 fork 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可保留。
+from trippostcollect.platforms.douyin.models import VideoUrlInfo as VideoUrlInfo
 from pydantic import BaseModel, Field
-
-
-class VideoUrlInfo(BaseModel):
-    """Douyin video URL information"""
-    aweme_id: str = Field(title="aweme id (video id)")
-    url_type: str = Field(default="normal", title="url type: normal, short, modal")
 
 
 class CreatorUrlInfo(BaseModel):

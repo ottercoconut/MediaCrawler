@@ -18,19 +18,11 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 
+# TripPostCollect：T06 改为根实现重导出或依赖装配；来源 fork 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可保留。
+from trippostcollect.platforms.douyin.models import (
+    DataFetchError as DataFetchError, SearchResponseError as SearchResponseError,
+)
 from httpx import RequestError
-
-
-class DataFetchError(RequestError):
-    """something error when fetch"""
-
-
-class SearchResponseError(DataFetchError):
-    """Douyin search returned JSON that is not a valid search result response."""
-
-    def __init__(self, reason: str):
-        self.reason = reason
-        super().__init__(reason)
 
 
 class IPBlockError(RequestError):

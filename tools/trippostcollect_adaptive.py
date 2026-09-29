@@ -1,6 +1,8 @@
 """TripPostCollect adaptive candidate accounting for MediaCrawler search loops."""
 
 from __future__ import annotations
+# T06：抖音前沿判据重导出根候选实现。
+from trippostcollect.application.candidates import should_reseed_douyin_frontier as should_reseed_douyin_frontier
 
 from trippostcollect.application.events import (
     _utc_iso as _utc_iso,
@@ -52,25 +54,3 @@ class AdaptiveAccumulator(_AdaptiveAccumulator):
         return super().for_platform(
             platform, existing_identities=existing_platform_identities(platform),
         )
-
-
-
-
-
-
-
-
-def should_reseed_douyin_frontier(
-    *,
-    saved_source_exhausted: bool,
-    refresh_has_more: bool | int | None,
-    refresh_next_cursor: str | None,
-    refresh_new_candidate_count: int,
-) -> bool:
-    """Start a new cursor epoch only when refresh proves new identities and continuation."""
-    return bool(
-        saved_source_exhausted
-        and refresh_has_more in (True, 1)
-        and str(refresh_next_cursor or "").strip()
-        and refresh_new_candidate_count > 0
-    )
