@@ -41,83 +41,23 @@ from trippostcollect.runtime.login_helpers import (
 from . import utils
 from .httpx_util import make_async_client
 
+from trippostcollect.runtime.cookies import (
+    convert_cookies as convert_cookies,
+    convert_browser_context_cookies as convert_browser_context_cookies,
+    convert_str_cookie_to_dict as convert_str_cookie_to_dict,
+)
+from trippostcollect.runtime.helpers import (
+    get_user_agent as get_user_agent,
+    get_mobile_user_agent as get_mobile_user_agent,
+    extract_text_from_html as extract_text_from_html,
+    extract_url_params_to_dict as extract_url_params_to_dict,
+)
+
 
 async def find_login_qrcode(page: Page, selector: str) -> str:
     return await _find_login_qrcode(
         page, selector, make_async_client=make_async_client, get_user_agent=get_user_agent,
     )
-
-
-def get_user_agent() -> str:
-    ua_list = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.5112.79 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.5060.53 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.5112.79 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.5060.53 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.4844.84 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5112.79 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.5060.53 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.4844.84 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.5112.79 Safari/537.36"
-    ]
-    return random.choice(ua_list)
-
-
-def get_mobile_user_agent() -> str:
-    ua_list = [
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
-    ]
-    return random.choice(ua_list)
-
-
-def convert_cookies(cookies: Optional[List[Cookie]]) -> Tuple[str, Dict]:
-    if not cookies:
-        return "", {}
-    cookies_str = ";".join([f"{cookie.get('name')}={cookie.get('value')}" for cookie in cookies])
-    cookie_dict = dict()
-    for cookie in cookies:
-        cookie_dict[cookie.get('name')] = cookie.get('value')
-    return cookies_str, cookie_dict
-
-
-async def convert_browser_context_cookies(
-    browser_context: BrowserContext, urls: Optional[List[str]] = None
-) -> Tuple[str, Dict]:
-    cookies = (
-        await browser_context.cookies(urls=urls)
-        if urls
-        else await browser_context.cookies()
-    )
-    return convert_cookies(cookies)
-
-
-def convert_str_cookie_to_dict(cookie_str: str) -> Dict:
-    cookie_dict: Dict[str, str] = dict()
-    if not cookie_str:
-        return cookie_dict
-    for cookie in cookie_str.split(";"):
-        cookie = cookie.strip()
-        if not cookie:
-            continue
-        cookie_list = cookie.split("=")
-        if len(cookie_list) != 2:
-            continue
-        cookie_value = cookie_list[1]
-        if isinstance(cookie_value, list):
-            cookie_value = "".join(cookie_value)
-        cookie_dict[cookie_list[0]] = cookie_value
-    return cookie_dict
 
 
 def match_interact_info_count(count_str: str) -> int:
@@ -156,24 +96,3 @@ def format_proxy_info(ip_proxy_info) -> Tuple[Optional[Dict], Optional[str]]:
     else:
         httpx_proxy = f"http://{ip_proxy_info.ip}:{ip_proxy_info.port}"
     return playwright_proxy, httpx_proxy
-
-
-def extract_text_from_html(html: str) -> str:
-    """Extract text from HTML, removing all tags."""
-    if not html:
-        return ""
-
-    # Remove script and style elements
-    clean_html = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', html, flags=re.DOTALL)
-    # Remove all other tags
-    clean_text = re.sub(r'<[^>]+>', '', clean_html).strip()
-    return clean_text
-
-def extract_url_params_to_dict(url: str) -> Dict:
-    """Extract URL parameters to dict"""
-    url_params_dict = dict()
-    if not url:
-        return url_params_dict
-    parsed_url = urllib.parse.urlparse(url)
-    url_params_dict = dict(urllib.parse.parse_qsl(parsed_url.query))
-    return url_params_dict
