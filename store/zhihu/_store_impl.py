@@ -49,6 +49,7 @@ import config
 from base.base_crawler import AbstractStore
 from tools import utils
 from var import crawler_type_var
+from trippostcollect.artifacts.jsonl import JsonlContentStore
 from tools.async_file_writer import AsyncFileWriter
 
 def calculate_number_of_files(file_store_path: str) -> int:
@@ -194,13 +195,15 @@ class ZhihuJsonStoreImplement(AbstractStore):
         pass
 
 
-class ZhihuJsonlStoreImplement(AbstractStore):
+class ZhihuJsonlStoreImplement(JsonlContentStore, AbstractStore):
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.writer = AsyncFileWriter(platform="zhihu", crawler_type=crawler_type_var.get())
+        AbstractStore.__init__(self, **kwargs)
+        super().__init__(
+            AsyncFileWriter(platform="zhihu", crawler_type=crawler_type_var.get()),
+        )
 
     async def store_content(self, content_item: Dict):
-        await self.writer.write_to_jsonl(item_type="contents", item=content_item)
+        await super().store_content(content_item)
 
     async def store_comment(self, comment_item: Dict):
         await self.writer.write_to_jsonl(item_type="comments", item=comment_item)

@@ -48,6 +48,7 @@ import aiofiles
 import config
 from base.base_crawler import AbstractStore
 from tools import utils
+from trippostcollect.artifacts.jsonl import JsonlContentStore
 from tools.async_file_writer import AsyncFileWriter
 from var import crawler_type_var
 
@@ -227,13 +228,15 @@ class WeiboJsonStoreImplement(AbstractStore):
         pass
 
 
-class WeiboJsonlStoreImplement(AbstractStore):
+class WeiboJsonlStoreImplement(JsonlContentStore, AbstractStore):
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.writer = AsyncFileWriter(platform="weibo", crawler_type=crawler_type_var.get())
+        AbstractStore.__init__(self, **kwargs)
+        super().__init__(
+            AsyncFileWriter(platform="weibo", crawler_type=crawler_type_var.get()),
+        )
 
     async def store_content(self, content_item: Dict):
-        await self.writer.write_to_jsonl(item_type="contents", item=content_item)
+        await super().store_content(content_item)
 
     async def store_comment(self, comment_item: Dict):
         await self.writer.write_to_jsonl(item_type="comments", item=comment_item)

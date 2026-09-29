@@ -28,67 +28,26 @@ from typing import Dict, List
 
 from base.base_crawler import AbstractStoreImage
 from tools import utils
-from tools.image_manifest import (
-    ImageAsset,
-    failed_manifest_row,
-    stage_post_images,
-    upsert_manifest_rows_atomic,
-    weibo_source_asset_key,
-)
+from tools.image_manifest import weibo_source_asset_key
+from trippostcollect.artifacts.image_staging import PostImageStager
 import config
 
 
-class WeiboStoreImage(AbstractStoreImage):
+class WeiboStoreImage(PostImageStager, AbstractStoreImage):
     def __init__(self):
-        if config.SAVE_DATA_PATH:
-            self.save_data_root = Path(config.SAVE_DATA_PATH)
-        else:
-            self.save_data_root = (MEDIACRAWLER_DIR / "data")
-        self.platform_root = self.save_data_root / "weibo"
-        self.image_store_path = self.platform_root / "images"
-        self.manifest_path = self.platform_root / "image_manifest.jsonl"
+        super().__init__(
+            save_data_root=Path(config.SAVE_DATA_PATH) if config.SAVE_DATA_PATH else MEDIACRAWLER_DIR / "data",
+            platform="weibo",
+            source_key="image_list",
+            source_asset_key=lambda item: weibo_source_asset_key(item.get("pid"), item["url"]),
+            log_saved=lambda count, note_id: utils.logger.info(
+                f"[WeiboImageStoreImplement.store_post_images] saved {count} "
+                f"body images for note {note_id}"
+            ),
+        )
 
     async def store_post_images(self, note_id: str, image_content_items: List[Dict]):
-        assets = [
-            ImageAsset(
-                source_index=int(item["source_index"]),
-                source_asset_key=weibo_source_asset_key(item.get("pid"), item["url"]),
-                source_url=item["url"],
-                content=item["content"],
-                attempts=int(item.get("attempts") or 1),
-                http_status=int(item.get("http_status") or 200),
-            )
-            for item in image_content_items
-        ]
-        rows = stage_post_images(
-            save_data_root=self.save_data_root,
-            platform_storage_key="weibo",
-            platform_key="weibo",
-            platform_post_id=note_id,
-            source_key="image_list",
-            assets=assets,
-        )
-        utils.logger.info(
-            f"[WeiboImageStoreImplement.store_post_images] saved {len(rows)} "
-            f"body images for note {note_id}"
-        )
-        return rows
+        return await super().store_post_images(note_id, image_content_items)
 
     async def record_failure(self, note_id: str, image_content_item: Dict):
-        row = failed_manifest_row(
-            platform_key="weibo",
-            platform_post_id=note_id,
-            source_key="image_list",
-            source_index=int(image_content_item["source_index"]),
-            source_asset_key=weibo_source_asset_key(
-                image_content_item.get("pid"), image_content_item["url"]
-            ),
-            source_url=image_content_item["url"],
-            attempts=int(image_content_item.get("attempts") or 1),
-            error_code=str(
-                image_content_item.get("error_code") or "image_download_retryable"
-            ),
-            http_status=image_content_item.get("http_status"),
-        )
-        upsert_manifest_rows_atomic(self.manifest_path, [row])
-        return row
+        return await super().record_failure(note_id, image_content_item)

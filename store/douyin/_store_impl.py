@@ -45,6 +45,7 @@ from typing import Dict
 import config
 from base.base_crawler import AbstractStore
 from tools import utils
+from trippostcollect.artifacts.jsonl import JsonlContentStore
 from tools.async_file_writer import AsyncFileWriter
 from var import crawler_type_var
 
@@ -205,18 +206,15 @@ class DouyinJsonStoreImplement(AbstractStore):
 
 
 
-class DouyinJsonlStoreImplement(AbstractStore):
+class DouyinJsonlStoreImplement(JsonlContentStore, AbstractStore):
     def __init__(self):
-        self.file_writer = AsyncFileWriter(
-            crawler_type=crawler_type_var.get(),
-            platform="douyin"
+        super().__init__(
+            AsyncFileWriter(platform="douyin", crawler_type=crawler_type_var.get()),
+            writer_attribute="file_writer",
         )
 
     async def store_content(self, content_item: Dict):
-        await self.file_writer.write_to_jsonl(
-            item=content_item,
-            item_type="contents"
-        )
+        await super().store_content(content_item)
 
     async def store_comment(self, comment_item: Dict):
         await self.file_writer.write_to_jsonl(

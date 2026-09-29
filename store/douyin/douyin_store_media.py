@@ -27,70 +27,29 @@ import aiofiles
 
 from base.base_crawler import AbstractStoreImage, AbstractStoreVideo
 from tools import utils
-from tools.image_manifest import (
-    ImageAsset,
-    douyin_source_asset_key,
-    failed_manifest_row,
-    stage_post_images,
-    upsert_manifest_rows_atomic,
-)
+from tools.image_manifest import douyin_source_asset_key
+from trippostcollect.artifacts.image_staging import PostImageStager
 import config
 
 
-class DouYinImage(AbstractStoreImage):
+class DouYinImage(PostImageStager, AbstractStoreImage):
     def __init__(self):
-        if config.SAVE_DATA_PATH:
-            self.save_data_root = Path(config.SAVE_DATA_PATH)
-        else:
-            self.save_data_root = (MEDIACRAWLER_DIR / "data")
-        self.platform_root = self.save_data_root / "douyin"
-        self.image_store_path = self.platform_root / "images"
-        self.manifest_path = self.platform_root / "image_manifest.jsonl"
+        super().__init__(
+            save_data_root=Path(config.SAVE_DATA_PATH) if config.SAVE_DATA_PATH else MEDIACRAWLER_DIR / "data",
+            platform="douyin",
+            source_key="note_download_url",
+            source_asset_key=lambda item: douyin_source_asset_key(item.get("uri"), item["url"]),
+            log_saved=lambda count, aweme_id: utils.logger.info(
+                f"[DouYinImage.store_post_images] saved {count} "
+                f"body images for aweme {aweme_id}"
+            ),
+        )
 
     async def store_post_images(self, aweme_id: str, image_content_items: List[Dict]):
-        assets = [
-            ImageAsset(
-                source_index=int(item["source_index"]),
-                source_asset_key=douyin_source_asset_key(item.get("uri"), item["url"]),
-                source_url=item["url"],
-                content=item["content"],
-                attempts=int(item.get("attempts") or 1),
-                http_status=int(item.get("http_status") or 200),
-            )
-            for item in image_content_items
-        ]
-        rows = stage_post_images(
-            save_data_root=self.save_data_root,
-            platform_storage_key="douyin",
-            platform_key="douyin",
-            platform_post_id=aweme_id,
-            source_key="note_download_url",
-            assets=assets,
-        )
-        utils.logger.info(
-            f"[DouYinImage.store_post_images] saved {len(rows)} "
-            f"body images for aweme {aweme_id}"
-        )
-        return rows
+        return await super().store_post_images(aweme_id, image_content_items)
 
     async def record_failure(self, aweme_id: str, image_content_item: Dict):
-        row = failed_manifest_row(
-            platform_key="douyin",
-            platform_post_id=aweme_id,
-            source_key="note_download_url",
-            source_index=int(image_content_item["source_index"]),
-            source_asset_key=douyin_source_asset_key(
-                image_content_item.get("uri"), image_content_item["url"]
-            ),
-            source_url=image_content_item["url"],
-            attempts=int(image_content_item.get("attempts") or 1),
-            error_code=str(
-                image_content_item.get("error_code") or "image_download_retryable"
-            ),
-            http_status=image_content_item.get("http_status"),
-        )
-        upsert_manifest_rows_atomic(self.manifest_path, [row])
-        return row
+        return await super().record_failure(aweme_id, image_content_item)
 
 
 class DouYinVideo(AbstractStoreVideo):
