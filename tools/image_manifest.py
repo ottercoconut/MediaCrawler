@@ -4,7 +4,10 @@
 from trippostcollect.platforms.douyin.parser import douyin_source_asset_key as douyin_source_asset_key
 from hashlib import sha256
 import re
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
+
+# T07：旧桥保留导入名，知乎资产键由本站 parser 定义。
+from trippostcollect.platforms.zhihu.parser import zhihu_source_asset_key as zhihu_source_asset_key
 
 from trippostcollect.runtime.helpers import normalize_image_url as normalize_image_url
 from trippostcollect.artifacts.image_staging import (
@@ -49,15 +52,3 @@ def xhs_source_asset_key(source_url: str) -> str:
     return f"xhs:path:{identity}"
 
 
-def zhihu_source_asset_key(source_url: str) -> str:
-    normalized = normalize_image_url(source_url)
-    parsed = urlsplit(normalized)
-    hostname = parsed.hostname.lower()
-    path = unquote(parsed.path)
-    is_zhimg = hostname == "zhimg.com" or hostname.endswith(".zhimg.com")
-    if is_zhimg:
-        logical_path = ZHIMG_TRANSFORM_SUFFIX_RE.sub("", path)
-        identity = RASTER_SUFFIX_RE.sub("", logical_path)
-    else:
-        identity = f"{hostname}{path}"
-    return f"zhihu:urlsha256:{sha256(identity.encode('utf-8')).hexdigest()}"

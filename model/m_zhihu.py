@@ -21,46 +21,10 @@
 # -*- coding: utf-8 -*-
 from pydantic import BaseModel, Field
 
+# TripPostCollect：T07 原位委托根实现；来源 MediaCrawler 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可见仓库 LICENSE。
+from trippostcollect.platforms.zhihu.models import ZhihuContent as ZhihuContent, ZhihuCreator as ZhihuCreator
 
-class ZhihuContent(BaseModel):
-    """
-    Zhihu content (answer, article, video)
-    """
-    content_id: str = Field(default="", description="Content ID")
-    content_type: str = Field(default="", description="Content type (article | answer | zvideo)")
-    content_text: str = Field(default="", description="Content text, empty for video type")
-    content_url: str = Field(default="", description="Content landing page URL")
-    question_id: str = Field(default="", description="Question ID, has value when type is answer")
-    title: str = Field(default="", description="Content title")
-    desc: str = Field(default="", description="Content description")
-    created_time: int = Field(default=0, description="Create time")
-    updated_time: int = Field(default=0, description="Update time")
-    voteup_count: int = Field(default=0, description="Upvote count")
-    comment_count: int = Field(default=0, description="Comment count")
-    image_list: list[str] = Field(default_factory=list, description="Content image URLs")
-    image_count: int = Field(default=0, description="Content image count")
-    image_list_source: str = Field(default="", description="Authoritative body image source")
-    image_assets: list[dict] = Field(default_factory=list, description="Ordered body image assets")
-    content_detail_status: str = Field(
-        default="search_payload",
-        description="Detail enrichment status for search results",
-    )
-    content_detail_source: str = Field(
-        default="",
-        description="Authoritative source that proved the persisted body complete",
-    )
-    source_keyword: str = Field(default="", description="Source keyword")
-    creator_hash: str = Field(default="", description="Creator anonymized hash")
-    creator_url_token: str = Field(default="", description="Creator URL token")
-    user_nickname: str = Field(default="", description="User nickname (masked)")
-    author_profile_url: str = Field(default="", description="Creator profile URL")
-    avatar_url: str = Field(default="", description="Creator avatar URL")
-    followers_count: int = Field(default=0, description="Creator follower count")
-    followers_observed: bool = Field(default=False, description="Whether the platform response explicitly included follower count")
-    author_followers_source: str = Field(default="", description="Follower count source")
-    following_count: int = Field(default=0, description="Creator following count")
-    author_desc: str = Field(default="", description="Creator headline or description")
-    verified_text: str = Field(default="", description="Creator verification text")
+
 
 
 class ZhihuComment(BaseModel):
@@ -79,26 +43,3 @@ class ZhihuComment(BaseModel):
     content_type: str = Field(default="", description="Content type (article | answer | zvideo)")
     creator_hash: str = Field(default="", description="Creator anonymized hash")
     user_nickname: str = Field(default="", description="User nickname (masked)")
-
-
-class ZhihuCreator(BaseModel):
-    """
-    Zhihu creator (in-memory only; personal profile is no longer persisted)
-    """
-    creator_hash: str = Field(default="", description="Creator anonymized hash")
-    url_token: str = Field(default="", description="Creator URL token")
-    user_nickname: str = Field(default="", description="User nickname (masked)")
-    profile_url: str = Field(default="", description="Creator profile URL")
-    avatar_url: str = Field(default="", description="Creator avatar URL")
-    follows: int = Field(default=0, description="Follows count")
-    fans: int = Field(default=0, description="Fans count")
-    followers_observed: bool = Field(default=False, description="Whether the platform response explicitly included follower count")
-    author_followers_source: str = Field(default="", description="Follower count source")
-    headline: str = Field(default="", description="Creator headline or description")
-    verified_text: str = Field(default="", description="Creator verification text")
-    anwser_count: int = Field(default=0, description="Answer count")
-    video_count: int = Field(default=0, description="Video count")
-    question_count: int = Field(default=0, description="Question count")
-    article_count: int = Field(default=0, description="Article count")
-    column_count: int = Field(default=0, description="Column count")
-    get_voteup_count: int = Field(default=0, description="Total upvotes received")

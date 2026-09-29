@@ -1,4 +1,6 @@
-"""TripPostCollect Zhihu body-image staging and manifest storage."""
+"""知乎旧桥的图片暂存装配；算法统一由根共享暂存器提供。"""
+
+# TripPostCollect：T07 薄装配；来源 MediaCrawler 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可见仓库 LICENSE。
 
 from __future__ import annotations
 
@@ -10,7 +12,7 @@ from typing import Dict, List
 import config
 from base.base_crawler import AbstractStoreImage
 from tools import utils
-from tools.image_manifest import zhihu_source_asset_key
+from trippostcollect.platforms.zhihu.parser import zhihu_source_asset_key
 from trippostcollect.artifacts.image_staging import PostImageStager
 
 
@@ -28,7 +30,7 @@ class ZhihuStoreImage(PostImageStager, AbstractStoreImage):
         )
 
     async def store_post_images(self, content_id: str, image_content_items: List[Dict]):
-        return await super().store_post_images(content_id, image_content_items)
+        return await PostImageStager.store_post_images(self, content_id, image_content_items)
 
     async def record_failure(self, content_id: str, image_content_item: Dict):
-        return await super().record_failure(content_id, image_content_item)
+        return await PostImageStager.record_failure(self, content_id, image_content_item)

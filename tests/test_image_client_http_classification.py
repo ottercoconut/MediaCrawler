@@ -150,8 +150,11 @@ async def test_xhs_html_response_preserves_security_limit_business_code(
 
 @pytest.mark.asyncio
 async def test_zhihu_http_404_preserves_terminal_status(monkeypatch) -> None:
-    monkeypatch.setattr(zhihu_client, "make_async_client", async_client_factory(404))
+    from types import SimpleNamespace
+
     client = object.__new__(zhihu_client.ZhiHuClient)
+    # T07：fork 类重导出根实现，HTTP 替身经实例端口注入。
+    client.ports = SimpleNamespace(make_async_client=async_client_factory(404))
     client.proxy = None
     client.timeout = 1
     client.default_headers = {}
@@ -168,13 +171,13 @@ async def test_zhihu_http_404_preserves_terminal_status(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_zhihu_oversized_response_is_terminal(monkeypatch) -> None:
-    monkeypatch.setattr(zhihu_client, "IMAGE_DOWNLOAD_MAX_BYTES", 3)
-    monkeypatch.setattr(
-        zhihu_client,
-        "make_async_client",
-        async_client_factory(200, content=b"four"),
-    )
+    from types import SimpleNamespace
+    from trippostcollect.platforms.zhihu import client as root_zhihu_client
+
+    monkeypatch.setattr(root_zhihu_client, "IMAGE_DOWNLOAD_MAX_BYTES", 3)
     client = object.__new__(zhihu_client.ZhiHuClient)
+    # T07：只改 mock 接缝，大小上限与错误断言保持原样。
+    client.ports = SimpleNamespace(make_async_client=async_client_factory(200, content=b"four"))
     client.proxy = None
     client.timeout = 1
     client.default_headers = {}

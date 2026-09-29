@@ -19,4 +19,4 @@
 
 
 # -*- coding: utf-8 -*-
-from .core import ZhihuCrawler
+from .core import ZhihuCrawler as ZhihuCrawler

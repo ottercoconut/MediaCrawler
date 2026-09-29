@@ -20,17 +20,12 @@
 
 from httpx import RequestError
 
+# TripPostCollect：T07 原位委托根实现；来源 MediaCrawler 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可见仓库 LICENSE。
+from trippostcollect.platforms.zhihu.models import DataFetchError as DataFetchError, PlatformRuntimeError as PlatformRuntimeError
 
-class DataFetchError(RequestError):
-    """something error when fetch"""
 
 
-class PlatformRuntimeError(DataFetchError):
-    """A login or rate-limit response that must stop the current run."""
 
-    def __init__(self, message: str, *, code: str):
-        super().__init__(message)
-        self.code = code
 
 
 class IPBlockError(RequestError):

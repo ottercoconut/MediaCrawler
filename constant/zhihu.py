@@ -19,9 +19,11 @@
 
 
 # -*- coding: utf-8 -*-
-ZHIHU_URL = "https://www.zhihu.com"
-ZHIHU_ZHUANLAN_URL = "https://zhuanlan.zhihu.com"
-
-ANSWER_NAME = "answer"
-ARTICLE_NAME = "article"
-VIDEO_NAME = "zvideo"
+# TripPostCollect：T07 重导出根常量；来源 MediaCrawler 5a68eb5098fcd17308c7fe0b9d53916ae839b303，原许可见仓库 LICENSE。
+from trippostcollect.platforms.zhihu.models import (
+    ZHIHU_URL as ZHIHU_URL,
+    ZHIHU_ZHUANLAN_URL as ZHIHU_ZHUANLAN_URL,
+    ANSWER_NAME as ANSWER_NAME,
+    ARTICLE_NAME as ARTICLE_NAME,
+    VIDEO_NAME as VIDEO_NAME,
+)
