@@ -23,83 +23,29 @@
 # @Time    : 2023/12/2 12:53
 # @Desc    : Crawler utility functions
 
-import base64
 import json
 import random
 import re
 import urllib
 import urllib.parse
-from io import BytesIO
 from typing import Dict, List, Optional, Tuple, cast
 
 import httpx
-from PIL import Image, ImageDraw, ImageShow
 from playwright.async_api import BrowserContext, Cookie, Page
 
+from trippostcollect.runtime.login_helpers import (
+    find_login_qrcode as _find_login_qrcode,
+    find_qrcode_img_from_canvas as find_qrcode_img_from_canvas,
+    show_qrcode as show_qrcode,
+)
 from . import utils
 from .httpx_util import make_async_client
 
 
 async def find_login_qrcode(page: Page, selector: str) -> str:
-    """find login qrcode image from target selector"""
-    try:
-        elements = await page.wait_for_selector(
-            selector=selector,
-        )
-        login_qrcode_img = str(await elements.get_property("src"))  # type: ignore
-        if "http://" in login_qrcode_img or "https://" in login_qrcode_img:
-            async with make_async_client(follow_redirects=True) as client:
-                utils.logger.info(f"[find_login_qrcode] get qrcode by url:{login_qrcode_img}")
-                resp = await client.get(login_qrcode_img, headers={"User-Agent": get_user_agent()})
-                if resp.status_code == 200:
-                    image_data = resp.content
-                    base64_image = base64.b64encode(image_data).decode('utf-8')
-                    return base64_image
-                raise Exception(f"fetch login image url failed, response message:{resp.text}")
-        return login_qrcode_img
-
-    except Exception as e:
-        print(e)
-        return ""
-
-
-async def find_qrcode_img_from_canvas(page: Page, canvas_selector: str) -> str:
-    """
-    find qrcode image from canvas element
-    Args:
-        page:
-        canvas_selector:
-
-    Returns:
-
-    """
-
-    # Wait for Canvas element to load
-    canvas = await page.wait_for_selector(canvas_selector)
-
-    # Take screenshot of Canvas element
-    screenshot = await canvas.screenshot()
-
-    # Convert screenshot to base64 format
-    base64_image = base64.b64encode(screenshot).decode('utf-8')
-    return base64_image
-
-
-def show_qrcode(qr_code) -> None:  # type: ignore
-    """parse base64 encode qrcode image and show it"""
-    if "," in qr_code:
-        qr_code = qr_code.split(",")[1]
-    qr_code = base64.b64decode(qr_code)
-    image = Image.open(BytesIO(qr_code))
-
-    # Add a square border around the QR code and display it within the border to improve scanning accuracy.
-    width, height = image.size
-    new_image = Image.new('RGB', (width + 20, height + 20), color=(255, 255, 255))
-    new_image.paste(image, (10, 10))
-    draw = ImageDraw.Draw(new_image)
-    draw.rectangle((0, 0, width + 19, height + 19), outline=(0, 0, 0), width=1)
-    del ImageShow.UnixViewer.options["save_all"]
-    new_image.show()
+    return await _find_login_qrcode(
+        page, selector, make_async_client=make_async_client, get_user_agent=get_user_agent,
+    )
 
 
 def get_user_agent() -> str:
