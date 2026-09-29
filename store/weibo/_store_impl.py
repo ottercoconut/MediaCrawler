@@ -24,28 +24,9 @@
 # @Desc    : Weibo storage implementation class
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-# 退出切片仅在对应实现被调用时加载；类型名供静态检查使用。
-if TYPE_CHECKING:
-    from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import AsyncSession
-    from database.models import WeiboNote
-    from database.models import WeiboNoteComment
-    from tools import words
-    from database.db_session import get_session
-    from database.mongodb_store_base import MongoDBStoreBase
-
-import asyncio
-import csv
-import json
 import os
-import pathlib
 from typing import Dict
 
-import aiofiles
-
-import config
 from base.base_crawler import AbstractStore
 from tools import utils
 from trippostcollect.artifacts.jsonl import JsonlContentStore
@@ -228,6 +209,7 @@ class WeiboJsonStoreImplement(AbstractStore):
         pass
 
 
+# TripPostCollect T05：原实现固定于 MediaCrawler 5a68eb5098fcd17308c7fe0b9d53916ae839b303；原位仅重导出或注入根实现。
 class WeiboJsonlStoreImplement(JsonlContentStore, AbstractStore):
     def __init__(self, **kwargs):
         AbstractStore.__init__(self, **kwargs)
@@ -236,7 +218,7 @@ class WeiboJsonlStoreImplement(JsonlContentStore, AbstractStore):
         )
 
     async def store_content(self, content_item: Dict):
-        await super().store_content(content_item)
+        return await JsonlContentStore.store_content(self, content_item)
 
     async def store_comment(self, comment_item: Dict):
         await self.writer.write_to_jsonl(item_type="comments", item=comment_item)

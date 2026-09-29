@@ -23,19 +23,12 @@
 # @Time    : 2023/12/2 18:44
 # @Desc    :
 
+# TripPostCollect T05：原实现固定于 MediaCrawler 5a68eb5098fcd17308c7fe0b9d53916ae839b303；原位仅重导出或注入根实现。
 from httpx import RequestError
-
-
-class DataFetchError(RequestError):
-    """something error when fetch"""
-
-
-class PlatformRuntimeError(DataFetchError):
-    """A login or rate-limit response that must stop the current run."""
-
-    def __init__(self, message: str, *, code: str):
-        super().__init__(message)
-        self.code = code
+from trippostcollect.platforms.weibo.models import (
+    DataFetchError as DataFetchError,
+    PlatformRuntimeError as PlatformRuntimeError,
+)
 
 
 class IPBlockError(RequestError):

@@ -38,8 +38,13 @@ async def test_douyin_http_404_preserves_terminal_status(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_weibo_http_404_preserves_terminal_status(monkeypatch) -> None:
-    monkeypatch.setattr(weibo_client, "make_async_client", async_client_factory(404))
+    import config
+    from trippostcollect.platforms.entry import weibo_dependencies
+
+    # fork 微博重导出根客户端，HTTP 替身注入根端口的实际调用边界。
+    monkeypatch.setattr("trippostcollect.runtime.http.make_async_client", async_client_factory(404))
     client = object.__new__(weibo_client.WeiboClient)
+    client.ports = weibo_dependencies(config)[1].client
     client.proxy = None
     client.timeout = 1
     client._image_agent_host = "https://i1.wp.com/"

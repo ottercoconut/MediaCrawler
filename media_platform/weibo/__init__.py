@@ -22,6 +22,6 @@
 # @Author  : relakkes@gmail.com
 # @Time    : 2023/12/23 15:40
 # @Desc    :
-from .client import WeiboClient
-from .core import WeiboCrawler
-from .login import WeiboLogin
+from .client import WeiboClient as WeiboClient
+from .core import WeiboCrawler as WeiboCrawler
+from .login import WeiboLogin as WeiboLogin

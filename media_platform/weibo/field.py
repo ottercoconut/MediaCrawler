@@ -22,18 +22,5 @@
 # @Author  : relakkes@gmail.com
 # @Time    : 2023/12/23 15:41
 # @Desc    :
-from enum import Enum
-
-
-class SearchType(Enum):
-    # Comprehensive
-    DEFAULT = "1"
-
-    # Real-time
-    REAL_TIME = "61"
-
-    # Popular
-    POPULAR = "60"
-
-    # Video
-    VIDEO = "64"
+# TripPostCollect T05：原实现固定于 MediaCrawler 5a68eb5098fcd17308c7fe0b9d53916ae839b303；原位仅重导出或注入根实现。
+from trippostcollect.platforms.weibo.models import SearchType as SearchType

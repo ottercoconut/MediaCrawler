@@ -28,11 +28,12 @@ from typing import Dict, List
 
 from base.base_crawler import AbstractStoreImage
 from tools import utils
-from tools.image_manifest import weibo_source_asset_key
+from trippostcollect.platforms.weibo.parser import weibo_source_asset_key
 from trippostcollect.artifacts.image_staging import PostImageStager
 import config
 
 
+# TripPostCollect T05：原实现固定于 MediaCrawler 5a68eb5098fcd17308c7fe0b9d53916ae839b303；原位仅重导出或注入根实现。
 class WeiboStoreImage(PostImageStager, AbstractStoreImage):
     def __init__(self):
         super().__init__(
@@ -47,7 +48,7 @@ class WeiboStoreImage(PostImageStager, AbstractStoreImage):
         )
 
     async def store_post_images(self, note_id: str, image_content_items: List[Dict]):
-        return await super().store_post_images(note_id, image_content_items)
+        return await PostImageStager.store_post_images(self, note_id, image_content_items)
 
     async def record_failure(self, note_id: str, image_content_item: Dict):
-        return await super().record_failure(note_id, image_content_item)
+        return await PostImageStager.record_failure(self, note_id, image_content_item)

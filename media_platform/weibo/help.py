@@ -23,23 +23,5 @@
 # @Time    : 2023/12/24 17:37
 # @Desc    :
 
-from typing import Dict, List
-
-
-def filter_search_result_card(card_list: List[Dict]) -> List[Dict]:
-    """
-    Filter Weibo search results, only keep data with card_type of 9
-    :param card_list: List of card items from search results
-    :return: Filtered list of note items
-    """
-    note_list: List[Dict] = []
-    for card_item in card_list:
-        if card_item.get("card_type") == 9:
-            note_list.append(card_item)
-        if len(card_item.get("card_group", [])) > 0:
-            card_group = card_item.get("card_group")
-            for card_group_item in card_group:
-                if card_group_item.get("card_type") == 9:
-                    note_list.append(card_group_item)
-
-    return note_list
+# TripPostCollect T05：原实现固定于 MediaCrawler 5a68eb5098fcd17308c7fe0b9d53916ae839b303；原位仅重导出或注入根实现。
+from trippostcollect.platforms.weibo.parser import filter_search_result_card as filter_search_result_card

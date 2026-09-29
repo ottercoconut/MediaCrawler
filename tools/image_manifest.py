@@ -33,13 +33,7 @@ ZHIMG_TRANSFORM_SUFFIX_RE = re.compile(
 RASTER_SUFFIX_RE = re.compile(r"\.(?:avif|gif|jpe?g|png|webp)$", re.IGNORECASE)
 
 
-def weibo_source_asset_key(pid: str | None, source_url: str) -> str:
-    if pid not in (None, ""):
-        return f"weibo:pid:{str(pid).strip()}"
-    normalized = normalize_image_url(source_url)
-    parsed = urlsplit(normalized)
-    digest = sha256(f"{parsed.hostname.lower()}{parsed.path}".encode("utf-8")).hexdigest()
-    return f"weibo:urlsha256:{digest}"
+from trippostcollect.platforms.weibo.parser import weibo_source_asset_key as weibo_source_asset_key
 
 
 def xhs_source_asset_key(source_url: str) -> str:
