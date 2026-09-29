@@ -12,7 +12,7 @@ async def test_transient_timeout_and_empty_response_recover_with_attempt_count(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        image_download_retry, "IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS", (0.0, 0.0)
+        "trippostcollect.runtime.image_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS", (0.0, 0.0)
     )
     fetcher = AsyncMock(side_effect=[TimeoutError(), None, b"image-bytes"])
     logger = MagicMock()
@@ -33,7 +33,7 @@ async def test_transient_timeout_and_empty_response_recover_with_attempt_count(
 @pytest.mark.asyncio
 async def test_retry_exhaustion_returns_final_attempt_count(monkeypatch):
     monkeypatch.setattr(
-        image_download_retry, "IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS", (0.0, 0.0)
+        "trippostcollect.runtime.image_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS", (0.0, 0.0)
     )
     fetcher = AsyncMock(return_value=None)
     logger = MagicMock()
@@ -54,7 +54,7 @@ async def test_retry_exhaustion_returns_final_attempt_count(monkeypatch):
 @pytest.mark.asyncio
 async def test_empty_bytes_are_retried_instead_of_treated_as_success(monkeypatch):
     monkeypatch.setattr(
-        image_download_retry, "IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS", (0.0, 0.0)
+        "trippostcollect.runtime.image_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS", (0.0, 0.0)
     )
     fetcher = AsyncMock(side_effect=[b"", b"", b"image-bytes"])
 
@@ -91,7 +91,7 @@ async def test_terminal_http_error_is_not_retried(monkeypatch):
 @pytest.mark.asyncio
 async def test_retryable_http_error_preserves_status_after_exhaustion(monkeypatch):
     monkeypatch.setattr(
-        image_download_retry, "IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS", (0.0, 0.0)
+        "trippostcollect.runtime.image_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS", (0.0, 0.0)
     )
     fetcher = AsyncMock(
         side_effect=image_download_retry.classified_http_image_error(503, "HTTP 503")

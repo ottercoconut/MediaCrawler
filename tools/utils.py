@@ -26,20 +26,7 @@ from .slider_util import *
 from .time_util import *
 
 
-def init_loging_config():
-    level = logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(name)s %(levelname)s (%(filename)s:%(lineno)d) - %(message)s",
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    _logger = logging.getLogger("MediaCrawler")
-    _logger.setLevel(level)
-
-    # Disable httpx INFO level logs
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-
-    return _logger
+from trippostcollect.runtime.worker import init_loging_config as init_loging_config
 
 
 logger = init_loging_config()

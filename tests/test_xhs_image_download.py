@@ -75,7 +75,7 @@ async def test_transient_xhs_image_failure_recovers_and_records_attempts(
     monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
     monkeypatch.setattr("media_platform.xhs.core.random.random", lambda: 0)
     monkeypatch.setattr(
-        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        "trippostcollect.runtime.image_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
         (0.0, 0.0),
     )
     crawler = XiaoHongShuCrawler()
@@ -102,7 +102,7 @@ async def test_xhs_failed_image_writes_no_success_file_or_manifest(monkeypatch, 
     monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
     monkeypatch.setattr("media_platform.xhs.core.random.random", lambda: 0)
     monkeypatch.setattr(
-        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        "trippostcollect.runtime.image_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
         (0.0, 0.0),
     )
     crawler = XiaoHongShuCrawler()

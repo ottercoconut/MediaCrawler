@@ -11,19 +11,11 @@ from typing import Any
 from playwright.async_api import BrowserContext, Page
 
 
-def _enabled() -> bool:
-    return os.environ.get("TRIPPOSTCOLLECT_HUMAN_BEHAVIOR_ENABLED", "").strip() == "1"
+from trippostcollect.application.worker_inputs import _enabled as _enabled
+from trippostcollect.runtime import behavior as _behavior
 
 
-def project_browser_args() -> list[str]:
-    try:
-        value = json.loads(os.environ.get("TRIPPOSTCOLLECT_BROWSER_ARGS_JSON", "[]"))
-    except json.JSONDecodeError:
-        return []
-    args = [str(item) for item in value] if isinstance(value, list) else []
-    if not any(item.startswith("--lang=") for item in args):
-        args.append("--lang=zh-CN")
-    return args
+from trippostcollect.runtime.behavior import project_browser_args as project_browser_args
 
 
 async def install_project_runtime_hints(context: BrowserContext) -> None:
@@ -32,12 +24,8 @@ async def install_project_runtime_hints(context: BrowserContext) -> None:
     scripts_dir = Path(os.environ.get("TRIPPOSTCOLLECT_PROJECT_SCRIPTS", "")).expanduser()
     if not scripts_dir.is_dir():
         raise RuntimeError("required TripPostCollect runtime hint configuration is incomplete")
-    scripts_value = str(scripts_dir.resolve())
-    if scripts_value not in sys.path:
-        sys.path.insert(0, scripts_value)
-    from human_flow import install_runtime_hints
 
-    await install_runtime_hints(context)
+    await _behavior.install_project_runtime_hints(context)
 
 
 async def run_required_human_behavior(page: Page, platform_key: str) -> dict[str, Any]:
@@ -53,11 +41,13 @@ async def run_required_human_behavior(page: Page, platform_key: str) -> dict[str
     scripts_value = str(scripts_dir.resolve())
     if scripts_value not in sys.path:
         sys.path.insert(0, scripts_value)
-    from mediacrawler_behavior import run_page_behavior
+    from mediacrawler_behavior import wait_for_xhs_search_ready, write_evidence
 
-    return await run_page_behavior(
+    return await _behavior.run_required_human_behavior(
         page,
         platform_key=platform_key,
+        xhs_search_ready=wait_for_xhs_search_ready,
+        write_evidence=write_evidence,
         evidence_path=evidence_path,
         profile_name=profile_name,
     )

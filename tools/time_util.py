@@ -49,12 +49,7 @@ def get_current_time_hour() -> str:
     """
     return time.strftime('%Y-%m-%d-%H', time.localtime())
 
-def get_current_date() -> str:
-    """
-    Get current date: '2023-12-02'
-    :return:
-    """
-    return time.strftime('%Y-%m-%d', time.localtime())
+from trippostcollect.artifacts.jsonl import get_current_date as get_current_date
 
 
 def get_time_str_from_unix_time(unixtime):

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import json
+from trippostcollect.application.events import (
+    _utc_iso as _utc_iso,
+    append_worker_execution_event as append_execution_event,
+)
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -51,24 +54,10 @@ class AdaptiveAccumulator(_AdaptiveAccumulator):
         )
 
 
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def append_execution_event(event_type: str, details: dict[str, Any]) -> None:
-    state_value = os.environ.get("TRIPPOSTCOLLECT_EXECUTION_STATE_PATH", "").strip()
-    if not state_value:
-        return
-    path = Path(state_value)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        payload.setdefault("events", []).append({"at": _utc_iso(), "type": event_type, "details": details})
-        payload["updated_at"] = _utc_iso()
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(path)
-    except (OSError, json.JSONDecodeError, TypeError):
-        return
+
+
 
 
 def should_reseed_douyin_frontier(

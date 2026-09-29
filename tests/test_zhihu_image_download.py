@@ -157,7 +157,7 @@ async def test_transient_zhihu_image_failure_recovers_and_records_attempts(
     monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
     monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
     monkeypatch.setattr(
-        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        "trippostcollect.runtime.image_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
         (0.0, 0.0),
     )
     crawler = ZhihuCrawler()
@@ -184,7 +184,7 @@ async def test_failed_zhihu_image_has_only_failed_manifest(monkeypatch, tmp_path
     monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
     monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
     monkeypatch.setattr(
-        "tools.image_download_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
+        "trippostcollect.runtime.image_retry.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS",
         (0.0, 0.0),
     )
     crawler = ZhihuCrawler()

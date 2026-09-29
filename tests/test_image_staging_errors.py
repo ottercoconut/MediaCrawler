@@ -15,7 +15,7 @@ def png_bytes() -> bytes:
 
 
 def test_byte_limit_uses_formal_terminal_error_code(monkeypatch) -> None:
-    monkeypatch.setattr(image_manifest, "MAX_IMAGE_BYTES", 3)
+    monkeypatch.setattr("trippostcollect.artifacts.image_staging.MAX_IMAGE_BYTES", 3)
 
     with pytest.raises(image_manifest.ImageStagingError) as exc_info:
         image_manifest.inspect_image_bytes(b"four")
